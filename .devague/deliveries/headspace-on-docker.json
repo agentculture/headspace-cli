@@ -2,7 +2,7 @@
   "plan_slug": "headspace-on-docker",
   "schema_version": 1,
   "created": "2026-07-27T23:07:34Z",
-  "updated": "2026-07-27T23:28:55Z",
+  "updated": "2026-07-27T23:56:51Z",
   "deviations": [
     {
       "id": "d1",
@@ -46,6 +46,35 @@
       "origin": "llm",
       "status": "approved",
       "classification": "needs-follow-up"
+    },
+    {
+      "id": "d4",
+      "what": "workspaces hold at ready with an active_jobs count and never enter the running state; t10 adds a running->ready edge so the spec's running state becomes real",
+      "task_ref": "t8",
+      "reason": "t1 built TRANSITIONS as a strict DAG with no edge back to ready, so ready->running->completed would exhaust a workspace's lifecycle on its first job \u2014 yet spec FR-07 requires multiple jobs to share one session and doc section 6 stage 4 (Execute) describes exactly that. t8 resolved the conflict by never entering running, which leaves a state named in spec claim c2 unreachable in practice and forces t8's destroy-during-run refusal to synthesize its error by asking the table about a transition no workspace actually makes. Resolution assigned to t10: add running->ready to states.py and drive ready->running->ready around each job, which makes the state real and turns the synthesized guard into a genuine one.",
+      "affects": [
+        "t1",
+        "t10",
+        "c2",
+        "h1"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up"
+    },
+    {
+      "id": "d5",
+      "what": "the docker SDK runtime dependency lands in wave 2 instead of wave 4",
+      "task_ref": "t14",
+      "reason": "t9 (wave 2) cannot import the docker SDK unless pyproject declares it, but the plan assigned dependency pinning to t14 in wave 4. Sequencing the plan strictly would force t9 to either edit a file the plan gave to another task or build against an uninstallable import. Landing only the dependency early (docker>=7.1,<8, probed as SDK 7.2.0 against engine 29.1.3 / API 1.52); t14 retains the README rewrite, the zero-dependency claim removal, the explain catalog, and the version bump.",
+      "affects": [
+        "t9",
+        "c15",
+        "h10"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
     }
   ]
 }
