@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from headspace.cli._errors import EXIT_POLICY_DENIED, CliError
 from headspace.core import policy
 
 # --- helpers ----------------------------------------------------------------
@@ -172,7 +173,7 @@ def test_unsatisfiable_memory_limit_raises_before_any_job_runs() -> None:
     with pytest.raises(policy.PolicyError) as exc_info:
         policy.resolve(policy.Policy(), snapshot)
     err = exc_info.value
-    assert err.code == 1
+    assert err.code == EXIT_POLICY_DENIED
     assert "memory" in err.remediation
 
 
@@ -213,12 +214,22 @@ def test_policy_error_never_weakens_the_requested_limit() -> None:
         pytest.fail("resolve() must raise, not return a degraded EffectivePolicy")
 
 
-def test_policy_error_to_dict_matches_the_cli_error_shape() -> None:
-    """Mirrors headspace.cli._errors.CliError's {code, message, remediation}
-    shape (by convention, not by import -- see the module docstring) so a
-    future CLI-layer catch can translate it directly."""
+def test_policy_error_is_a_cli_error_carrying_the_policy_denied_code() -> None:
+    """PolicyError must be catchable as CliError, not merely shaped like one.
+
+    ``main()`` catches CliError by name and wraps anything else as an
+    internal defect, so a look-alike would report a legitimate policy
+    refusal as a bug and exit with the wrong code.
+    """
     err = policy.PolicyError(message="m", remediation="r")
-    assert err.to_dict() == {"code": 1, "message": "m", "remediation": "r"}
+    assert isinstance(err, CliError)
+    assert err.code == EXIT_POLICY_DENIED
+    assert err.to_dict() == {
+        "code": EXIT_POLICY_DENIED,
+        "message": "m",
+        "remediation": "r",
+        "category": "policy_denied",
+    }
 
 
 def test_resolve_is_pure_and_deterministic() -> None:

@@ -40,6 +40,8 @@ import enum
 from dataclasses import dataclass, field
 from typing import Any
 
+from headspace.cli._errors import EXIT_POLICY_DENIED, CliError
+
 # ---------------------------------------------------------------------------
 # Declared policy -- what the caller asks for. Every default is CLOSED.
 # ---------------------------------------------------------------------------
@@ -192,35 +194,37 @@ class EffectivePolicy:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class PolicyError(Exception):
+class PolicyError(CliError):
     """Raised when a declared :class:`Policy` cannot be satisfied by a
     :class:`CapabilitySnapshot`.
 
-    Structurally mirrors ``headspace.cli._errors.CliError``'s
-    ``{code, message, remediation}`` shape by convention, not by import --
-    this module stays free of any CLI dependency per the core layering rule
-    in ``headspace/core/__init__.py``, so a future CLI-layer catch can
-    translate a ``PolicyError`` into a ``CliError`` using these same fields.
-    ``code`` is fixed at 1, the user-error exit code: an unsatisfiable
-    policy is a caller request the host cannot grant, not an environment
-    failure or a headspace bug, and this task does not own the reserved 3+
-    exit-code band.
+    A **subclass** of :class:`~headspace.cli._errors.CliError`, not a
+    look-alike. ``main()`` catches ``CliError`` by name and wraps anything
+    else as ``unexpected: ... file a bug`` — so a structurally-identical but
+    unrelated type would surface a legitimate policy refusal as an internal
+    defect, and route it through the wrong exit code. Inheriting removes
+    that translation burden from every future caller instead of relying on
+    each one to remember it.
+
+    Importing ``_errors`` does not breach the core layering rule in
+    ``headspace/core/__init__.py``: that rule bars providers and the docker
+    SDK, and ``_errors`` imports nothing from the rest of the package, so no
+    cycle is possible. :mod:`headspace.core.states` and
+    :mod:`headspace.core.profiles` take the same import.
+
+    ``code`` defaults to :data:`~headspace.cli._errors.EXIT_POLICY_DENIED`
+    (3) — the failure taxonomy's own slot. A refused policy is precisely
+    what that code exists to name, and reporting it as a generic user error
+    would collapse the distinction the taxonomy was built to preserve.
     """
 
-    message: str
-    remediation: str
-    code: int = 1
-
-    def __post_init__(self) -> None:
-        super().__init__(self.message)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "code": self.code,
-            "message": self.message,
-            "remediation": self.remediation,
-        }
+    def __init__(
+        self,
+        message: str,
+        remediation: str = "",
+        code: int = EXIT_POLICY_DENIED,
+    ) -> None:
+        super().__init__(code=code, message=message, remediation=remediation)
 
 
 def resolve(policy: Policy, snapshot: CapabilitySnapshot) -> EffectivePolicy:

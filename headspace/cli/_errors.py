@@ -50,11 +50,11 @@ EXIT_CATEGORIES: dict[int, str] = {
     EXIT_INFRASTRUCTURE_FAILURE: "infrastructure_failure",
 }
 
-# Codes in the reserved 3+ band get their category tagged onto `message`
-# automatically (see CliError.__post_init__) so the failure taxonomy is
-# legible in plain-text error output, not only --json. 0/1/2 are excluded
-# deliberately — their message shape must not change under existing callers.
-_TAGGED_CODES = frozenset(
+# The reserved 3+ band — the failure taxonomy proper. Plain-text rendering
+# names the category inline for these (see :func:`headspace.cli._output.emit_error`)
+# so the taxonomy is legible without --json. 0/1/2 are excluded deliberately:
+# their rendered shape must not change under existing callers.
+TAXONOMY_CODES = frozenset(
     {
         EXIT_POLICY_DENIED,
         EXIT_TIMEOUT,
@@ -79,10 +79,6 @@ class CliError(Exception):
     remediation: str = ""
 
     def __post_init__(self) -> None:
-        if self.code in _TAGGED_CODES:
-            tag = f"[{self.category}] "
-            if not self.message.startswith(tag):
-                self.message = tag + self.message
         super().__init__(self.message)
 
     @property

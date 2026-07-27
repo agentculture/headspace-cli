@@ -11,7 +11,7 @@ import json
 import sys
 from typing import Any, TextIO
 
-from headspace.cli._errors import CliError
+from headspace.cli._errors import TAXONOMY_CODES, CliError
 
 
 def emit_result(data: Any, *, json_mode: bool, stream: TextIO | None = None) -> None:
@@ -36,13 +36,22 @@ def emit_error(err: CliError, *, json_mode: bool, stream: TextIO | None = None) 
         hint: <remediation>
 
     The ``hint:`` prefix is required by the agent-first error rubric.
+
+    Errors in the failure-taxonomy band (:data:`TAXONOMY_CODES`) name their
+    category inline — ``error: [policy_denied] <message>`` — so a caller
+    reading plain stderr can tell *why* a job failed, not merely that it did,
+    without switching to ``--json``. Codes 0/1/2 render unchanged. The tag
+    belongs here rather than baked into ``CliError.message``: rendering is
+    this module's job, and a caller reading ``err.message`` should get the
+    message it was constructed with.
     """
     s = stream if stream is not None else sys.stderr
     if json_mode:
         json.dump(err.to_dict(), s, ensure_ascii=False)
         s.write("\n")
         return
-    s.write(f"error: {err.message}\n")
+    tag = f"[{err.category}] " if err.code in TAXONOMY_CODES else ""
+    s.write(f"error: {tag}{err.message}\n")
     if err.remediation:
         s.write(f"hint: {err.remediation}\n")
 
