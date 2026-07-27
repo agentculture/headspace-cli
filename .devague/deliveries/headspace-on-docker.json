@@ -1,0 +1,51 @@
+{
+  "plan_slug": "headspace-on-docker",
+  "schema_version": 1,
+  "created": "2026-07-27T23:07:34Z",
+  "updated": "2026-07-27T23:28:55Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "PolicyError subclasses CliError and carries EXIT_POLICY_DENIED (3) instead of being a structural look-alike with exit code 1",
+      "task_ref": "t3",
+      "reason": "t3's brief told it to keep core free of CLI imports while t1 and t5 were told to import CliError, so wave 0 shipped two error contracts; main() catches CliError by name and wraps anything else as 'unexpected: file a bug', so a policy refusal would have surfaced as an internal defect. Exit code 1 also contradicted spec honesty condition h5, which requires policy denial to carry its own documented code \u2014 t3 used 1 only because its brief predated t7's taxonomy band. APPLIED DURING THE MERGE GATE before this record was written.",
+      "affects": [
+        "t1",
+        "t5",
+        "t7",
+        "c6",
+        "h5"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d2",
+      "what": "failure-category tag renders in emit_error instead of being prefixed onto CliError.message",
+      "task_ref": "t7",
+      "reason": "t7's acceptance criterion required the category to be distinguishable in TEXT error output, but its brief scoped headspace/cli/_output.py out of its file list, leaving message mutation as the only reachable workaround. That mutated a field callers read and duplicated the category already present in to_dict(). The fix edits _output.py, which no wave-0 task owned. t7's tests asserted the behaviour rather than the mechanism, so they pass unchanged. APPLIED DURING THE MERGE GATE before this record was written.",
+      "affects": [
+        "c6",
+        "h5"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d3",
+      "what": "assign the ArtifactRecord to result.Artifact mapping explicitly to t10",
+      "task_ref": "t10",
+      "reason": "t2 and t6 independently defined artifact vocabularies that do not line up (t6: name, content_type, purpose, retention, size_bytes, sha256; t2: name, purpose, media_type, digest, size_bytes, reference). t6's to_list() is documented as feeding the result package's artifact section but cannot construct t2's Artifact directly. The plan gave t2 and t7 a shared status vocabulary but never gave t2 and t6 a shared artifact one, so no task owns the mapping. NOT YET APPLIED \u2014 this amends t10's brief before wave 2 starts.",
+      "affects": [
+        "t2",
+        "t6",
+        "c3"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up"
+    }
+  ]
+}
