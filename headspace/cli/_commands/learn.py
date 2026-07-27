@@ -9,6 +9,14 @@ from __future__ import annotations
 import argparse
 
 from headspace import __version__
+from headspace.cli._errors import (
+    EXIT_CANCELLED,
+    EXIT_COMPUTATION_FAILED,
+    EXIT_INFRASTRUCTURE_FAILURE,
+    EXIT_POLICY_DENIED,
+    EXIT_TIMEOUT,
+    category_for_code,
+)
 from headspace.cli._output import emit_result
 
 _TEXT = """\
@@ -33,14 +41,20 @@ Commands
 Machine-readable output
 -----------------------
 Every command supports --json. Errors in JSON mode emit
-{"code", "message", "remediation"} to stderr. Stdout and stderr never mix.
+{"code", "message", "remediation", "category"} to stderr. Stdout and stderr
+never mix.
 
 Exit-code policy
 ----------------
   0 success
   1 user-input error (bad flag, bad path, missing arg)
   2 environment / setup error
-  3+ reserved
+  3 policy_denied — refused by policy before running
+  4 timeout — wall-clock or budget limit hit
+  5 cancelled — caller asked for it to stop
+  6 computation_failed — ran correctly, produced a failing result
+  7 infrastructure_failure — engine/environment broke, not a computation
+    failure
 
 More detail
 -----------
@@ -65,6 +79,17 @@ def _as_json_payload() -> dict[str, object]:
             "0": "success",
             "1": "user-input error",
             "2": "environment/setup error",
+            "3": f"{category_for_code(EXIT_POLICY_DENIED)} — refused by policy before running",
+            "4": f"{category_for_code(EXIT_TIMEOUT)} — wall-clock or budget limit hit",
+            "5": f"{category_for_code(EXIT_CANCELLED)} — caller asked for it to stop",
+            "6": (
+                f"{category_for_code(EXIT_COMPUTATION_FAILED)} — ran correctly, "
+                "produced a failing result"
+            ),
+            "7": (
+                f"{category_for_code(EXIT_INFRASTRUCTURE_FAILURE)} — engine/environment "
+                "broke, not a computation failure"
+            ),
         },
         "json_support": True,
         "explain_pointer": "headspace-cli explain <path>",
