@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-28
+
+### Added
+
+- **Converged product spec** at `docs/specs/2026-07-27-headspace-on-docker.md` — the buildable spec for headspace as an ephemeral computational workspace on Docker, worked backwards from `docs/headspace_cli_issue_requirements.docx` via the `/scope` → `/think` → `/challenge` legs. Every requirement carries a confirmed honesty condition (what must be true) and an operator instruction (how to build or verify it). Records the three founding decisions: the docker Python SDK as the first runtime dependency, CLI-owned local state under `~/.headspace` reconciled against engine labels (no daemon), and flat lifecycle verbs (`create`, `run`, `inspect`, `export`, `destroy`). Audience is three consumer classes with distinct renderings — agents read the markdown default, humans read markdown (interactive/HTML view parked), scripts read `--json`.
+- **Buildable plan** at `docs/plans/2026-07-27-headspace-on-docker.md` — 14 confirmed tasks covering all 42 spec targets, resolving to five dependency waves whose same-wave tasks touch disjoint files so parallel fan-out merges cleanly. Each task carries TDD-phrased acceptance criteria (the merge contract) plus an operator instruction citing the spec instruction it implements. Four plan risks are first-class state: the rootless/non-Linux enforcement matrix, docker SDK versus engine API drift, Docker-in-CI flakiness, and the follow-up to file the shell-cli execution-seam issue.
+- **Frame and plan state** under `.devague/` — the durable evidence trail behind both artifacts: 20 scope entries (12 from the scope survey, 8 from the challenge pass), 30 claims, 22 honesty conditions, 8 parked unknowns, and the resolved questions. Kept with the exported docs so every confirmed claim traces back to the surface it came from.
+- **Source requirements document** at `docs/headspace_cli_issue_requirements.docx` — the authoritative product-concept doc the spec cites by section (lifecycle in §6, the context-return contract in §8, MVP acceptance in §11).
+
+### Changed
+
+- `.gitignore` excludes `.devague/questions/` and `.devague/reviews/` — devague working state that is regenerated per run, unlike the frame and plan state which are committed.
+
 ## [0.6.1] - 2026-07-20
 
 ### Added
