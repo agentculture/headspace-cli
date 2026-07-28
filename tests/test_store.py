@@ -623,9 +623,10 @@ def test_unusable_store_root_is_an_environment_error(
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("", encoding="utf-8")
     monkeypatch.setenv(HOME_ENV_VAR, str(blocker))
+    store = Store()
 
     with pytest.raises(CliError) as exc:
-        Store().write_state(WS, {"phase": "created"})
+        store.write_state(WS, {"phase": "created"})
 
     assert exc.value.code == EXIT_ENV_ERROR
     assert exc.value.remediation

@@ -589,8 +589,9 @@ def test_h18_destroy_refuses_while_a_job_is_genuinely_running_because_running_to
     runner.start()
     _wait_for_lifecycle_state(store, workspace_id, State.RUNNING, timeout=10)
 
+    contender = Orchestrator(DockerProvider(), Store())
     with pytest.raises(CliError) as caught:
-        Orchestrator(DockerProvider(), Store()).destroy(workspace_id)
+        contender.destroy(workspace_id)
 
     assert not isinstance(caught.value, ProviderError)
     assert "running" in caught.value.message and "destroyed" in caught.value.message

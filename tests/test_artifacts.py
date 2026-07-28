@@ -122,9 +122,10 @@ def test_export_refuses_to_publish_on_digest_mismatch(tmp_path: Path) -> None:
     """A digest that does not verify is a failure — nothing gets published."""
     dest = _exports_dir(tmp_path) / "report.csv"
 
+    source = _chunks(b"payload that will not match")
     with pytest.raises(CliError) as exc:
         export_artifact(
-            _chunks(b"payload that will not match"),
+            source,
             dest,
             purpose="tabular result",
             expected_sha256="0" * 64,
@@ -145,8 +146,9 @@ def test_source_failing_midstream_leaves_no_file_at_final_path(tmp_path: Path) -
         yield b"first half of the artifact"
         raise RuntimeError("source stream died")
 
+    source = dying_source()
     with pytest.raises(CliError) as exc:
-        export_artifact(dying_source(), dest, purpose="tabular result")
+        export_artifact(source, dest, purpose="tabular result")
 
     assert exc.value.code == EXIT_ENV_ERROR
     assert isinstance(exc.value.__cause__, RuntimeError)
@@ -163,8 +165,9 @@ def test_keyboard_interrupt_midstream_publishes_nothing(tmp_path: Path) -> None:
         yield b"first half of the artifact"
         raise KeyboardInterrupt
 
+    source = interrupted_source()
     with pytest.raises(KeyboardInterrupt):
-        export_artifact(interrupted_source(), dest, purpose="tabular result")
+        export_artifact(source, dest, purpose="tabular result")
 
     assert not dest.exists()
     assert not partial_path(dest).exists()
@@ -181,13 +184,15 @@ def test_failed_export_leaves_a_previous_good_artifact_untouched(tmp_path: Path)
         yield b"replacement bytes"
         raise OSError("volume went away")
 
+    first_source = dying_source()
     with pytest.raises(CliError):
-        export_artifact(dying_source(), dest, purpose="tabular result")
+        export_artifact(first_source, dest, purpose="tabular result")
     assert dest.read_bytes() == previous
 
+    second_source = _chunks(b"replacement bytes")
     with pytest.raises(CliError):
         export_artifact(
-            _chunks(b"replacement bytes"),
+            second_source,
             dest,
             purpose="tabular result",
             expected_sha256="1" * 64,
@@ -199,8 +204,9 @@ def test_failed_export_leaves_a_previous_good_artifact_untouched(tmp_path: Path)
 def test_export_rejects_a_missing_destination_directory(tmp_path: Path) -> None:
     dest = tmp_path / "no-such-dir" / "report.csv"
 
+    source = _chunks(b"payload")
     with pytest.raises(CliError) as exc:
-        export_artifact(_chunks(b"payload"), dest, purpose="tabular result")
+        export_artifact(source, dest, purpose="tabular result")
 
     assert exc.value.code == EXIT_USER_ERROR
     assert exc.value.remediation
@@ -210,10 +216,9 @@ def test_export_rejects_a_missing_destination_directory(tmp_path: Path) -> None:
 def test_export_rejects_a_malformed_expected_digest(tmp_path: Path) -> None:
     dest = _exports_dir(tmp_path) / "report.csv"
 
+    source = _chunks(b"payload")
     with pytest.raises(CliError) as exc:
-        export_artifact(
-            _chunks(b"payload"), dest, purpose="tabular result", expected_sha256="deadbeef"
-        )
+        export_artifact(source, dest, purpose="tabular result", expected_sha256="deadbeef")
 
     assert exc.value.code == EXIT_USER_ERROR
     assert not dest.exists()
@@ -226,8 +231,9 @@ def test_export_rejects_a_non_bytes_chunk(tmp_path: Path) -> None:
     def text_source() -> Iterator[object]:
         yield "not bytes"
 
+    source = text_source()
     with pytest.raises(CliError) as exc:
-        export_artifact(text_source(), dest, purpose="tabular result")  # type: ignore[arg-type]
+        export_artifact(source, dest, purpose="tabular result")  # type: ignore[arg-type]
 
     assert exc.value.code == EXIT_USER_ERROR
     assert not dest.exists()
@@ -358,9 +364,10 @@ def test_declaring_the_same_name_twice_is_rejected() -> None:
 
 def test_marking_an_undeclared_artifact_is_rejected() -> None:
     inventory = ArtifactInventory()
+    digest = _sha256(b"x")
 
     with pytest.raises(CliError) as exc:
-        inventory.mark_exported("ghost.csv", size_bytes=1, sha256=_sha256(b"x"))
+        inventory.mark_exported("ghost.csv", size_bytes=1, sha256=digest)
 
     assert exc.value.code == EXIT_USER_ERROR
     assert exc.value.remediation

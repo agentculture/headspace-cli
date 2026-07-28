@@ -170,8 +170,9 @@ def test_empty_filesystem_scope_never_needs_host_mount_support() -> None:
 
 def test_unsatisfiable_memory_limit_raises_before_any_job_runs() -> None:
     snapshot = _capable_snapshot(memory_enforceable=False)
+    requested = policy.Policy()
     with pytest.raises(policy.PolicyError) as exc_info:
-        policy.resolve(policy.Policy(), snapshot)
+        policy.resolve(requested, snapshot)
     err = exc_info.value
     assert err.code == EXIT_POLICY_DENIED
     assert "memory" in err.remediation
@@ -179,8 +180,9 @@ def test_unsatisfiable_memory_limit_raises_before_any_job_runs() -> None:
 
 def test_unsatisfiable_network_isolation_raises_before_any_job_runs() -> None:
     snapshot = _capable_snapshot(network_disable_supported=False)
+    requested = policy.Policy()  # default policy: network DISABLED
     with pytest.raises(policy.PolicyError) as exc_info:
-        policy.resolve(policy.Policy(), snapshot)  # default policy: network DISABLED
+        policy.resolve(requested, snapshot)
     assert "network" in exc_info.value.remediation
 
 
@@ -194,8 +196,9 @@ def test_unsatisfiable_filesystem_scope_expansion_raises() -> None:
 
 def test_unsatisfiable_cpu_and_pids_raise_with_both_named() -> None:
     snapshot = _capable_snapshot(cpu_enforceable=False, pids_enforceable=False)
+    requested = policy.Policy()
     with pytest.raises(policy.PolicyError) as exc_info:
-        policy.resolve(policy.Policy(), snapshot)
+        policy.resolve(requested, snapshot)
     remediation = exc_info.value.remediation
     assert "cpu" in remediation
     assert "pids" in remediation
@@ -206,12 +209,9 @@ def test_policy_error_never_weakens_the_requested_limit() -> None:
     satisfied -- it raises, full stop; the caller never sees a silently
     lowered limit."""
     snapshot = _capable_snapshot(memory_enforceable=False)
-    try:
-        policy.resolve(policy.Policy(), snapshot)
-    except policy.PolicyError:
-        pass
-    else:
-        pytest.fail("resolve() must raise, not return a degraded EffectivePolicy")
+    requested = policy.Policy()
+    with pytest.raises(policy.PolicyError):
+        policy.resolve(requested, snapshot)
 
 
 def test_policy_error_is_a_cli_error_carrying_the_policy_denied_code() -> None:

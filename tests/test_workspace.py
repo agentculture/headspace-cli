@@ -462,8 +462,9 @@ def test_export_publishes_the_file_and_records_its_digest_and_reference(
 
 def test_exporting_an_undeclared_artifact_is_refused(orch: Orchestrator, tmp_path: Path) -> None:
     orch.create(workspace_id=WS)
+    payload = io.BytesIO(b"x")
     with pytest.raises(CliError) as exc_info:
-        orch.export(WS, "surprise.bin", io.BytesIO(b"x"), tmp_path / "surprise.bin")
+        orch.export(WS, "surprise.bin", payload, tmp_path / "surprise.bin")
     assert exc_info.value.code == EXIT_USER_ERROR
     assert "declared" in exc_info.value.message
 
@@ -474,9 +475,10 @@ def test_a_failed_export_publishes_nothing_and_leaves_no_orphan(
     orch.create(workspace_id=WS)
     orch.run(WS, ECHO, declares=[ArtifactDeclaration("out.csv", "the measurements")])
     destination = tmp_path / "out.csv"
+    payload = io.BytesIO(b"payload")
 
     with pytest.raises(CliError):
-        orch.export(WS, "out.csv", io.BytesIO(b"payload"), destination, expected_sha256="0" * 64)
+        orch.export(WS, "out.csv", payload, destination, expected_sha256="0" * 64)
 
     assert not destination.exists()
     assert artifacts_on_disk(store)[0]["retention"] == RETENTION_DECLARED
@@ -995,7 +997,7 @@ def test_an_unreadable_workspace_is_reported_not_raised_during_reconciliation(
     dispositions = Orchestrator(provider, Store()).reconcile()
 
     assert [d.disposition for d in dispositions] == [DISPOSITION_REPORTED]
-    assert "ws-corrupt" == dispositions[0].workspace_id
+    assert dispositions[0].workspace_id == "ws-corrupt"
 
 
 # --- deviation d3: the artifact mapping -----------------------------------
@@ -1115,9 +1117,10 @@ def test_the_workspace_lock_is_taken_for_every_state_mutation(
     """c24: interleaved verbs serialise; a busy workspace refuses rather than corrupts."""
     orch.create(workspace_id=WS)
     holder = Store()
+    contender = Orchestrator(orch_provider(orch), Store())
     with holder.lock(WS):
         with pytest.raises(CliError) as exc_info:
-            Orchestrator(orch_provider(orch), Store()).destroy(WS)
+            contender.destroy(WS)
     assert exc_info.value.code == EXIT_ENV_ERROR
     assert store.exists(WS)
 
@@ -1233,8 +1236,9 @@ def test_an_interrupted_export_is_reported_and_the_artifact_stays_guarded(
     crashing = Orchestrator(
         provider, CrashingStore(store.root, crash_before_state=State.READY.value)
     )
+    payload = io.BytesIO(b"payload")
     with pytest.raises(KeyboardInterrupt):
-        crashing.export(WS, "out.csv", io.BytesIO(b"payload"), destination)
+        crashing.export(WS, "out.csv", payload, destination)
 
     assert destination.read_bytes() == b"payload"
     assert artifacts_on_disk(store)[0]["retention"] == RETENTION_DECLARED
@@ -1245,8 +1249,9 @@ def test_an_interrupted_export_is_reported_and_the_artifact_stays_guarded(
     assert "out.csv" in disposition.detail and "re-export" in disposition.detail
     assert not open_intents(store), "the caller was told once; it is not re-reported forever"
     # The artifact is still guarded, which is the fail-safe direction.
+    contender = Orchestrator(provider, Store())
     with pytest.raises(CliError):
-        Orchestrator(provider, Store()).destroy(WS)
+        contender.destroy(WS)
 
 
 def test_a_workspace_with_an_unreadable_state_record_is_reported_not_raised(

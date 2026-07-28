@@ -331,8 +331,9 @@ def test_last_resort_clip_leaves_json_structurally_complete() -> None:
 
 
 def test_bound_below_the_floor_fails_closed() -> None:
+    package = _package()
     with pytest.raises(CliError) as exc:
-        render_markdown(_package(), max_bytes=16)
+        render_markdown(package, max_bytes=16)
     assert str(MIN_RENDER_BYTES) in exc.value.remediation
 
 
