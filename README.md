@@ -31,8 +31,8 @@ deserves to re-enter the model's context.
 ## What's in this repository
 
 - **The CLI** (`headspace` on `PATH` once installed) — five lifecycle verbs
-  that create and use a workspace, plus five introspection verbs that
-  describe this agent. Every verb supports `--json`; every lifecycle verb
+  that create and use a workspace, plus six introspection verbs that
+  describe this agent and its CLI surface. Every verb supports `--json`; every lifecycle verb
   supports `--provider {docker,fake}`. See [CLI](#cli) below.
 - **`headspace/core/`** — the backend-neutral engine: a nine-state lifecycle
   (`states.py`), closed-by-default policy with an enforced-vs-measured

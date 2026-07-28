@@ -465,8 +465,18 @@ class TestReadingArtifactsBackOut:
         provider.run(workspace_id, WRITING_COMMAND, _default_policy(provider), job_id="writer")
 
         def objects() -> tuple[int, int]:
-            containers = engine.containers.list(all=True, filters={"label": LABEL_WORKSPACE_ID})
-            volumes = engine.volumes.list(filters={"label": LABEL_WORKSPACE_ID})
+            # Scope the count to THIS workspace. Filtering on the label key alone
+            # counts every headspace object on the engine, so under `pytest -n
+            # auto` a sibling worker creating or reaping its own workspace moves
+            # the number and fails this assertion for reasons that have nothing
+            # to do with reading. Scoping loses nothing: the provider labels
+            # every object it creates with the workspace id — that ownership
+            # invariant is what crash reconciliation relies on, and other tests
+            # assert it — so a helper object created to serve this read would
+            # carry this label and still be counted.
+            selector = {"label": f"{LABEL_WORKSPACE_ID}={workspace_id}"}
+            containers = engine.containers.list(all=True, filters=selector)
+            volumes = engine.volumes.list(filters=selector)
             return len(containers), len(volumes)
 
         before = objects()

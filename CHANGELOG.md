@@ -11,6 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **SonarCloud gate blocker** (`new_reliability_rating` 4 -> A) -- `parse_command` in `headspace/cli/_commands/run.py` now uses the empty-safe slice `argv[:1] == ["--"]` instead of `argv and argv[0] == "--"`. The original was correct (short-circuit evaluation means the index is only reached when the list is non-empty), but rule S6466 has to *prove* that; the slice form is correct without an argument.
 - **markdownlint on CI** -- `.markdownlint-cli2.yaml` now ignores `.venv/**` and `**/site-packages/**`. Installed third-party packages ship their own `LICENSE.md` files, which are not ours to reformat. They only appear once dependencies are synced, which is why CI caught this and a local run made before `uv sync` did not.
+- **A test that could not survive parallel execution.** `test_reading_creates_no_engine_object_of_its_own` counted engine objects filtered on the label *key*, which spans every headspace object on the daemon — so under `pytest -n auto` (what CI runs) a sibling xdist worker creating or reaping its own workspace moved the number and failed the assertion for reasons unrelated to reading. Now scoped to the workspace under test. Nothing is lost: the provider labels every object it creates with the workspace id, which is the ownership invariant crash reconciliation depends on, so an object created to serve the read would still be counted.
+- **README introspection-verb count** -- the prose said five while the table listed six (`cli overview` was uncounted). Reported by review on PR #5.
 
 ## [0.8.0] - 2026-07-28
 
