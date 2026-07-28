@@ -591,7 +591,11 @@ class Orchestrator:
                     label="captured output",
                     kind="excerpt",
                     excerpt=outcome.output,
-                    source=inspect_path(job_id),
+                    # A bare ref, not a rendered command: result._excerpt_marker
+                    # calls inspect_path() itself when it truncates. Passing an
+                    # already-rendered path made every truncated result print
+                    # `headspace inspect headspace inspect job-x --logs --logs`.
+                    source=job_id,
                 )
             ],
             artifacts=_artifact_section(record),
@@ -627,7 +631,8 @@ class Orchestrator:
                     label=f"captured output of job {last.get('job_id', '')}",
                     kind="excerpt",
                     excerpt=str(last.get("output", "")),
-                    source=inspect_path(str(last.get("job_id", workspace_id))),
+                    # Bare ref — the renderer applies inspect_path(). See run().
+                    source=str(last.get("job_id", workspace_id)),
                 )
             )
 
@@ -854,6 +859,14 @@ class Orchestrator:
             outcome_summary=f"workspace {workspace_id} was destroyed on {self._provider.name}",
             status=STATUS_SUCCESS,
             key_findings=findings,
+            # The destruction report has to say what survives elsewhere, not
+            # only what went away (doc section 11: "Destruction reports which
+            # workspace data was removed and which exported artifacts remain").
+            # `record` still holds the inventory updated just above, which is
+            # why this reads it before delete_workspace() drops the record.
+            # Only exported artifacts render here; anything force-discarded is
+            # named in the warning instead, where its loss can be stated plainly.
+            artifacts=_artifact_section(record),
             warnings=warnings,
             resource_usage=ResourceUsage(),
             provenance=self._provenance(record, None, descriptor),

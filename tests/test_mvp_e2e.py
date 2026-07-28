@@ -587,18 +587,6 @@ def test_the_transcript_stays_retrievable_through_the_separate_path(
     assert delegation.job_id in message and "destroyed workspace" in message
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN DEFECT: Orchestrator.run/inspect pass an already-rendered "
-        "`inspect_path(job_id)` as Evidence.source, and result._excerpt_marker renders it "
-        "again -- so the marker prints `headspace inspect headspace inspect <job> --logs "
-        "--logs`, a command that does not parse. tests/test_result.py pins the correct "
-        "single-wrapped form because it builds Evidence(source='job-2') with a raw ref, so "
-        "the double wrap is invisible below the orchestrator. Fix: pass the raw job id as "
-        "Evidence.source in headspace/core/workspace.py. See docs/traceability.md."
-    ),
-)
 def test_the_truncation_marker_names_a_command_a_caller_can_run(
     delegation: Delegation,
 ) -> None:
@@ -729,18 +717,6 @@ def test_destroy_reports_what_it_removed_and_the_export_outlives_it(
     assert containers == () and volumes == ()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN GAP: criterion 13 asks destruction to report both what was removed AND "
-        "which exported artifacts remain elsewhere. Orchestrator.destroy builds its "
-        "ResultPackage without an `artifacts=` argument, so the section renders `(none)` "
-        "even when the store's export ledger holds the answer -- and the store record is "
-        "deleted on the next line, so this is the caller's last chance to be told. Fix: "
-        "pass _artifact_section(record) to destroy's package, as run/inspect/export do. "
-        "See docs/traceability.md."
-    ),
-)
 def test_destroy_names_the_exported_artifacts_that_remain_elsewhere(
     delegation: Delegation,
 ) -> None:
