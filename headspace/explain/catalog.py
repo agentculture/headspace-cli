@@ -12,11 +12,12 @@ from __future__ import annotations
 _ROOT = """\
 # headspace-cli
 
-A clonable template for AgentCulture mesh agents. It carries an agent-first CLI
-(cited from the teken `python-cli` reference), a mesh identity (`culture.yaml` +
-`CLAUDE.md`), the canonical guildmaster skill kit under `.claude/skills/`, and a
-buildable/deployable package baseline. Clone it, rename the package, edit
-`culture.yaml`, and you have a new agent.
+Headspace is an ephemeral computational workspace for agents: a bounded,
+isolated workspace a model can offload execution, experimentation, and
+calculation into, then get back a compact, evidence-bearing result instead of
+a raw execution transcript. This agent also carries its own mesh identity
+(`culture.yaml` + `AGENTS.colleague.md`) and the canonical guildmaster skill
+kit under `.claude/skills/`.
 
 ## Lifecycle verbs
 
