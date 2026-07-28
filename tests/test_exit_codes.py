@@ -24,9 +24,11 @@ from headspace.cli._errors import (
     EXIT_ENV_ERROR,
     EXIT_INFRASTRUCTURE_FAILURE,
     EXIT_POLICY_DENIED,
+    EXIT_RESOURCE_EXHAUSTED,
     EXIT_SUCCESS,
     EXIT_TIMEOUT,
     EXIT_USER_ERROR,
+    TAXONOMY_CODES,
     CliError,
     category_for_code,
 )
@@ -174,3 +176,74 @@ def test_learn_json_lists_every_category(capsys: pytest.CaptureFixture[str]) -> 
     for code, name in _NEW_CATEGORIES:
         assert str(code) in exit_codes, f"learn --json is missing exit code {code}"
         assert name in exit_codes[str(code)], f"learn --json entry for {code} missing {name!r}"
+
+
+# --- resource_exhausted: exit code 8, the taxonomy's newest member ---------
+#
+# Deliberately a *separate* list from `_NEW_CATEGORIES` above, not folded into
+# it: `learn`'s self-teaching prompt (headspace/cli/_commands/learn.py) is a
+# hand-written surface that a different task keeps in sync with the taxonomy,
+# and this task's contract is the four vocabulary surfaces named in its brief
+# (STATUSES, JOB_STATUSES, _STATUS_EXIT_CODES, EXIT_CATEGORIES/TAXONOMY_CODES)
+# — not `learn`'s prose. Folding code 8 into `_NEW_CATEGORIES` would make
+# `test_learn_text_lists_every_category` / `test_learn_json_lists_every_category`
+# above fail for a reason outside that contract.
+
+
+def test_resource_exhausted_is_exit_code_eight() -> None:
+    assert EXIT_RESOURCE_EXHAUSTED == 8
+
+
+def test_resource_exhausted_extends_the_band_downward_compatibly() -> None:
+    # Additive extension of the reserved 3+ band: one past the previous
+    # highest code (7), never a renumbering or reuse of an existing one.
+    assert EXIT_RESOURCE_EXHAUSTED == EXIT_INFRASTRUCTURE_FAILURE + 1
+    existing_codes = {EXIT_SUCCESS, EXIT_USER_ERROR, EXIT_ENV_ERROR} | {
+        code for code, _name in _NEW_CATEGORIES
+    }
+    assert EXIT_RESOURCE_EXHAUSTED not in existing_codes
+
+
+def test_resource_exhausted_is_named_in_exit_categories_and_taxonomy_codes() -> None:
+    assert EXIT_CATEGORIES[EXIT_RESOURCE_EXHAUSTED] == "resource_exhausted"
+    assert category_for_code(EXIT_RESOURCE_EXHAUSTED) == "resource_exhausted"
+    assert EXIT_RESOURCE_EXHAUSTED in TAXONOMY_CODES
+
+
+def test_resource_exhausted_recoverable_from_to_dict() -> None:
+    err = CliError(
+        code=EXIT_RESOURCE_EXHAUSTED,
+        message="the job was killed for exceeding its memory ceiling",
+        remediation="raise the memory budget or reduce the working set",
+    )
+    payload = err.to_dict()
+    assert payload["code"] == EXIT_RESOURCE_EXHAUSTED
+    assert payload["category"] == "resource_exhausted"
+
+
+def test_resource_exhausted_recoverable_from_json_render() -> None:
+    err = CliError(code=EXIT_RESOURCE_EXHAUSTED, message="failure detail", remediation="hint text")
+    buf = io.StringIO()
+    emit_error(err, json_mode=True, stream=buf)
+    payload = json.loads(buf.getvalue())
+    assert payload["category"] == "resource_exhausted"
+    assert payload["code"] == EXIT_RESOURCE_EXHAUSTED
+
+
+def test_resource_exhausted_recoverable_from_text_render() -> None:
+    err = CliError(code=EXIT_RESOURCE_EXHAUSTED, message="failure detail", remediation="hint text")
+    buf = io.StringIO()
+    emit_error(err, json_mode=False, stream=buf)
+    text = buf.getvalue()
+    assert text.startswith("error:")
+    assert "hint:" in text
+    assert "resource_exhausted" in text
+
+
+def test_resource_exhausted_is_distinguishable_from_the_existing_band_in_text() -> None:
+    err = CliError(code=EXIT_RESOURCE_EXHAUSTED, message="failure detail")
+    buf = io.StringIO()
+    emit_error(err, json_mode=False, stream=buf)
+    rendered = buf.getvalue()
+    for _code, name in _NEW_CATEGORIES:
+        assert name not in rendered, f"resource_exhausted text leaked {name!r}"

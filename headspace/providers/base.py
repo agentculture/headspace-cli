@@ -149,6 +149,7 @@ from headspace.core.result import (
     STATUS_CANCELLED,
     STATUS_FAILURE,
     STATUS_PARTIAL_SUCCESS,
+    STATUS_RESOURCE_EXHAUSTED,
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
     ResourceUsage,
@@ -161,12 +162,16 @@ from headspace.core.states import State, validate_transition
 #: vocabulary minus the two that describe something other than the job.
 #: ``infrastructure_failure`` and ``policy_denied`` are raised, never returned
 #: (see the module docstring) — omitting them here is what makes that true.
+#: ``resource_exhausted`` (e.g. an OOM kill) *is* a statement about the job —
+#: the command ran and was stopped for exceeding a declared ceiling — so it
+#: belongs in this tuple, unlike the two that are raised instead.
 JOB_STATUSES: tuple[str, ...] = (
     STATUS_SUCCESS,
     STATUS_PARTIAL_SUCCESS,
     STATUS_FAILURE,
     STATUS_CANCELLED,
     STATUS_TIMEOUT,
+    STATUS_RESOURCE_EXHAUSTED,
 )
 
 #: Statuses that mean the command never produced an exit status of its own.
