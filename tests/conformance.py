@@ -727,9 +727,9 @@ class ProviderConformance:
             effective_policy(provider),
             job_id=job_id,
         )
-        assert outcome.status == STATUS_SUCCESS, (
-            f"the writing command did not succeed: {outcome.status} / {outcome.output!r}"
-        )
+        assert (
+            outcome.status == STATUS_SUCCESS
+        ), f"the writing command did not succeed: {outcome.status} / {outcome.output!r}"
         return descriptor.workspace_id
 
     def test_read_streams_back_exactly_what_a_job_wrote(

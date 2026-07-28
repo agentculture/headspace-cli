@@ -57,8 +57,8 @@ and names every artifact it discarded, with the digest field present and empty,
 because an artifact that was never exported has no digest and inventing one
 would be the lie the guard exists to prevent.
 
-Two deviations from the plan are implemented here
--------------------------------------------------
+Three deviations from the plan are implemented here
+---------------------------------------------------
 **d4 — ``running`` is a state workspaces genuinely occupy.** The lifecycle
 table originally had no ``running -> ready`` edge, so a workspace that entered
 ``running`` could never serve a second job; the seam worked around it by never
@@ -84,6 +84,17 @@ is the explicit translation, :data:`ARTIFACT_FIELD_MAP` is its tested
 specification, and the function refuses any record that was never exported —
 a wire artifact promises retrievability and integrity, and a declared one can
 keep neither promise.
+
+**d6 — ``export`` pulls its own bytes.** The seam originally had five verbs and
+none of them could read a file *out* of a workspace, so :meth:`Orchestrator.export`
+demanded the bytes from its caller. That was unimplementable for the one caller
+that matters: ``headspace export`` knows an artifact's name, not its contents,
+and the contents sit inside a volume no process outside the engine can open. The
+seam grew a sixth verb (:meth:`headspace.providers.base.Provider.read`) and this
+module now streams from it whenever no explicit ``source`` is given. Note what
+did *not* move: the digest, the atomic temp-and-rename, and the ledger all still
+live in :mod:`headspace.core.artifacts`. The provider became a source of bytes,
+not a second opinion about durability.
 
 What this module may import
 ---------------------------
@@ -126,7 +137,7 @@ import contextlib
 import dataclasses
 import os
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -639,20 +650,48 @@ class Orchestrator:
         self,
         workspace_id: str,
         name: str,
-        source: ByteSource,
-        destination: str | os.PathLike[str],
+        source: ByteSource | None = None,
+        destination: str | os.PathLike[str] | None = None,
         *,
         expected_sha256: str | None = None,
+        path: str | None = None,
     ) -> ResultPackage:
         """Publish a declared artifact atomically and record what left the workspace.
 
-        ``source`` is supplied by the caller rather than pulled through the
-        provider: the seam's five verbs contain no way to read bytes out of a
-        workspace, and inventing a sixth here would put a backend concern in
-        the orchestration layer. Whoever can produce the bytes hands them over;
-        this method owns the durability boundary, the digest, and the ledger.
+        Two ways to name the bytes, and the default is the one that matters
+        (deviation d6, issue #3):
+
+        * **Omit ``source``** and the artifact is pulled through the provider's
+          ``read`` verb from ``path`` — defaulting to ``name``, because an
+          artifact is usually declared under the name the job wrote it as. This
+          is the path the CLI takes, and the only one it *can* take: the bytes
+          live inside a workspace volume that no process outside the engine can
+          open, so "hand me the source" was a request the caller could not
+          satisfy.
+        * **Pass ``source``** and it is used verbatim, with no read at all, for
+          the caller that already holds the bytes.
+
+        Either way this method owns the durability boundary and nothing else
+        moved: :func:`~headspace.core.artifacts.export_artifact` still computes
+        the digest during the copy, still publishes by atomic rename, and still
+        writes the ledger entry. The provider became *a source of bytes*, not a
+        second place where durability is decided.
+
+        The stream is released on every exit — a digest that fails to verify
+        must not also strand whatever the backend was holding open.
         """
         attention = self._take_attention()
+        if destination is None:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"no destination given for artifact '{name}'",
+                remediation=(
+                    "pass the path the artifact should be published to; an export that "
+                    "lands nowhere durable is not an export"
+                ),
+            )
+        workspace_path = path if path is not None else name
+
         with self._store.lock(workspace_id):
             record = self._read(workspace_id)
             inventory = _inventory(record)
@@ -670,17 +709,26 @@ class Orchestrator:
             intent_id = self._intend(
                 workspace_id,
                 INTENT_EXPORT,
-                {"name": name, "destination": os.fspath(destination)},
+                {
+                    "name": name,
+                    "destination": os.fspath(destination),
+                    "path": "" if source is not None else workspace_path,
+                },
             )
             try:
-                exported = export_artifact(
-                    source,
-                    destination,
-                    purpose=declaration.purpose,
-                    name=name,
-                    content_type=declaration.content_type,
-                    expected_sha256=expected_sha256,
-                )
+                # The read is inside the try for the same reason the copy is: a
+                # missing artifact and a dead engine are both failures of *this*
+                # invocation, and both have to close the intent on their way out
+                # or reconciliation will later read them as a crash.
+                with self._bytes(workspace_id, source, workspace_path) as bytes_source:
+                    exported = export_artifact(
+                        bytes_source,
+                        destination,
+                        purpose=declaration.purpose,
+                        name=name,
+                        content_type=declaration.content_type,
+                        expected_sha256=expected_sha256,
+                    )
             except CliError as err:
                 self._close(workspace_id, INTENT_EXPORT, intent_id, PHASE_ABANDONED, err)
                 raise
@@ -811,6 +859,27 @@ class Orchestrator:
             provenance=self._provenance(record, None, descriptor),
             attention=attention + [_discarded_attention(item) for item in discarded],
         )
+
+    @contextlib.contextmanager
+    def _bytes(
+        self,
+        workspace_id: str,
+        source: ByteSource | None,
+        path: str,
+    ) -> Iterator[ByteSource]:
+        """The artifact's bytes, and the guarantee that whatever opened them closes.
+
+        A context manager rather than a plain lookup because the two cases have
+        different ownership and both are correct: a caller-supplied source
+        belongs to the caller and must not be closed here, while a stream this
+        method pulled through the seam belongs to this method and must be
+        released however the export ends — verified, refused, or interrupted.
+        """
+        if source is not None:
+            yield source
+            return
+        with self._provider.read(workspace_id, path) as stream:
+            yield stream
 
     # --- reconciliation ---------------------------------------------------
 

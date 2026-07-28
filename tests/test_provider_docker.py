@@ -167,13 +167,22 @@ def _reap_engine_strays() -> Iterator[None]:
     engine-breakage test strands a workspace on purpose (its provider is
     pointed at a dead socket, so the suite's own cleanup cannot reach it), and
     a test that dies mid-``create`` can strand one by accident.
+
+    ``ignore_removed`` is load-bearing under ``-n auto``. The filter selects on
+    the label *key*, so the listing spans every worker's objects, and the SDK
+    re-inspects each id it listed — an object a sibling worker removed in
+    between therefore raises ``NotFound`` from the listing itself, aborting this
+    reaper before it reaches its own strays. The one thing a safety net must not
+    do is fail on someone else's tidiness.
     """
     yield
     if _engine_reason():
         return
     client = docker.from_env()
     try:
-        for container in client.containers.list(all=True, filters={"label": LABEL_WORKSPACE_ID}):
+        for container in client.containers.list(
+            all=True, filters={"label": LABEL_WORKSPACE_ID}, ignore_removed=True
+        ):
             if _owned(container.labels.get(LABEL_WORKSPACE_ID, "")):
                 container.remove(force=True)
         for volume in client.volumes.list(filters={"label": LABEL_WORKSPACE_ID}):

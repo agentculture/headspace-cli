@@ -15,7 +15,7 @@ this seam is a plain, JSON-serialisable, backend-neutral structure.** The
 conformance suite (``tests/conformance.py``) checks that mechanically, against
 every backend, forever.
 
-Five verbs, chosen from what the orchestration layer needs and nothing else:
+Six verbs, chosen from what the orchestration layer needs and nothing else:
 
 ===============  ==========================================================
 verb             what it answers
@@ -24,8 +24,31 @@ verb             what it answers
 ``create``       give me a workspace under this policy
 ``run``          execute this command in that workspace
 ``inspect``      what does the backend say about that workspace now?
+``read``         hand me the bytes of one file the workspace holds
 ``remove``       tear it down and tell me exactly what went away
 ===============  ==========================================================
+
+Why ``read`` is a verb and not a convenience
+--------------------------------------------
+The first five verbs can put work *into* a workspace and describe it, but none
+of them can get a result *out*. That left ``export`` demanding its bytes from
+whoever called it — which the CLI cannot supply, because the artifacts sit
+inside a volume no process outside the engine can open. A product whose whole
+promise is "the answer outlives the scratch space" therefore had no way to keep
+it (issue #3).
+
+It is a *streaming* verb (:class:`ByteStream`) rather than one returning
+``bytes``, because an artifact may be larger than the host's memory, and a seam
+that hands back a single object makes that unfixable above it. It is
+*context-managed* because a backend generally holds something open — a socket,
+an archive, a connection — and the consumer routinely stops early: a digest
+that fails to verify abandons the stream mid-flight, and that path must release
+as reliably as the happy one.
+
+Only a regular file's bytes cross. A directory, a symlink or a device is
+refused as a user error, and the path itself is normalised and bounded by
+:func:`require_workspace_path` here rather than in each backend — see its
+docstring for why the engine underneath cannot be trusted to do it.
 
 A :class:`typing.Protocol`, not an abstract base class. A backend is anything
 that *behaves* correctly; nothing about it should have to inherit from
@@ -111,11 +134,13 @@ translation step is where two vocabularies drift apart.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
+from types import TracebackType
 from typing import Any, Protocol, runtime_checkable
 
 from headspace.cli._errors import EXIT_INFRASTRUCTURE_FAILURE, EXIT_USER_ERROR, CliError
@@ -161,6 +186,22 @@ REMOVABLE_RESOURCES: tuple[str, ...] = (RESOURCE_RUNTIME, RESOURCE_STORAGE)
 #: The key an :class:`OpaqueRef` serialises under. The conformance scanner
 #: keys off this name to know which subtree it must NOT interpret.
 OPAQUE_KEY = "opaque"
+
+#: Default read granularity, matching :data:`headspace.core.artifacts.DEFAULT_CHUNK_SIZE`
+#: so an artifact travels from the engine to the destination file in one size of
+#: chunk rather than being re-cut at the boundary. It is only a default: the
+#: caller passes ``chunk_size`` when it knows better, and a backend must honour
+#: it — bounded chunks are the property that makes an artifact larger than
+#: memory readable at all.
+DEFAULT_READ_CHUNK_BYTES = 1 << 20
+
+#: Path segments that carry no location. Dropped during normalisation so
+#: ``./out.bin``, ``out.bin/`` and ``results//out.csv`` are one path each rather
+#: than four distinct ones a backend would have to canonicalise itself.
+_EMPTY_SEGMENTS: frozenset[str] = frozenset({"", "."})
+#: The segment that leaves. Refused, never resolved — see
+#: :func:`require_workspace_path`.
+_PARENT_SEGMENT = ".."
 
 #: An algorithm-prefixed content address, e.g. ``sha256:<64 hex>``. The
 #: algorithm is not hardcoded: OCI already allows others, and a future backend
@@ -332,6 +373,113 @@ def unknown_workspace(workspace_id: str) -> CliError:
         code=EXIT_USER_ERROR,
         message=f"unknown workspace {workspace_id}",
         remediation="create the workspace first, or pass an id that still exists",
+    )
+
+
+def _refuse_path(path: Any, why: str) -> CliError:
+    """One refusal shape for every unusable path, so the advice is stated once."""
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=f"unusable workspace path {path!r}: {why}",
+        remediation=(
+            "pass a path relative to the workspace root, such as 'out.csv' or "
+            "'results/final.csv' — a workspace read never leaves the workspace"
+        ),
+    )
+
+
+def require_workspace_path(path: str) -> str:
+    """Normalise a workspace-relative path, refusing anything that could leave it.
+
+    The workspace is a boundary, and this is where the boundary is drawn — once,
+    at the seam, rather than once per backend. That placement is the whole point
+    rather than tidiness: the engines underneath resolve ``..`` perfectly
+    happily. Docker's archive endpoint, asked for ``/workspace/../etc/hostname``,
+    returns the container's own file with a straight face. A rule that lived in
+    each backend would be a rule each backend could forget, and forgetting it
+    would look exactly like a working read.
+
+    The grammar is deliberately small: a relative path, ``/``-separated, with no
+    root and no ``..`` anywhere. Empty and ``.`` segments carry no location and
+    are dropped, which is what makes ``./out.bin``, ``out.bin/`` and
+    ``results//out.csv`` one path each instead of four a backend has to
+    canonicalise itself.
+
+    ``..`` is **refused, not resolved**. Textual resolution would produce a path
+    that looks contained and then be handed to an engine that resolves symlinks
+    on its own terms, so the two would disagree exactly where it matters. A
+    caller that meant a sibling directory can name it directly.
+    """
+    if not isinstance(path, str):
+        raise _refuse_path(path, f"a workspace path must be a string, not {type(path).__name__}")
+    if not path.strip():
+        raise _refuse_path(path, "a workspace path must name something")
+    if "\x00" in path:
+        raise _refuse_path(path, "a path may not contain a null byte")
+    if path.startswith("/"):
+        raise _refuse_path(path, "an absolute path presumes a layout the seam has none of")
+    segments = [segment for segment in path.split("/") if segment not in _EMPTY_SEGMENTS]
+    if _PARENT_SEGMENT in segments:
+        raise _refuse_path(path, f"'{_PARENT_SEGMENT}' would leave the workspace")
+    if not segments:
+        raise _refuse_path(path, "a workspace path must name something")
+    return "/".join(segments)
+
+
+def require_chunk_size(chunk_size: int) -> int:
+    """Reject a read granularity no backend could honour.
+
+    Checked at the seam for the same reason the path is: a non-positive chunk
+    size means something different in every transport — an unbounded read here,
+    an empty slice there — and "bounded chunks" is the one property ``read``
+    exists to promise.
+    """
+    if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"chunk_size must be a positive number of bytes, got {chunk_size!r}",
+            remediation=f"omit chunk_size to read in {DEFAULT_READ_CHUNK_BYTES}-byte chunks",
+        )
+    return chunk_size
+
+
+def missing_workspace_path(workspace_id: str, path: str) -> CliError:
+    """The one refusal shape every backend uses for a path a workspace lacks.
+
+    A :class:`CliError` and deliberately **not** a :class:`ProviderError`. The
+    engine answered the question correctly and the answer was "there is no such
+    file": that is the caller's mistake, not a broken engine. Reporting it as
+    exit 7 would tell an agent to restart a daemon and retry, when what it needs
+    is to look at what its job actually wrote.
+    """
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=f"workspace {workspace_id} holds no readable file at '{path}'",
+        remediation=(
+            "check what the job wrote, relative to the workspace root; only a regular "
+            "file can be read back — a directory or a link is not an artifact"
+        ),
+    )
+
+
+def unreadable_workspace_path(workspace_id: str, path: str, kind: str) -> CliError:
+    """Refuse a path that exists but is not one file's bytes.
+
+    Separate from :func:`missing_workspace_path` because the remedy differs: a
+    missing artifact means the job did not write it, while a directory or a
+    symlink means the caller named the wrong *kind* of thing. The symlink case
+    is a boundary check rather than a nicety — a job can plant a link pointing
+    outside the workspace volume, and an engine that resolves it would quietly
+    export a file the workspace never produced.
+    """
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=f"workspace {workspace_id} holds a {kind} at '{path}', not a file",
+        remediation=(
+            "an artifact is one regular file's bytes; name the file itself — a "
+            "directory has to be archived by the job first, and a link is not "
+            "followed because its target may lie outside the workspace"
+        ),
     )
 
 
@@ -619,6 +767,106 @@ class RemovalDisposition:
         }
 
 
+# --- the bytes themselves ---------------------------------------------------
+
+
+class ByteStream:
+    """An artifact's bytes, in bounded chunks, with a release that always runs.
+
+    The one thing crossing this seam that is not a serialisable record, and it
+    earns the exception: an artifact can be larger than the host's memory, so
+    ``read`` has to hand back something lazy. What it must *not* hand back is a
+    bare generator, for two reasons that are really one:
+
+    * **A backend holds something open.** A socket, an HTTP response, an archive
+      reader. Whatever it is, it is the backend's business and no caller should
+      have to learn its shape in order to let go of it. One ``close`` is the
+      whole vocabulary.
+    * **The consumer routinely stops early.** The export path abandons a stream
+      whenever a digest fails to verify or a destination fills up, and an engine
+      can die mid-artifact. "Read it all or leak" would therefore not be a
+      theoretical failure mode; it would be the common one. So the release runs
+      on exhaustion, on :meth:`close`, on ``with``-block exit, and on an
+      exception raised by the source — every way out, once.
+
+    Deliberately **not** a file object: there is no ``read(n)``. The backend is
+    the side that knows what a cheap read looks like on its own transport, so
+    its chunk boundaries travel unchanged all the way to disk.
+    :func:`headspace.core.artifacts.export_artifact` re-chunks anything with a
+    ``.read()`` and iterates anything else, so the absence is what keeps the
+    backend's granularity intact rather than silently re-cut.
+
+    Idempotent by construction: :attr:`_release` is dropped as it fires, so a
+    consumer that closes twice — or closes a stream that already ran dry —
+    releases once and then yields nothing more.
+    """
+
+    def __init__(
+        self, chunks: Iterable[bytes], *, release: Callable[[], None] | None = None
+    ) -> None:
+        self._chunks: Iterator[bytes] = iter(chunks)
+        self._release = release
+        self._closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        """Return *self*, not a fresh iterator.
+
+        A stream is a position in someone else's transport, not a re-readable
+        collection. Two iterators over one stream would silently interleave, so
+        ``iter()`` twice continues from where the last chunk left off — which is
+        also what lets a caller pull one chunk with ``next(iter(stream))`` and
+        then walk away.
+        """
+        return self
+
+    def __next__(self) -> bytes:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            # Exhausted is one of the ways out, and the most common: releasing
+            # only on close would leak for every consumer that read to the end.
+            self.close()
+            raise
+        except BaseException:
+            # The failure path matters most. A broken engine must not also
+            # strand whatever it was holding open on the way out.
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Release the backend's resources. Safe to call any number of times."""
+        if self._closed:
+            return
+        self._closed = True
+        chunks, self._chunks = self._chunks, iter(())
+        release, self._release = self._release, None
+        try:
+            # Finalise a generator source so its own ``finally`` blocks run at a
+            # moment the caller chose, rather than whenever the collector gets
+            # to it.
+            closer = getattr(chunks, "close", None)
+            if callable(closer):
+                with contextlib.suppress(Exception):
+                    closer()
+        finally:
+            if release is not None:
+                release()
+
+    def __enter__(self) -> ByteStream:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        self.close()
+        return False
+
+
 # --- the seam ---------------------------------------------------------------
 
 
@@ -685,6 +933,28 @@ class Provider(Protocol):
         """Report the backend's current facts about a workspace.
 
         Raises :class:`CliError` (exit 1) for an id this backend does not hold.
+        """
+
+    def read(
+        self, workspace_id: str, path: str, *, chunk_size: int = DEFAULT_READ_CHUNK_BYTES
+    ) -> ByteStream:
+        """Stream one file's bytes out of a workspace.
+
+        ``path`` is relative to the workspace root and is normalised and bounded
+        by :func:`require_workspace_path`; ``chunk_size`` is the largest chunk
+        the returned stream may yield, and honouring it is what makes an
+        artifact larger than memory readable.
+
+        Must work whether or not the workspace's runtime is still alive. That is
+        the case the verb exists for: a container has exited but the storage —
+        and the work in it — has not, and a read that needed a live runtime
+        would lose exactly the results a caller most needs back.
+
+        Raises :class:`CliError` (exit 1) for an unknown workspace, a path the
+        workspace does not hold, a path that is not a regular file, and a path
+        that would leave the workspace. Raises :class:`ProviderError` (exit 7)
+        when the engine broke — including part-way through the stream, where it
+        surfaces from the iteration rather than from this call.
         """
 
     def remove(self, workspace_id: str) -> RemovalDisposition:

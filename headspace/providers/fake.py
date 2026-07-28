@@ -44,8 +44,8 @@ test asserts that mechanically by inspecting this module's imports.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 from headspace.cli._errors import EXIT_USER_ERROR, CliError
@@ -53,7 +53,9 @@ from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS, STATUS_TIMEOUT, ResourceUsage
 from headspace.core.states import State, validate_transition
 from headspace.providers.base import (
+    DEFAULT_READ_CHUNK_BYTES,
     REMOVABLE_RESOURCES,
+    ByteStream,
     JobOutcome,
     OpaqueRef,
     ProviderError,
@@ -61,9 +63,12 @@ from headspace.providers.base import (
     WorkspaceDescriptor,
     environment_digest,
     guard_removable,
+    missing_workspace_path,
     requested_limit,
+    require_chunk_size,
     require_command,
     require_workspace_id,
+    require_workspace_path,
     unknown_workspace,
     utc_now,
 )
@@ -73,8 +78,17 @@ from headspace.providers.base import (
 #: against.
 FOREVER_SECONDS = 10**9
 
-#: The verbs :meth:`FakeProvider.break_next` can break.
-BREAKABLE_OPERATIONS: tuple[str, ...] = ("capabilities", "create", "run", "inspect", "remove")
+#: The verbs :meth:`FakeProvider.break_next` can break. All six, because NFR-07
+#: applies to all six: the path that carries artifacts out has to report a dead
+#: engine as a dead engine just as loudly as the path that runs jobs.
+BREAKABLE_OPERATIONS: tuple[str, ...] = (
+    "capabilities",
+    "create",
+    "run",
+    "inspect",
+    "read",
+    "remove",
+)
 
 #: What this fake claims a host can enforce. Mirrors a healthy real host,
 #: storage included: ``storage_enforceable=False`` is the canonical
@@ -114,6 +128,13 @@ class JobPlan:
     ``active_jobs`` already incremented. It exists so a test can observe the
     one state a synchronous, single-process MVP otherwise cannot reach from
     outside: a workspace with a job actually running.
+
+    ``writes`` is what the job leaves behind in the workspace, keyed by
+    workspace-relative path. It exists so read-back can be exercised against
+    something a *job* produced rather than against content a test placed behind
+    the provider's back — an artifact nobody produced would prove nothing about
+    artifacts leaving. The bytes count towards the workspace's measured storage
+    exactly as a real job's output would.
     """
 
     status: str = STATUS_SUCCESS
@@ -126,6 +147,7 @@ class JobPlan:
     storage_bytes: int = 0
     infrastructure_failure: str = ""
     during: Callable[[], None] | None = None
+    writes: Mapping[str, bytes] = field(default_factory=dict)
 
     @classmethod
     def succeeding(cls, output: str = "", **overrides: Any) -> JobPlan:
@@ -153,7 +175,18 @@ class JobPlan:
 
 @dataclass
 class _Workspace:
-    """The fake's private record. Never crosses the seam; descriptors do."""
+    """The fake's private record. Never crosses the seam; descriptors do.
+
+    ``files`` is the workspace's storage: a dict keyed by normalised
+    workspace-relative path. It is the fake's stand-in for a volume, and it is
+    what makes ``read`` a real read — the bytes came from somewhere, they
+    outlive the job that wrote them, and they die with the workspace.
+
+    ``storage_bytes`` counts only what *jobs claimed* to occupy; the bytes
+    actually sitting in ``files`` are added on top when the workspace is
+    described. Keeping the two apart means a scripted storage figure and a real
+    file cannot silently double-count each other.
+    """
 
     workspace_id: str
     environment_digest: str
@@ -163,6 +196,7 @@ class _Workspace:
     state: State = State.READY
     storage_bytes: int = 0
     active_jobs: int = 0
+    files: dict[str, bytes] = field(default_factory=dict)
 
 
 class FakeProvider:
@@ -190,6 +224,20 @@ class FakeProvider:
     def script_command(self, command: Sequence[str], plan: JobPlan) -> None:
         """Make ``command`` behave as ``plan`` describes, from now on."""
         self._script[tuple(command)] = plan
+
+    def write_file(self, workspace_id: str, path: str, content: bytes) -> None:
+        """Put bytes in a workspace with no job to run — the seeding shortcut.
+
+        For tests whose subject is the *read* rather than the write. The
+        conformance suite deliberately does not use this: it scripts a job with
+        :attr:`JobPlan.writes` instead, because read-back has to be proven
+        against something a job produced.
+
+        Refuses an unknown workspace rather than conjuring one, so seeding
+        cannot quietly create the very thing a test is about to assert exists.
+        """
+        record = self._require(require_workspace_id(workspace_id))
+        record.files[require_workspace_path(path)] = bytes(content)
 
     def break_next(self, operation: str = "run", message: str = "") -> None:
         """Arm an infrastructure failure on the next call to ``operation``.
@@ -275,6 +323,8 @@ class FakeProvider:
             if plan.during is not None:
                 plan.during()
             record.storage_bytes += plan.storage_bytes
+            for path, content in plan.writes.items():
+                record.files[require_workspace_path(path)] = bytes(content)
             output, produced, truncated = _capture(plan, output_budget)
             timed_out = plan.wall_time_seconds > wall_budget
         finally:
@@ -295,7 +345,7 @@ class FakeProvider:
                 wall_time_seconds=wall_budget if timed_out else plan.wall_time_seconds,
                 cpu_seconds=plan.cpu_seconds,
                 max_memory_bytes=plan.max_memory_bytes,
-                storage_bytes=record.storage_bytes,
+                storage_bytes=_storage_bytes(record),
                 output_bytes=produced,
             ),
         )
@@ -304,6 +354,30 @@ class FakeProvider:
         workspace_id = require_workspace_id(workspace_id)
         self._fail_if_broken("inspect")
         return self._describe(self._require(workspace_id))
+
+    def read(
+        self, workspace_id: str, path: str, *, chunk_size: int = DEFAULT_READ_CHUNK_BYTES
+    ) -> ByteStream:
+        """Stream one stored file back, in chunks no larger than ``chunk_size``.
+
+        The path is normalised and bounded first, before the workspace is even
+        looked up: a path that would leave the workspace is refused by the seam's
+        own rule, so the fake and a live engine refuse the identical set.
+
+        Nothing is held open, so there is genuinely nothing to release — but the
+        stream still carries the full contract, because a caller must not have to
+        know which backend it is talking to in order to know whether ``close``
+        matters.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        relative = require_workspace_path(path)
+        size = require_chunk_size(chunk_size)
+        self._fail_if_broken("read")
+        record = self._require(workspace_id)
+        content = record.files.get(relative)
+        if content is None:
+            raise missing_workspace_path(workspace_id, relative)
+        return ByteStream(_chunked(content, size))
 
     def remove(self, workspace_id: str) -> RemovalDisposition:
         workspace_id = require_workspace_id(workspace_id)
@@ -335,12 +409,34 @@ class FakeProvider:
             environment_digest=record.environment_digest,
             created_at=record.created_at,
             network_enabled=record.network_enabled,
-            storage_bytes=record.storage_bytes,
+            storage_bytes=_storage_bytes(record),
             active_jobs=record.active_jobs,
             # A backend-private handle nothing above the seam may read. The
             # conformance suite proves it never appears anywhere else.
             ref=OpaqueRef(record.token),
         )
+
+
+def _storage_bytes(record: _Workspace) -> int:
+    """What the workspace occupies: what jobs claimed, plus what they left behind.
+
+    A file in a workspace really does occupy it, so a fake that reported only
+    the scripted figure would let a read-back test pass against a workspace that
+    claimed to be empty — simulating the semantics, not stubbing them, is the
+    whole reason this backend exists.
+    """
+    return record.storage_bytes + sum(len(content) for content in record.files.values())
+
+
+def _chunked(content: bytes, chunk_size: int) -> Iterator[bytes]:
+    """Yield ``content`` in bounded slices, lazily.
+
+    Lazily even though it is already in memory: the point of the chunking is the
+    *contract*, and a fake that handed back one blob would let a backend which
+    ignored ``chunk_size`` look conformant by comparison.
+    """
+    for start in range(0, len(content), chunk_size):
+        yield content[start : start + chunk_size]
 
 
 def _capture(plan: JobPlan, budget: int) -> tuple[str, int, bool]:

@@ -531,7 +531,9 @@ def test_a_provider_pulled_export_still_verifies_an_expected_digest(
     orch = _prepared(store)
     destination = tmp_path / "out.csv"
 
-    orch.export(WS, "out.csv", destination=destination, expected_sha256=hashlib.sha256(WRITTEN).hexdigest())
+    orch.export(
+        WS, "out.csv", destination=destination, expected_sha256=hashlib.sha256(WRITTEN).hexdigest()
+    )
     assert destination.read_bytes() == WRITTEN
 
     with pytest.raises(CliError):

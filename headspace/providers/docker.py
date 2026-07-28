@@ -93,6 +93,46 @@ order — which is all any backend can promise across two pipes, and why
 :class:`~headspace.providers.base.JobOutcome` promises ordering rather than
 separation.
 
+Getting an artifact back out
+----------------------------
+The read verb asks the engine's archive endpoint (``get_archive``) for one path
+inside the **workspace container** — the object this provider already owns — and
+untars a single member out of the transfer stream as it arrives. Three
+properties made that the choice over the obvious alternative, a short-lived
+helper container mounting the same volume:
+
+* **It works on a workspace whose runtime has exited.** The engine resolves the
+  path through the container's mounts, not through a running process, so the
+  artifacts survive the box that produced them. That is the case the verb
+  exists for: a container that died is exactly when a caller most needs its
+  results, and a read that required a live runtime would lose them.
+* **It creates nothing.** A helper container is a second engine object that has
+  to be reaped on every failure path, including the ones nobody thought of.
+  "The engine's object count does not move" is a guarantee no reaper can match,
+  and a test asserts it.
+* **It widens nothing.** No host mount, no network, no socket — the read reuses
+  the box the posture already closed rather than opening a new one beside it.
+
+Nothing is materialised on the way. The engine's chunks feed a one-chunk-deep
+reader (:class:`_ChunkReader`), which feeds :mod:`tarfile` in stream mode
+(:data:`ARCHIVE_STREAM_MODE`), which yields the member's bytes in the caller's
+own chunk size — so peak memory tracks the chunk, not the artifact. A test
+reads a 16 MiB artifact under :mod:`tracemalloc` and holds the peak to a
+quarter of it, because "streamed" is a claim worth measuring rather than
+asserting.
+
+The connection is the one exception to "one connection per verb": the bytes are
+still arriving when the caller gets its stream, so the client, the transfer
+archive and the archive reader are handed to the stream's release
+(a :class:`contextlib.ExitStack`) instead of being closed at the end of a block.
+Abandoning a read half way — which the export path does whenever a digest fails
+to verify — therefore releases exactly what a completed read releases.
+
+Only a regular file's bytes cross. A directory or a symlink is refused as a
+user error, and the symlink refusal is load-bearing rather than fastidious: a
+job can plant a link to a path outside the workspace volume, and the archive
+endpoint resolves link targets within the container's filesystem quite happily.
+
 Measured, not assumed
 ---------------------
 :meth:`DockerProvider.capabilities` interrogates the engine — version, API
@@ -123,13 +163,14 @@ from __future__ import annotations
 import contextlib
 import math
 import re
+import tarfile
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import fields
-from typing import Any
+from typing import IO, Any
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
@@ -141,8 +182,10 @@ from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS, STATUS_TIMEOUT, ResourceUsage
 from headspace.core.states import State, validate_transition
 from headspace.providers.base import (
+    DEFAULT_READ_CHUNK_BYTES,
     RESOURCE_RUNTIME,
     RESOURCE_STORAGE,
+    ByteStream,
     JobOutcome,
     OpaqueRef,
     ProviderError,
@@ -150,10 +193,14 @@ from headspace.providers.base import (
     WorkspaceDescriptor,
     environment_digest,
     guard_removable,
+    missing_workspace_path,
     requested_limit,
+    require_chunk_size,
     require_command,
     require_workspace_id,
+    require_workspace_path,
     unknown_workspace,
+    unreadable_workspace_path,
     utc_now,
 )
 
@@ -259,6 +306,25 @@ CAPTURE_GRACE_SECONDS = 10.0
 _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_NAME_PART = 32
 
+# --- reading an artifact back out -------------------------------------------
+
+#: How the transfer archive is opened. The trailing ``|`` is the load-bearing
+#: character: it selects :mod:`tarfile`'s *stream* mode, which never seeks and
+#: never holds the archive, so the artifact is consumed as it arrives. Plain
+#: ``"r"`` would require a seekable file and would therefore mean buffering the
+#: whole transfer first — the one thing this path must not do.
+ARCHIVE_STREAM_MODE = "r|"
+
+#: Everything a failing engine can throw at this module, in one tuple so no
+#: call site can catch a narrower set by accident.
+#:
+#: ``requests`` transport errors subclass :class:`OSError`, which is how the
+#: whole HTTP surface is covered without importing the SDK's own stack. A
+#: :class:`tarfile.TarError` joins them because a truncated or malformed
+#: transfer archive is the engine failing to deliver bytes it said it had — a
+#: broken engine (exit 7), never a caller that asked for the wrong thing.
+_ENGINE_FAILURES: tuple[type[BaseException], ...] = (DockerException, OSError, tarfile.TarError)
+
 
 def log_cap_bytes(output_budget: int) -> int:
     """The on-disk log ceiling for a job whose caller wants ``output_budget`` kept.
@@ -306,6 +372,67 @@ def _slug(value: str) -> str:
 def _label_value(value: Any) -> str:
     """Label values are strings; booleans must round-trip readably."""
     return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def _quietly(close: Callable[[], Any]) -> None:
+    """Run one release step, never letting its own failure mask the real one.
+
+    Cleanup on the failure path is exactly where a second exception does the
+    most damage: it replaces the diagnosis with the tidy-up's complaint about
+    a socket that was already dead.
+    """
+    with contextlib.suppress(Exception):
+        close()
+
+
+class _ChunkReader:
+    """A ``read()``-able view over the engine's chunk iterator, one chunk deep.
+
+    :mod:`tarfile` wants a file object; the engine hands back an iterator of
+    byte chunks. Adapting one to the other is all this does, and the constraint
+    that shapes it is that it must never hold more than the chunk it is
+    currently serving. An artifact larger than the host's memory is precisely
+    the case the streaming read exists for, so a buffer that grew with the
+    artifact would defeat the whole path while still passing every
+    small-artifact test.
+    """
+
+    def __init__(self, chunks: Iterator[bytes]) -> None:
+        self._chunks = chunks
+        self._buffer = bytearray()
+
+    def read(self, size: int = -1) -> bytes:
+        """Serve exactly ``size`` bytes, pulling from the engine only as needed."""
+        while size < 0 or len(self._buffer) < size:
+            chunk = next(self._chunks, b"")
+            if not chunk:
+                break
+            self._buffer += chunk
+        if size < 0:
+            size = len(self._buffer)
+        taken = bytes(self._buffer[:size])
+        # Consume in place: a slice-and-rebind would hold both halves at once.
+        del self._buffer[:size]
+        return taken
+
+
+def _streamed(member: IO[bytes], chunk_size: int, action: str) -> Iterator[bytes]:
+    """Yield one archived file's bytes, bounded, one chunk in flight at a time.
+
+    The engine can die *during* a transfer as easily as before one, and an
+    artifact that stops arriving half way is still an infrastructure failure —
+    so the taxonomy is applied here too, not only at the call that opened the
+    stream. A caller told exit 7 retries the fetch; one told exit 6 would
+    conclude its work was lost.
+    """
+    while True:
+        try:
+            chunk = member.read(chunk_size)
+        except _ENGINE_FAILURES as err:
+            raise ProviderError(f"the execution engine failed while {action}: {err}") from err
+        if not chunk:
+            return
+        yield chunk
 
 
 class _Capture:
@@ -576,6 +703,101 @@ class DockerProvider:
         with self._engine(f"inspecting workspace {workspace_id}") as client:
             return self._describe(client, self._require(client, workspace_id))
 
+    def read(
+        self, workspace_id: str, path: str, *, chunk_size: int = DEFAULT_READ_CHUNK_BYTES
+    ) -> ByteStream:
+        """Stream one file out of a workspace's storage, live runtime or not.
+
+        Everything that can be refused locally is refused before a socket is
+        opened: the path is normalised and bounded by the seam's own rule (see
+        :func:`~headspace.providers.base.require_workspace_path`, and note that
+        the engine would happily resolve ``..`` if asked), and the chunk size is
+        checked. Only then is the engine involved.
+
+        The client outlives this call, which is the one place this module
+        departs from "one connection per verb": the bytes are still arriving
+        when the caller gets the stream back, so the connection, the transfer
+        archive and the archive reader are all handed to the stream's release
+        instead. :class:`contextlib.ExitStack` owns them from the moment each is
+        acquired, so a failure part-way through setup unwinds exactly what had
+        been opened — and the same stack becomes the release, which is what
+        makes a stream that is abandoned half way as tidy as one read to the end.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        relative = require_workspace_path(path)
+        size = require_chunk_size(chunk_size)
+        action = f"reading '{relative}' from workspace {workspace_id}"
+
+        try:
+            client = self._connect()
+        except (DockerException, OSError) as err:
+            raise ProviderError(
+                f"could not reach the execution engine while {action}: {err}"
+            ) from err
+
+        release = contextlib.ExitStack()
+        release.callback(_quietly, client.close)
+        try:
+            with self._engine_failures(action):
+                anchor = self._require(client, workspace_id)
+                member = self._archived_file(anchor, workspace_id, relative, size, release)
+        except BaseException:
+            release.close()
+            raise
+        return ByteStream(_streamed(member, size, action), release=release.close)
+
+    @staticmethod
+    def _archived_file(
+        anchor: Container,
+        workspace_id: str,
+        relative: str,
+        chunk_size: int,
+        release: contextlib.ExitStack,
+    ) -> IO[bytes]:
+        """Open the engine's transfer archive, positioned at one file's bytes.
+
+        ``get_archive`` is asked of the *workspace* container — the one this
+        provider already owns — for two reasons. It works on a container that
+        has exited, because the engine reads the path through the container's
+        mounts rather than through a running process, so an artifact survives
+        the runtime that produced it (which is the case this verb exists for).
+        And it creates nothing: a helper container mounting the same volume
+        would be a second engine object to reap on every failure path, and
+        "nothing was created" is a stronger guarantee than any reaper.
+
+        Exactly one member is read, and it must be a regular file. A directory
+        arrives as a directory entry followed by its contents, and a symlink
+        arrives as a link — neither is an artifact, and the link case is a
+        boundary check rather than fussiness: a job can plant one pointing
+        outside the workspace volume.
+        """
+        try:
+            archive_stream, _stat = anchor.get_archive(
+                f"{WORKSPACE_MOUNT_PATH}/{relative}", chunk_size=chunk_size
+            )
+        except NotFound as err:
+            # The engine answered, and the answer was "no such file" — the
+            # caller's mistake, not a broken engine.
+            raise missing_workspace_path(workspace_id, relative) from err
+        release.callback(_quietly, archive_stream.close)
+
+        archive = tarfile.open(mode=ARCHIVE_STREAM_MODE, fileobj=_ChunkReader(archive_stream))
+        release.callback(_quietly, archive.close)
+        entry = archive.next()
+        if entry is None:
+            raise ProviderError(
+                f"the engine returned an empty archive for '{relative}' in "
+                f"workspace {workspace_id}"
+            )
+        if entry.isdir():
+            raise unreadable_workspace_path(workspace_id, relative, "directory")
+        if entry.issym() or entry.islnk():
+            raise unreadable_workspace_path(workspace_id, relative, "link")
+        member = archive.extractfile(entry) if entry.isfile() else None
+        if member is None:
+            raise unreadable_workspace_path(workspace_id, relative, "special file")
+        return member
+
     def remove(self, workspace_id: str) -> RemovalDisposition:
         """Tear the workspace down and report what actually went away.
 
@@ -622,16 +844,26 @@ class DockerProvider:
     # --- engine plumbing --------------------------------------------------
 
     @contextmanager
+    def _engine_failures(self, action: str) -> Iterator[None]:
+        """Turn every engine failure inside this block into exit 7, and nothing else.
+
+        Split out from :meth:`_engine` because ``read`` needs the taxonomy
+        without the connection lifetime: its client has to outlive the block
+        that opened it. See :data:`_ENGINE_FAILURES` for what counts as the
+        engine failing.
+        """
+        try:
+            yield
+        except _ENGINE_FAILURES as err:
+            raise ProviderError(f"the execution engine failed while {action}: {err}") from err
+
+    @contextmanager
     def _engine(self, action: str) -> Iterator[docker.DockerClient]:
         """One connection per verb, and one place engine failure becomes exit 7.
 
         Per verb rather than cached because that is production: each CLI
         invocation is its own process, so a provider object is not a session and
         pretending otherwise would hide an engine that died between two verbs.
-
-        ``requests`` transport errors subclass :class:`OSError`, which is why
-        catching ``(DockerException, OSError)`` covers the whole surface without
-        this module importing the SDK's own HTTP stack.
         """
         try:
             client = self._connect()
@@ -640,9 +872,8 @@ class DockerProvider:
                 f"could not reach the execution engine while {action}: {err}"
             ) from err
         try:
-            yield client
-        except (DockerException, OSError) as err:
-            raise ProviderError(f"the execution engine failed while {action}: {err}") from err
+            with self._engine_failures(action):
+                yield client
         finally:
             with contextlib.suppress(Exception):
                 client.close()
