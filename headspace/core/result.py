@@ -340,6 +340,10 @@ class ResultPackage:
 
 # --- markdown rendering (a generic walk, so it cannot omit a field) --------
 
+# One level of markdown nesting. Two spaces, because a list continuation has to
+# line up under its bullet's text for the renderer to read it as a child.
+_INDENT = "  "
+
 
 def _md_scalar(value: Any) -> str:
     # bool before the str() fallback: JSON spells them lowercase, and the
@@ -365,35 +369,47 @@ def _fenced(text: str, pad: str) -> list[str]:
 
 
 def _md_lines(value: Any, depth: int) -> list[str]:
-    pad = "  " * depth
+    """Dispatch on the JSON shape — the three cases the payload can hold."""
     if isinstance(value, dict):
-        lines: list[str] = []
-        for key, item in value.items():
-            if isinstance(item, (dict, list)):
-                lines.append(f"{pad}- {key}:")
-                lines.extend(_md_lines(item, depth + 1))
-            elif key == "excerpt" and item:
-                lines.append(f"{pad}- {key}:")
-                lines.extend(_fenced(str(item), "  " * (depth + 1)))
-            else:
-                lines.append(f"{pad}- {key}: {_md_scalar(item)}")
-        return lines
+        return _md_mapping(value, depth)
     if isinstance(value, list):
-        if not value:
-            return [f"{pad}- (none)"]
-        lines = []
-        for item in value:
-            if isinstance(item, dict):
-                # A record renders as one bullet headed by its first field,
-                # with the rest nested. Generic: no key names are hardcoded.
-                entries = list(item.items())
-                first_key, first_value = entries[0]
-                lines.append(f"{pad}- {first_key}: {_md_scalar(first_value)}")
-                lines.extend(_md_lines(dict(entries[1:]), depth + 1))
-            else:
-                lines.append(f"{pad}- {_md_scalar(item)}")
-        return lines
-    return [f"{pad}{_md_scalar(value)}"]
+        return _md_sequence(value, depth)
+    return [f"{_INDENT * depth}{_md_scalar(value)}"]
+
+
+def _md_mapping(mapping: dict[str, Any], depth: int) -> list[str]:
+    """Every key, in payload order, nesting whatever is not a leaf."""
+    pad = _INDENT * depth
+    lines: list[str] = []
+    for key, item in mapping.items():
+        if isinstance(item, (dict, list)):
+            lines.append(f"{pad}- {key}:")
+            lines.extend(_md_lines(item, depth + 1))
+        elif key == "excerpt" and item:
+            lines.append(f"{pad}- {key}:")
+            lines.extend(_fenced(str(item), _INDENT * (depth + 1)))
+        else:
+            lines.append(f"{pad}- {key}: {_md_scalar(item)}")
+    return lines
+
+
+def _md_sequence(items: list[Any], depth: int) -> list[str]:
+    """Every element, with an empty list saying so rather than rendering blank."""
+    pad = _INDENT * depth
+    if not items:
+        return [f"{pad}- (none)"]
+    lines: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            # A record renders as one bullet headed by its first field,
+            # with the rest nested. Generic: no key names are hardcoded.
+            entries = list(item.items())
+            first_key, first_value = entries[0]
+            lines.append(f"{pad}- {first_key}: {_md_scalar(first_value)}")
+            lines.extend(_md_lines(dict(entries[1:]), depth + 1))
+        else:
+            lines.append(f"{pad}- {_md_scalar(item)}")
+    return lines
 
 
 def _document(payload: dict[str, Any]) -> str:
