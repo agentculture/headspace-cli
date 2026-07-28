@@ -86,6 +86,10 @@ from headspace.cli._errors import EXIT_USER_ERROR, CliError
 # --- status vocabulary ----------------------------------------------------
 # Shared verbatim with the exit-code mapping in headspace.cli._errors; renaming
 # a member here silently breaks that mapping, so treat this tuple as frozen.
+# Appending a new member is the sanctioned exception — the exit-code band is
+# additive by the same policy (see cli._errors: "extend downward-compatibly,
+# never renumber an existing code") — so a new status is added at the end,
+# never inserted or reordered.
 STATUS_SUCCESS = "success"
 STATUS_PARTIAL_SUCCESS = "partial_success"
 STATUS_FAILURE = "failure"
@@ -93,6 +97,7 @@ STATUS_CANCELLED = "cancelled"
 STATUS_TIMEOUT = "timeout"
 STATUS_POLICY_DENIED = "policy_denied"
 STATUS_INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+STATUS_RESOURCE_EXHAUSTED = "resource_exhausted"
 
 STATUSES: tuple[str, ...] = (
     STATUS_SUCCESS,
@@ -102,6 +107,7 @@ STATUSES: tuple[str, ...] = (
     STATUS_TIMEOUT,
     STATUS_POLICY_DENIED,
     STATUS_INFRASTRUCTURE_FAILURE,
+    STATUS_RESOURCE_EXHAUSTED,
 )
 
 # --- byte bound -----------------------------------------------------------
