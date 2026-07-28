@@ -200,6 +200,7 @@ from headspace.providers.base import (
     WorkspaceDescriptor,
     guard_removable,
     removal_path,
+    requested_limit,
     utc_now,
 )
 
@@ -281,6 +282,22 @@ _STATUS_EXIT_CODES: dict[str, int] = {
     STATUS_POLICY_DENIED: EXIT_POLICY_DENIED,
     STATUS_INFRASTRUCTURE_FAILURE: EXIT_INFRASTRUCTURE_FAILURE,
     STATUS_RESOURCE_EXHAUSTED: EXIT_RESOURCE_EXHAUSTED,
+}
+
+#: The two exit statuses that mean the command never got to run its own logic,
+#: and what each one tells the caller to change. POSIX's convention, not any
+#: engine's — which is why it is written here rather than imported from a
+#: backend, and why the finding built from it says "conventionally": a shell
+#: *inside* the workspace relaying its own "command not found" produces the same
+#: number, and headspace cannot tell the two apart from an exit status alone.
+#:
+#: The two are kept separate for the same reason the provider that produces them
+#: keeps them separate: 127 says re-spell the name, 126 says the name was right
+#: and something else is wrong. Collapsed, they would send an agent off to fix a
+#: spelling that was already correct.
+_UNRUNNABLE_COMMAND_DIAGNOSES: dict[int, str] = {
+    126: "was found but is not executable",
+    127: "was not found",
 }
 
 _STATE_KEY = "state"
@@ -588,7 +605,12 @@ class Orchestrator:
                 f"and reported {outcome.status}"
             ),
             status=outcome.status,
-            key_findings=_job_findings(outcome),
+            key_findings=_job_findings(
+                outcome,
+                policy=effective,
+                profile=str(record.get("profile", "")),
+                command=command,
+            ),
             evidence=[
                 Evidence(
                     label="captured output",
@@ -605,7 +627,11 @@ class Orchestrator:
             warnings=warnings,
             resource_usage=outcome.usage,
             provenance=self._provenance(record, effective, None, outcome=outcome, command=command),
-            attention=attention + _pending_artifact_attention(record),
+            attention=(
+                attention
+                + _resource_attention(outcome, effective)
+                + _pending_artifact_attention(record)
+            ),
         )
 
     def inspect(self, workspace_id: str) -> ResultPackage:
@@ -1402,13 +1428,79 @@ def _descriptor_findings(state: State, descriptor: WorkspaceDescriptor | None) -
     return findings
 
 
-def _job_findings(outcome: JobOutcome) -> list[str]:
+def _memory_ceiling(policy: EffectivePolicy) -> int:
+    """The memory limit the workspace was created under, in bytes.
+
+    Read from the effective policy — the ceiling headspace asked the host to
+    *enforce* — and never from a measurement. The two are different numbers and
+    the whole point of naming this one is that it is the one the job hit.
+    """
+    return int(requested_limit(policy, "memory"))
+
+
+def _job_findings(
+    outcome: JobOutcome,
+    *,
+    policy: EffectivePolicy,
+    profile: str,
+    command: Sequence[str],
+) -> list[str]:
+    """How the job ended, in the terms that change what the caller does next.
+
+    Four shapes, in the order a reader needs them:
+
+    * no exit status at all — the command was stopped, and silence is not
+      success;
+    * stopped for exceeding a ceiling — name the ceiling, in bytes, because
+      "exit status 137" alone leaves an agent to rerun an identical job;
+    * a command the environment could not run — name the profile and the
+      caller's own ``argv[0]``, built from what headspace knows rather than
+      from whatever sentence the engine produced (which carries engine handles
+      and is exactly the context pollution headspace exists to prevent);
+    * anything else — an ordinary computation reporting its own answer, which
+      needs no interpretation and gets none.
+    """
     if outcome.exit_status is None:
         return [
             f"the job reported {outcome.status} and never produced an exit status",
             "no exit status means the command was stopped, not that it succeeded",
         ]
+    if outcome.status == STATUS_RESOURCE_EXHAUSTED:
+        return [
+            "the job was killed for exceeding the workspace's enforced memory ceiling of "
+            f"{_memory_ceiling(policy)} bytes",
+            f"exit status {outcome.exit_status} reports that kill, not an answer the "
+            "command chose",
+        ]
+    diagnosis = _UNRUNNABLE_COMMAND_DIAGNOSES.get(outcome.exit_status)
+    if diagnosis is not None:
+        argv0 = command[0] if command else ""
+        return [
+            f"exit status {outcome.exit_status} conventionally means the command "
+            f"{diagnosis}: the {profile} profile was asked to run '{argv0}'"
+        ]
     return [f"the command completed with exit status {outcome.exit_status}"]
+
+
+def _resource_attention(outcome: JobOutcome, policy: EffectivePolicy) -> list[str]:
+    """The decision a job killed at its memory ceiling leaves for its caller.
+
+    Empty for every other outcome. A ``resource_exhausted`` result with an empty
+    attention section is the defect this exists to close: the caller is told the
+    job died, given nothing to change, and reruns a job that dies identically.
+
+    The remedy names the flag rather than gesturing at it, and says where the
+    flag lives — ``--memory-bytes`` is a ``create`` flag, because a workspace
+    runs under the contract it was created with (see cli/_commands/run.py), so
+    "raise it and retry here" would be advice that cannot be followed.
+    """
+    if outcome.status != STATUS_RESOURCE_EXHAUSTED:
+        return []
+    return [
+        "raise the memory ceiling — create a workspace with --memory-bytes above "
+        f"{_memory_ceiling(policy)} — or reduce the job's working set; this workspace "
+        "keeps the ceiling it was created under, so an unchanged rerun here dies the same way"
+    ]
 
 
 def _job_warnings(record: Mapping[str, Any], outcome: JobOutcome) -> list[str]:
