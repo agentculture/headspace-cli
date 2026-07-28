@@ -1027,7 +1027,7 @@ class Orchestrator:
             if record is not None:
                 self._store.write_state(workspace_id, record)
         else:
-            disposition, detail, record = self._reap(workspace_id, record)
+            disposition, detail, record = self._reap(record)
             if record is not None:
                 self._store.write_state(workspace_id, record)
 
@@ -1099,10 +1099,12 @@ class Orchestrator:
             record,
         )
 
-    def _reap(
-        self, workspace_id: str, record: dict[str, Any] | None
-    ) -> tuple[str, str, dict[str, Any] | None]:
-        """The engine does not hold it. Keep the record only if work was at stake."""
+    def _reap(self, record: dict[str, Any] | None) -> tuple[str, str, dict[str, Any] | None]:
+        """The engine does not hold it. Keep the record only if work was at stake.
+
+        Takes no workspace id, unlike its :meth:`_adopt` sibling: with no engine
+        object left to interrogate, the record is the whole of the evidence.
+        """
         if record is None:
             return (
                 DISPOSITION_REAPED,
