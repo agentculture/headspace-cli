@@ -395,6 +395,16 @@ class _ChunkReader:
     the case the streaming read exists for, so a buffer that grew with the
     artifact would defeat the whole path while still passing every
     small-artifact test.
+
+    ``read`` is the entire surface on purpose. Under
+    :data:`ARCHIVE_STREAM_MODE` :mod:`tarfile` reads through ``_Stream``, which
+    only ever calls ``fileobj.read(bufsize)`` and — because the object was
+    passed in rather than opened by it — never closes it. Type stubs describe
+    that parameter as a full ``IO[bytes]``, which the documented stream-mode
+    contract does not require and which no bytes here could honestly satisfy:
+    ``seek``, ``tell`` and ``write`` on a one-shot chunk iterator would each
+    have to be a lie. Closing the underlying stream stays where it belongs,
+    with the :class:`~contextlib.ExitStack` at the call site.
     """
 
     def __init__(self, chunks: Iterator[bytes]) -> None:
