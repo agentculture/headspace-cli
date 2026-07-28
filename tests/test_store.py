@@ -10,6 +10,7 @@ description, so a thread-only test would pass vacuously.
 
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing as mp
 import os
@@ -148,7 +149,7 @@ def test_future_schema_version_mutates_nothing(store: Store) -> None:
             load()
 
     assert path.read_bytes() == before
-    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == [".lock", "state.json"]
+    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == ["state.json"]
 
 
 def test_schema_error_renders_through_the_cli_error_contract(
@@ -293,6 +294,134 @@ def test_nested_lock_is_reentrant_within_one_store(store: Store) -> None:
     assert store.read_state(WS).state == {"generation": 1}
 
 
+# --- criterion 2a (continued): the lock outlives the data it guards -------
+
+
+def _lock_path(store: Store, workspace_id: str = WS) -> Path:
+    """Where the flock target lives — deliberately outside the workspace directory."""
+    return store.root / store_module._LOCKS_DIRNAME / f"{workspace_id}{store_module._LOCK_SUFFIX}"
+
+
+def _delete_while_holding_the_lock(
+    root: str, workspace_id: str, out_dir: str, deleted_flag: str, hold: float
+) -> None:
+    """Child process: delete the workspace, then keep holding its lock a while longer."""
+    child_store = Store(Path(root))
+    with child_store.lock(workspace_id):
+        entered = time.monotonic()
+        child_store.delete_workspace(workspace_id)  # re-entrant: the same hold
+        Path(deleted_flag).write_text("deleted", encoding="utf-8")
+        time.sleep(hold)
+        left = time.monotonic()
+    Path(out_dir, "deleter.json").write_text(json.dumps([entered, left]), encoding="utf-8")
+
+
+def _contend_once_the_delete_has_landed(
+    root: str, workspace_id: str, out_dir: str, deleted_flag: str, timeout: float
+) -> None:
+    """Child process: after the delete lands, probe and then queue for the same lock."""
+    child_store = Store(Path(root))
+    flag = Path(deleted_flag)
+    deadline = time.monotonic() + timeout
+    while not flag.exists():
+        if time.monotonic() > deadline:  # pragma: no cover - only if the deleter died
+            raise SystemExit("the deleter never signalled that it had removed the workspace")
+        time.sleep(0.005)
+    try:
+        with child_store.lock(workspace_id, blocking=False):
+            probe = "ACQUIRED"
+    except CliError:
+        probe = "BUSY"
+    with child_store.lock(workspace_id):
+        entered = time.monotonic()
+        left = time.monotonic()
+    Path(out_dir, "contender.json").write_text(json.dumps([probe, entered, left]), encoding="utf-8")
+
+
+def test_deleting_a_workspace_does_not_hand_its_lock_to_another_process(
+    store: Store, tmp_path: Path
+) -> None:
+    """Deletion is the one mutation that can destroy its own guard.
+
+    A lock file living *inside* the workspace directory is unlinked by the
+    ``rmtree`` it is serialising. POSIX keeps the flock on the now-nameless
+    inode, so the holder notices nothing — while the next process recreates the
+    directory, opens a fresh lock file at the same path, and locks *that*. Both
+    then believe they hold the workspace, one of them mid-delete. Asserting the
+    lock file's path would not catch that; only a second process failing to
+    acquire during a real delete does.
+    """
+    store.write_state(WS, {"phase": "created"})
+    out_dir = tmp_path / "intervals"
+    out_dir.mkdir()
+    deleted_flag = tmp_path / "deleted.flag"
+    hold = 0.3
+
+    ctx = mp.get_context("fork")
+    children = [
+        ctx.Process(
+            target=_delete_while_holding_the_lock,
+            args=(str(store.root), WS, str(out_dir), str(deleted_flag), hold),
+        ),
+        ctx.Process(
+            target=_contend_once_the_delete_has_landed,
+            args=(str(store.root), WS, str(out_dir), str(deleted_flag), 30.0),
+        ),
+    ]
+    for child in children:
+        child.start()
+    for child in children:
+        child.join(60)
+        if child.is_alive():  # pragma: no cover - only on a lock deadlock
+            child.kill()
+            child.join(5)
+
+    assert [child.exitcode for child in children] == [0, 0]
+    _, deleter_left = json.loads((out_dir / "deleter.json").read_text(encoding="utf-8"))
+    probe, contender_enter, _ = json.loads((out_dir / "contender.json").read_text(encoding="utf-8"))
+
+    assert probe == "BUSY", "a second process took the lock of a workspace mid-deletion"
+    assert contender_enter >= deleter_left, "the two holds overlapped across the delete"
+    # Acquiring the lock must not resurrect what the delete removed, either.
+    assert not store.workspace_dir(WS).exists()
+    assert store.list_workspaces() == []
+
+
+def test_the_lock_file_lives_outside_the_workspace_it_guards(store: Store) -> None:
+    """Pins the layout the concurrency test above depends on, so a move is deliberate."""
+    store.write_state(WS, {"phase": "created"})
+
+    assert _lock_path(store).is_file()
+    assert store.workspace_dir(WS) not in _lock_path(store).parents
+    assert _lock_path(store).parent != store.root / "workspaces"
+
+
+def test_a_deleted_workspace_keeps_its_lock_file(store: Store) -> None:
+    """The store leaks an empty lock file per deleted workspace, on purpose.
+
+    Reaping it is what reintroduces the race: any process that unlinks a lock
+    file another process may already hold hands the next acquirer a fresh inode.
+    An empty file per workspace id ever used is a bounded, cheap leak, and
+    recreating the id reuses the same file. Reaping belongs in a future sweep
+    that takes the lock non-blocking before unlinking, not in ``delete``.
+    """
+    store.write_state(WS, {"phase": "created"})
+
+    store.delete_workspace(WS)
+
+    assert _lock_path(store).is_file()
+    assert not store.workspace_dir(WS).exists()
+
+
+def test_the_lock_tree_is_never_listed_as_a_workspace(store: Store) -> None:
+    store.write_state(WS, {"phase": "created"})
+    store.write_state("ws-beta", {"phase": "created"})
+
+    store.delete_workspace(WS)
+
+    assert store.list_workspaces() == ["ws-beta"]
+
+
 # --- criterion 2b: writes are atomic via temp-and-rename ------------------
 
 
@@ -346,7 +475,102 @@ def test_interrupted_write_leaves_the_prior_content_intact(
     assert _state_path(store).read_bytes() == before
     assert store.read_state(WS).state == {"generation": 1}
     # No temp file survives the failure, so nothing partial is observable.
-    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == [".lock", "state.json"]
+    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == ["state.json"]
+
+
+def test_a_refused_directory_fsync_does_not_fail_a_completed_write(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory fsync is a durability hint about the rename, not the write.
+
+    Real filesystems refuse it (EINVAL is the common one). By then ``os.replace``
+    has already published the new state file, so reporting "cannot write" makes
+    the caller retry or abort an operation that in fact completed — for a state
+    store, strictly worse than losing the hint.
+    """
+    store.write_state(WS, {"generation": 1})
+
+    def _refuse(directory: Path) -> None:
+        raise OSError(errno.EINVAL, "directory fsync is not supported here")
+
+    monkeypatch.setattr(store_module, "_fsync_directory", _refuse)
+    record = store.write_state(WS, {"generation": 2})
+    monkeypatch.undo()
+
+    assert record.state == {"generation": 2}
+    assert store.read_state(WS).state == {"generation": 2}
+    assert json.loads(_state_path(store).read_text(encoding="utf-8"))["state"] == {"generation": 2}
+    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == ["state.json"]
+
+
+def _refuse_mkstemp(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fail(**kwargs: Any) -> tuple[int, str]:
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(store_module.tempfile, "mkstemp", _fail)
+
+
+def _refuse_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _RefusingHandle:
+        def write(self, payload: str) -> int:
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        def flush(self) -> None:  # pragma: no cover - never reached
+            pass
+
+        def fileno(self) -> int:  # pragma: no cover - never reached
+            return -1
+
+    @contextmanager
+    def _fail(fd: int, *args: Any, **kwargs: Any) -> Iterator[_RefusingHandle]:
+        os.close(fd)  # the caller no longer owns it once fdopen has taken it
+        yield _RefusingHandle()
+
+    monkeypatch.setattr(store_module.os, "fdopen", _fail)
+
+
+def _refuse_file_fsync(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fail(fd: int) -> None:
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(store_module.os, "fsync", _fail)
+
+
+def _refuse_replace(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fail(src: Any, dst: Any) -> None:
+        raise OSError(errno.EXDEV, "invalid cross-device link")
+
+    monkeypatch.setattr(store_module.os, "replace", _fail)
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    [_refuse_mkstemp, _refuse_write, _refuse_file_fsync, _refuse_replace],
+    ids=["mkstemp", "write", "file-fsync", "replace"],
+)
+def test_every_failure_up_to_the_rename_is_still_fatal(
+    store: Store,
+    monkeypatch: pytest.MonkeyPatch,
+    break_it: Any,
+) -> None:
+    """Only the directory fsync is best-effort; nothing before the rename is.
+
+    Until ``os.replace`` returns, the old state is still what a reader sees, so
+    every failure on the way there has to be reported as the failed write it is.
+    """
+    store.write_state(WS, {"generation": 1})
+    before = _state_path(store).read_bytes()
+
+    break_it(monkeypatch)
+    with pytest.raises(CliError) as exc:
+        store.write_state(WS, {"generation": 2})
+    monkeypatch.undo()
+
+    assert exc.value.code == EXIT_ENV_ERROR
+    assert exc.value.remediation
+    assert _state_path(store).read_bytes() == before
+    assert store.read_state(WS).state == {"generation": 1}
+    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == ["state.json"]
 
 
 def test_unserialisable_state_is_rejected_without_touching_disk(store: Store) -> None:
@@ -359,7 +583,7 @@ def test_unserialisable_state_is_rejected_without_touching_disk(store: Store) ->
     assert exc.value.code == EXIT_USER_ERROR
     assert exc.value.remediation
     assert _state_path(store).read_bytes() == before
-    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == [".lock", "state.json"]
+    assert sorted(p.name for p in store.workspace_dir(WS).iterdir()) == ["state.json"]
 
 
 def test_successful_writes_leave_no_temporary_files(store: Store) -> None:
@@ -368,7 +592,7 @@ def test_successful_writes_leave_no_temporary_files(store: Store) -> None:
     store.append_journal(WS, {"intent": "create"})
 
     names = sorted(path.name for path in store.workspace_dir(WS).iterdir())
-    assert names == [".lock", "journal.jsonl", "state.json"]
+    assert names == ["journal.jsonl", "state.json"]
 
 
 # --- store root resolution ------------------------------------------------

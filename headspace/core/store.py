@@ -15,6 +15,8 @@ Three properties are therefore built in here rather than left to callers:
 * **A per-workspace advisory lock.** Every mutating operation takes
   :func:`fcntl.flock` on the workspace's lock file, so interleaved verbs from
   parallel CLI invocations cannot corrupt state or double-start a job (c24).
+  The lock file lives in a sibling tree, never inside the workspace directory
+  it guards — see :meth:`Store._ensure_lock_path` for why deletion demands it.
 
 This module owns *all* filesystem access under the store root. No other module
 may read or write there: centralising it is what makes the schema check
@@ -27,7 +29,9 @@ On-disk layout::
         <workspace-id>/
           state.json            one schema-stamped envelope (see StateRecord)
           journal.jsonl         append-only intent journal, one envelope a line
-          .lock                 flock target; never read, never parsed
+      locks/
+        <workspace-id>.lock     flock target; never read, never parsed, and
+                                deliberately outlives the workspace it names
 
 Scope note: the lock serialises *processes*. ``flock`` is held per open file
 description, so nested :meth:`Store.lock` calls on one :class:`Store` are
@@ -46,7 +50,7 @@ import shutil
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,12 +66,14 @@ HOME_ENV_VAR = "HEADSPACE_HOME"
 DEFAULT_STORE_DIRNAME = ".headspace"
 
 _WORKSPACES_DIRNAME = "workspaces"
+_LOCKS_DIRNAME = "locks"
 _STATE_FILENAME = "state.json"
 _JOURNAL_FILENAME = "journal.jsonl"
-_LOCK_FILENAME = ".lock"
+_LOCK_SUFFIX = ".lock"
 
-# Workspace ids become directory names, so they are constrained rather than
-# escaped: no separators, no leading dot, no traversal.
+# Workspace ids become directory names under workspaces/ and file names under
+# locks/, so they are constrained rather than escaped: no separators, no leading
+# dot, no traversal.
 _WORKSPACE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 
 _UPGRADE_HINT = (
@@ -123,7 +129,7 @@ class Store:
     # --- paths ------------------------------------------------------------
 
     def workspace_dir(self, workspace_id: str) -> Path:
-        """Directory holding one workspace's state, journal, and lock."""
+        """Directory holding one workspace's state and journal — everything deletable."""
         return self.root / _WORKSPACES_DIRNAME / _validate_workspace_id(workspace_id)
 
     # --- locking ----------------------------------------------------------
@@ -159,7 +165,7 @@ class Store:
                 os.close(held_fd)
 
     def _acquire_flock(self, workspace: str, *, blocking: bool) -> int:
-        path = self._ensure_workspace_dir(workspace) / _LOCK_FILENAME
+        path = self._ensure_lock_path(workspace)
         try:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as err:
@@ -293,7 +299,21 @@ class Store:
         return JournalEntry(recorded_at=recorded_at, entry=dict(entry))
 
     def delete_workspace(self, workspace_id: str) -> None:
-        """Remove a workspace directory and everything under it."""
+        """Remove a workspace directory and everything under it — but not its lock.
+
+        The lock file is left behind deliberately. Unlinking it here is what
+        makes deletion race itself (see :meth:`_ensure_lock_path`), and doing it
+        after the release is no safer: another process may already be blocked on
+        that inode, and unlinking hands the next acquirer a different one.
+
+        The honest cost is a slow leak — one empty file per workspace id ever
+        used, never reclaimed, even for ids that are never recreated. That is
+        bounded by the ids an operator has actually used, costs an inode each,
+        and is reused verbatim if the id comes back. Correctness under
+        concurrent deletion is worth more than those bytes. Reaping them safely
+        needs a sweep that takes each lock non-blocking before unlinking, and
+        that is a separate verb, not a side effect of ``delete``.
+        """
         workspace = _validate_workspace_id(workspace_id)
         directory = self.workspace_dir(workspace)
         if not directory.is_dir():
@@ -344,7 +364,29 @@ class Store:
         return StateRecord(workspace_id=workspace, updated_at=updated_at, state=dict(state))
 
     def _ensure_workspace_dir(self, workspace: str) -> Path:
-        directory = self.root / _WORKSPACES_DIRNAME / workspace
+        return self._ensure_dir(self.root / _WORKSPACES_DIRNAME / workspace)
+
+    def _ensure_lock_path(self, workspace: str) -> Path:
+        """Resolve the flock target, which lives *outside* the workspace directory.
+
+        A lock file inside the workspace directory is unlinked by the very
+        :meth:`delete_workspace` it is serialising. POSIX keeps the flock alive
+        on the now-nameless inode, so the holder sees nothing wrong — meanwhile
+        any other process recreates the directory, opens a fresh lock file at
+        the same path, and locks *that* one successfully. Two processes then
+        believe they own the workspace, and the second races an in-flight
+        ``rmtree``. Keeping locks in a sibling tree lets the lock outlive the
+        data it guards, which is the only way deletion itself can be serialised.
+
+        Workspace ids are already constrained by :data:`_WORKSPACE_ID_RE` to
+        characters that are safe as a single filename, so no escaping is needed
+        to flatten ``<id>`` into ``locks/<id>.lock``. The tree is a sibling of
+        ``workspaces/`` rather than a hidden directory beneath it so that
+        :meth:`list_workspaces` cannot mistake it for a workspace at all.
+        """
+        return self._ensure_dir(self.root / _LOCKS_DIRNAME) / f"{workspace}{_LOCK_SUFFIX}"
+
+    def _ensure_dir(self, directory: Path) -> Path:
         try:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as err:
@@ -468,6 +510,11 @@ def _write_json_atomically(path: Path, document: Mapping[str, Any], *, what: str
     The temp file shares the target's directory so the rename never crosses a
     filesystem, and it is removed on any failure — a partial serialisation is
     only ever visible at the temp path, never at ``path``.
+
+    ``os.replace`` is the point of no return: everything up to it is fatal,
+    because until it returns a reader still sees the old state and the caller
+    must be told the write did not happen. Everything after it is best-effort,
+    because by then the new state is published.
     """
     payload = _encode_json(document, what) + "\n"
     directory = path.parent
@@ -488,7 +535,6 @@ def _write_json_atomically(path: Path, document: Mapping[str, Any], *, what: str
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, path)
-        _fsync_directory(directory)
     except OSError as err:
         temp_path.unlink(missing_ok=True)
         raise CliError(
@@ -499,10 +545,24 @@ def _write_json_atomically(path: Path, document: Mapping[str, Any], *, what: str
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
+    # Past the rename, and so deliberately outside the failure path above: the
+    # new state is on disk and readable, and this fsync only hardens the rename
+    # against a power loss. Filesystems do refuse it (EINVAL is the usual one),
+    # and telling a caller "cannot write" about a write that already landed is
+    # worse for a state store than losing that durability hint — it invites a
+    # retry or an abort of an operation that completed. Compare
+    # ``artifacts._fsync_dir``, which reaches the same conclusion.
+    with suppress(OSError):
+        _fsync_directory(directory)
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Durably record the rename itself, not just the file contents."""
+    """Durably record the rename itself, not just the file contents.
+
+    Raises :class:`OSError` like the syscalls it wraps; it is the *caller* that
+    decides how much a refusal matters, and the only caller here treats it as
+    non-fatal because it runs after the rename has already been published.
+    """
     fd = os.open(directory, os.O_RDONLY)
     try:
         os.fsync(fd)
