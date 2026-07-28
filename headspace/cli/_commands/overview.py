@@ -1,9 +1,10 @@
 """``headspace-cli overview`` — read-only descriptive snapshot of the agent.
 
 Describes the agent to an agent reader: identity (from culture.yaml), the verb
-surface, and the sibling-pattern artifacts this template carries. The shared
-section/render helpers here are reused by the ``cli`` noun's ``overview`` (see
-:mod:`headspace.cli._commands.cli`).
+surface — lifecycle and introspection, listed separately because they answer
+different questions — and the sibling-pattern artifacts the repo carries. The
+shared section/render helpers here are reused by the ``cli`` noun's
+``overview`` (see :mod:`headspace.cli._commands.cli`).
 
 Descriptive verbs never hard-fail on a missing target path — an optional
 positional ``target`` is accepted and ignored (overview describes this agent,
@@ -22,6 +23,14 @@ _ARTIFACTS = [
     ".claude/skills/ — the canonical guildmaster skill kit (cite-don't-import)",
     "docs/skill-sources.md — skill provenance ledger",
     "pyproject.toml + .github/workflows/ — buildable, deployable package baseline",
+]
+
+_LIFECYCLE_VERBS = [
+    "create — create a workspace under a declared policy",
+    "run <workspace> <command> — run a job inside a workspace",
+    "inspect <handle> [--logs] — status, or the full captured output",
+    "export <workspace> <name> --to PATH — publish an artifact, digest-verified",
+    "destroy <workspace> [--force] — tear down; refuses unexported artifacts",
 ]
 
 _VERBS = [
@@ -46,7 +55,8 @@ def agent_sections() -> list[dict[str, object]]:
                 f"model: {ident['model']}",
             ],
         },
-        {"title": "Verbs", "items": list(_VERBS)},
+        {"title": "Lifecycle verbs", "items": list(_LIFECYCLE_VERBS)},
+        {"title": "Introspection verbs", "items": list(_VERBS)},
         {"title": "Sibling-pattern artifacts", "items": list(_ARTIFACTS)},
     ]
 
@@ -56,14 +66,19 @@ def cli_sections() -> list[dict[str, object]]:
     return [
         {
             "title": "Verbs",
-            "items": list(_VERBS) + ["cli overview — describe the CLI surface (this command)"],
+            "items": list(_LIFECYCLE_VERBS)
+            + list(_VERBS)
+            + ["cli overview — describe the CLI surface (this command)"],
         },
         {
             "title": "Conventions",
             "items": [
                 "every command supports --json",
                 "results to stdout, errors/diagnostics to stderr (never mixed)",
-                "exit codes: 0 success, 1 user error, 2 environment error, 3+ reserved",
+                "lifecycle verbs take --provider {docker,fake} and --max-result-bytes",
+                "exit codes: 0 success, 1 user error, 2 environment error, then the "
+                "failure taxonomy — 3 policy_denied, 4 timeout, 5 cancelled, "
+                "6 computation_failed, 7 infrastructure_failure",
             ],
         },
     ]

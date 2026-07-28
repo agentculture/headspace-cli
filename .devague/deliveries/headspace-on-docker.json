@@ -2,7 +2,7 @@
   "plan_slug": "headspace-on-docker",
   "schema_version": 1,
   "created": "2026-07-27T23:07:34Z",
-  "updated": "2026-07-28T04:00:55Z",
+  "updated": "2026-07-28T06:27:06Z",
   "deviations": [
     {
       "id": "d1",
@@ -92,6 +92,21 @@
       "origin": "llm",
       "status": "approved",
       "classification": "risky"
+    },
+    {
+      "id": "d7",
+      "what": "rewrite the agent-facing self-description in learn and overview, which still advertised the repo as a clonable scaffold",
+      "task_ref": "t14",
+      "reason": "t14's scope named the README and the explain catalog but not headspace/cli/_commands/learn.py or overview.py. Those carry the CLI's own self-teaching prompt and descriptive snapshot \u2014 the surface an AGENT reads to learn what the tool does \u2014 and both still said 'Scaffold for a new Culture mesh agent... Clone it, rename the package' while listing only the five introspection verbs, omitting all five lifecycle verbs. More consequential than the README, since learn is what an agent consumer reads. Also corrects the top-level parser description and registers the pytest integration marker. Found and reported by t14, which could not fix it within its file list.",
+      "affects": [
+        "t11",
+        "c15",
+        "h10",
+        "c19"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
     }
   ]
 }

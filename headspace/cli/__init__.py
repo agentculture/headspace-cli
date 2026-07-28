@@ -76,7 +76,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser = _CliArgumentParser(
         prog="headspace-cli",
-        description="headspace-cli — a clonable template for AgentCulture mesh agents.",
+        description=(
+            "headspace-cli — ephemeral computational workspaces for agents. Offload "
+            "execution into a bounded, isolated workspace and get back a compact, "
+            "evidence-bearing result instead of a raw execution transcript."
+        ),
     )
     parser.add_argument(
         "--version",

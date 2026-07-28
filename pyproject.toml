@@ -80,3 +80,9 @@ skips = ["B101", "B404", "B603"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    # Live-engine tests. They skip cleanly when no Docker socket is reachable,
+    # so CI's unit lane never depends on a daemon — but they are slow, and
+    # naming the mark lets a developer deselect them with `-m 'not integration'`.
+    "integration: exercises a live container engine",
+]
