@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-07-29
+
+### Added
+
+- **A ninth failure category, `resource_exhausted`, and exit code `8`** — added across all four vocabulary surfaces that mirror each other (`STATUSES`, `JOB_STATUSES`, `_STATUS_EXIT_CODES`, `EXIT_CATEGORIES`/`TAXONOMY_CODES`), with a test that fails if any one of the four is missing. A job killed for exceeding a declared memory ceiling is now a distinguishable outcome instead of being folded into an ordinary failing computation.
+- **OOM detection keyed on `State.OOMKilled`, never on exit status 137** — a program can exit 137 deliberately, so the engine's own kill flag is the only sound discriminator between "the kernel killed this for memory" and "this process chose that number." Wall-clock `timeout` keeps precedence over an OOM verdict when both are true.
+- **The result package names the enforced memory ceiling and an actionable remedy** on a `resource_exhausted` outcome, and labels `max_memory_bytes` a **sampled floor**, not a peak, when the job was OOM-killed — sampling misses the allocation spike that triggered the kill, so the measured number understates the true peak. The ceiling is never substituted for the measured figure; it gets its own honest home in the key finding.
+- **Both providers (`docker` and the in-memory `fake`) are held to the widened taxonomy by the shared conformance suite**, so `resource_exhausted` is a mechanically checked backend-independent property, not a Docker-only special case. The fake gained scripting for both a not-executable command and an OOM kill so the taxonomy is exercisable without a live engine.
+- README, `headspace learn`, and `docs/traceability.md` updated to document the ninth status, exit code `8`, and the two reclassified cases below.
+
+### Changed
+
+- **A job killed for exceeding its memory ceiling now exits `8` (`resource_exhausted`), not `6` (`computation_failed`).** It used to be indistinguishable from an ordinary failing computation — same exit code, same bare "the command completed with exit status 137" sentence, warnings and attention both empty. An autonomous caller's only sane move was to rerun the identical job and watch it die identically.
+- **A command the image cannot execute now exits `6` (`computation_failed`), not `7` (`infrastructure_failure`).** It used to be reported as `infrastructure_failure` with the hint "the execution engine failed, not the job — check the engine is running and reachable, then retry," which told an autonomous agent to retry a deterministic failure forever. The job's own `exit_status` is now set by shell convention — `127` when the engine says the name isn't there, `126` when it says the name was found but isn't executable. Matching is scoped to the engine's exec-init step only, so every other engine `400` still reports `infrastructure_failure`; this change can only move cases *out* of exit `7`, never into it.
+- Exit codes `0`–`7` keep their exact prior meanings — nothing was renumbered, and a test pins the mapping — but this is not a purely additive release for a consumer with an explicit branch table on exit code: the two cases above now land in different arms than they used to. The new status and exit `8` are additive; where those two specific cases land is not.
+
+### Fixed
+
+- **Information disclosure: a raw Docker engine handle no longer reaches a caller.** The failure report for a command the image cannot execute used to carry the container id and the engine's internal `http+docker://` endpoint straight from `docker.errors.APIError` into stdout/stderr — the exact pollution headspace exists to prevent. The report is now built from what headspace already knows (the environment reference and the caller's own `argv[0]`), with the engine's diagnosis appended beneath it, redacted of the transport envelope (e.g. "400 Client Error") and of the container id by exact knowledge of the handle. The engine's original sentence stays retrievable through `headspace inspect <job> --logs` so a misclassification stays diagnosable.
+
 ## [0.8.1] - 2026-07-28
 
 ### Fixed
