@@ -42,7 +42,7 @@ import os
 from collections.abc import Buffer, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Any, Protocol
+from typing import IO, Any, Protocol, cast
 
 from headspace.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
 
@@ -208,18 +208,28 @@ class ArtifactInventory:
 
     def mark_exported(self, name: str, *, size_bytes: int, sha256: str) -> ArtifactRecord:
         """Record a verified export — size and digest come from :func:`export_artifact`."""
-        record: ArtifactRecord = replace(
-            self._require(name),
-            retention=RETENTION_EXPORTED,
-            size_bytes=size_bytes,
-            sha256=sha256,
+        # `replace()` returns the same dataclass type it was handed, but some
+        # type stubs still declare it as a bare dataclass instance, so the cast
+        # states what the call already guarantees. Constructing an
+        # `ArtifactRecord` field-by-field here instead would type-check without
+        # a cast and be worse: it would silently drop any field added later,
+        # where `replace` is total over them by construction.
+        record = cast(
+            ArtifactRecord,
+            replace(
+                self._require(name),
+                retention=RETENTION_EXPORTED,
+                size_bytes=size_bytes,
+                sha256=sha256,
+            ),
         )
         self._records[name] = record
         return record
 
     def mark_discarded(self, name: str) -> ArtifactRecord:
         """Record that a declared artifact went away unexported (a forced destroy)."""
-        record: ArtifactRecord = replace(self._require(name), retention=RETENTION_DISCARDED)
+        # Cast for the same reason as `mark_exported` above.
+        record = cast(ArtifactRecord, replace(self._require(name), retention=RETENTION_DISCARDED))
         self._records[name] = record
         return record
 
