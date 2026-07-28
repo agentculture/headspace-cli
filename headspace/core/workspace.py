@@ -843,12 +843,7 @@ class Orchestrator:
             )
             self._store.delete_workspace(workspace_id)
 
-        findings = [
-            "removed: " + (", ".join(disposition.removed) or "(none)"),
-            "retained: " + (", ".join(disposition.retained) or "(none)"),
-            "unverified: " + (", ".join(disposition.unverified) or "(none)"),
-            "lifecycle path: " + " -> ".join(target.value for target in path),
-        ]
+        findings = _removal_findings(disposition, path)
         warnings: list[str] = []
         if discarded:
             warnings.append(
@@ -1370,6 +1365,23 @@ def _pending_artifact_attention(record: Mapping[str, Any]) -> list[str]:
 def _discarded_attention(entry: ArtifactRecord) -> str:
     digest = entry.sha256 or "none — it was never exported, so nothing can verify or recover it"
     return f"discarded declared artifact '{entry.name}' (digest: {digest})"
+
+
+def _removal_findings(disposition: RemovalDisposition, path: Sequence[State]) -> list[str]:
+    """The destruction report's buckets, with an empty one named rather than blank.
+
+    Every bucket is rendered even when nothing fell into it. A line that just
+    stops after the colon reads as "not checked", and the whole point of the
+    report is that each resource named was verified one way or the other.
+    """
+    buckets = (
+        ("removed", disposition.removed),
+        ("retained", disposition.retained),
+        ("unverified", disposition.unverified),
+    )
+    findings = [f"{bucket}: {', '.join(names) or '(none)'}" for bucket, names in buckets]
+    findings.append("lifecycle path: " + " -> ".join(target.value for target in path))
+    return findings
 
 
 def _descriptor_findings(state: State, descriptor: WorkspaceDescriptor | None) -> list[str]:
