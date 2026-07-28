@@ -17,7 +17,23 @@ config:
 ignores:
   - "node_modules/**"
   - ".local/**"
+  # Installed third-party packages. Their LICENSE.md files are not ours to
+  # reformat, and they only appear once dependencies are synced — which is why
+  # CI caught this and a local run before `uv sync` did not.
+  - ".venv/**"
+  - "**/site-packages/**"
   - ".afi/**"
   - ".teken/**"
   # Vendored skills are cited verbatim from guildmaster — do not reformat them.
   - ".claude/skills/**"
+  # Specs and plans are rendered by `devague export` from frame/plan state and
+  # re-exported in place on every /challenge or /spec-to-plan pass, so any hand
+  # edit is lost on the next run. They also trip MD037 on snake_case identifiers
+  # (`_output.py`, `_dispatch`), which devague has no move to reword — claim text
+  # is immutable once captured, and reject-and-recapture renumbers ids the plan
+  # already covers.
+  - "docs/specs/**"
+  - "docs/plans/**"
+  # devague's own working state (questions, review artifacts). Gitignored, so CI
+  # never sees it; ignored here so local lint runs match CI.
+  - ".devague/**"

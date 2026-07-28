@@ -1,0 +1,527 @@
+{
+  "slug": "headspace-on-docker",
+  "title": "headspace on docker",
+  "frame_slug": "headspace-on-docker",
+  "schema_version": 3,
+  "status": "exported",
+  "created": "2026-07-27T22:40:36Z",
+  "updated": "2026-07-27T22:45:14Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "headspace-cli ships ephemeral computational workspaces for agents: an agent creates a Docker-backed headspace under explicit resource and access policies, runs jobs that share workspace state, exports named artifacts, and receives a compact evidence-bearing result package while the raw execution transcript stays out of model context"
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "the full loop runs against real Docker with no backend detail entering the model context beyond what the result package deliberately carries: create, run, inspect, export, destroy, each emitting bounded structured output"
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "explicit lifecycle with normalized states (requested, provisioning, ready, running, completed, failed, cancelled, expired, destroyed) per docs/headspace_cli_issue_requirements.docx section 6; state transitions observable, invalid transitions fail clearly"
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "every lifecycle state and legal transition is exercised in tests via a fake provider, and an invalid transition raises CliError with a remediation hint without mutating stored state"
+    },
+    {
+      "id": "c3",
+      "kind": "requirement",
+      "text": "default result is a compact context-return package (outcome summary, normalized status, key findings, evidence, artifact inventory, warnings, resource usage, provenance, attention items) per doc section 8; raw logs stay inspectable via a separate path and never enter the default result (FR-11, FR-16, NFR-03)"
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "for a job emitting megabytes of stdout, the default result package stays within a configurable byte bound and carries references instead of the transcript; a separate inspect path retrieves full logs on request"
+    },
+    {
+      "id": "c4",
+      "kind": "requirement",
+      "text": "Docker is the first conformance backend (user decision; resolves doc open decision 1) behind a provider abstraction so lifecycle and result semantics stay backend-neutral (FR-25, FR-26); host verified with Docker 29.1.3 plus seccomp, apparmor, cgroupns"
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "no Docker-specific field or string appears in the primary result schema: swapping the Docker provider for the in-memory fake yields the identical result structure, verified by a conformance test both providers pass"
+    },
+    {
+      "id": "c5",
+      "kind": "requirement",
+      "text": "new workspace noun groups register via the existing register(sub) extension point in headspace/cli/__init__.py _build_parser and every verb honors --json (FR-27 machine interface lands on the existing contract)"
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "new workspace verbs register without editing _dispatch, _output, or _errors, and teken cli doctor . --strict stays green after registration"
+    },
+    {
+      "id": "c6",
+      "kind": "requirement",
+      "text": "all new verbs keep the stable contract in headspace/cli/_errors.py and _output.py: results to stdout, errors to stderr as CliError {code, message, remediation}, exit codes 0/1/2 with 3+ reserved \u2014 the reserved band is where FR-12 failure taxonomy (policy denial, timeout, infra failure) can land"
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "policy denial, timeout, cancellation, computational failure, and infrastructure failure are distinguishable in both text and --json output, each mapped to a documented exit code with user error staying exit 1 and environment error exit 2"
+    },
+    {
+      "id": "c7",
+      "kind": "boundary",
+      "text": "the CI agent-first rubric gate (uv run teken cli doctor . --strict in .github/workflows/tests.yml) constrains any new CLI surface: nouns with action verbs must expose overview, errors need hint lines; new noun groups must pass it"
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "the branch adding workspace verbs runs uv run teken cli doctor . --strict in CI and it passes \u2014 the rubric gate is exercised, not assumed"
+    },
+    {
+      "id": "c11",
+      "kind": "requirement",
+      "text": "security by default per NFR-02: containers start network-disabled with explicit resource limits and a bounded workspace mount; access expands only through declared policy, and unsupported policy is rejected rather than silently degraded (NFR-09, FR-05, FR-06)"
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "an integration test attempts network egress from a default headspace and fails, and the declared budget lands as container resource limits observable via docker inspect; requesting an unsupported policy fails before any job runs"
+    },
+    {
+      "id": "c15",
+      "kind": "before_state",
+      "text": "agents run computation through generic shells or ad hoc sandboxes: execution output floods model context, temporary state has no owner, security and provenance are implicit, and sandbox lifecycle logic is reimplemented per runtime (doc section 2 problem statement)"
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "the spec claims no problem beyond what doc section 2 records \u2014 every pain point in the before-state cites the requirements doc, none is invented"
+    },
+    {
+      "id": "c16",
+      "kind": "after_state",
+      "text": "an agent delegates a non-trivial computation to a Docker-backed headspace and receives a compact evidence-bearing result package plus named artifacts, with the noisy working process staying outside its context \u2014 the doc section 11 MVP success test, passed literally"
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "the after-state is executable, not aspirational: a scripted delegation returns a bounded result package and recoverable artifacts with zero backend knowledge required of the caller"
+    },
+    {
+      "id": "c17",
+      "kind": "success_signal",
+      "text": "the section 11 acceptance list passes end to end against real Docker: create, run multiple jobs sharing state, inspect, export named artifacts with digests, destroy with a disposition report \u2014 default result bounded and far smaller than the raw transcript, CI green (pytest, coverage 60+, afi rubric, version bump)"
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "each section 11 acceptance criterion maps to at least one automated test or documented manual check in the delivered plan \u2014 none is waved through"
+    },
+    {
+      "id": "c19",
+      "kind": "audience",
+      "text": "three consumer classes with distinct renderings: AI agents consume the default markdown text output, humans consume markdown now with an interactive or HTML webserver view as a possible later mode, and scripts or non-AI bots consume --json \u2014 user decision refining the interface model"
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "the same underlying data renders in every mode: default markdown output and --json carry identical fields, asserted by a rendering test; no verb requires an agent to parse human-only formatting"
+    },
+    {
+      "id": "c20",
+      "kind": "requirement",
+      "text": "runtime profiles resolve to Docker images pinned by digest; the digest actually used is recorded in job provenance and create fails explicitly when the image cannot be resolved \u2014 image pull happens host-side so job-level network stays closed (FR-19, FR-20, doc section 13 non-reproducible-environments risk)"
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "two creates from the same profile record the same image digest unless the profile is explicitly updated, and every completed job result carries the digest actually used"
+    },
+    {
+      "id": "c21",
+      "kind": "requirement",
+      "text": "create probes engine capabilities (API version, cgroup controllers for memory, cpu, pids) and the effective-policy report distinguishes enforced from measured-only limits; a budget the host cannot enforce fails closed or degrades explicitly per NFR-09 \u2014 storage on the default local volume driver is measured-only and must be reported as such (FR-30, doc section 13 silent-weakening risk)"
+    },
+    {
+      "id": "h15",
+      "kind": "honesty",
+      "text": "on a host that cannot enforce a requested memory limit, create fails with a policy error rather than running unlimited; the effective-policy output labels every limit enforced or measured, with storage showing measured on the local driver"
+    },
+    {
+      "id": "c22",
+      "kind": "requirement",
+      "text": "every engine object carries a headspace ownership label and state mutations are crash-consistent: a CLI killed between an engine call and the state write leaves a reconcilable orphan, and lazy reconciliation on any invocation adopts or reaps labeled orphans and reports the disposition (NFR-07: infrastructure failure never masquerades as computational failure)"
+    },
+    {
+      "id": "h16",
+      "kind": "honesty",
+      "text": "killing the CLI between container create and state write leaves no permanent leak: the next invocation detects the labeled orphan, reconciles it, and reports it in attention items"
+    },
+    {
+      "id": "c23",
+      "kind": "requirement",
+      "text": "artifact export is atomic and digest-verified end to end: content is staged to a temporary path, its digest computed and checked, then renamed into place \u2014 an interrupted export never leaves a partial file presented as a completed artifact (FR-14, FR-15, NFR-05)"
+    },
+    {
+      "id": "h17",
+      "kind": "honesty",
+      "text": "interrupting an export mid-copy leaves no destination file at the final path; a completed export always matches its recorded digest"
+    },
+    {
+      "id": "c24",
+      "kind": "requirement",
+      "text": "concurrent CLI invocations against one workspace serialize through a per-workspace lock; destroy while a job runs either cancels it first or refuses with a clear error \u2014 interleaved verbs can never corrupt the state store or double-start a job"
+    },
+    {
+      "id": "h18",
+      "kind": "honesty",
+      "text": "parallel runs against a single workspace never corrupt state or double-start; destroy during an active job takes the documented path (cancel-then-destroy or refuse) \u2014 exercised by a concurrency test"
+    },
+    {
+      "id": "c25",
+      "kind": "requirement",
+      "text": "job stdout and stderr are bounded at capture time via engine log options and streaming caps, not only at render time \u2014 a job emitting unbounded output cannot exhaust host disk or bloat the state store; overflow is recorded as a truncation event in warnings (FR-16, FR-05 output volume)"
+    },
+    {
+      "id": "h19",
+      "kind": "honesty",
+      "text": "a job writing a gigabyte to stdout leaves only the configured bounded capture on disk with a truncation marker, and the overflow surfaces in the result package warnings"
+    },
+    {
+      "id": "c26",
+      "kind": "boundary",
+      "text": "jobs never receive the engine socket, host filesystem bind mounts, host network, or extra devices; the only writable surface inside a job is the bounded workspace volume \u2014 verified per job, not assumed (probe evidence on this host: network none blocked egress, memory and pids limits landed in HostConfig)"
+    },
+    {
+      "id": "h20",
+      "kind": "honesty",
+      "text": "the conformance suite inspects every MVP job container and asserts no socket mount, no host bind mounts, network none by default, and only the workspace volume writable"
+    },
+    {
+      "id": "c27",
+      "kind": "requirement",
+      "text": "the state store carries a schema_version from day one; an unknown or future version fails closed with a migration hint instead of reinterpreting or overwriting state (doc section 13 reproducibility risk)"
+    },
+    {
+      "id": "h21",
+      "kind": "honesty",
+      "text": "pointing the CLI at a state file with a future schema_version makes every verb exit with the version error and remediation hint \u2014 no traceback, no mutation"
+    },
+    {
+      "id": "c28",
+      "kind": "requirement",
+      "text": "destroy on a workspace holding declared but never-exported artifacts refuses with the artifact inventory and requires an explicit force flag; the destruction report states what was removed, what was retained elsewhere, and what could not be verified (doc section 11 destruction criterion \u2014 data-loss guard)"
+    },
+    {
+      "id": "h22",
+      "kind": "honesty",
+      "text": "destroying a workspace with an unexported declared artifact and no force flag exits non-zero and removes nothing; with force it proceeds and the report lists the discarded artifacts by name and digest"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Lifecycle state machine \u2014 states enum and transition table in headspace/core/states.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "tests parametrize the full transition matrix, legal and illegal; every one of the nine states is reachable",
+        "an illegal transition raises CliError with a remediation hint and leaves stored state unchanged"
+      ],
+      "deps": [],
+      "covers": [
+        "c2",
+        "h1"
+      ],
+      "instruction": "write tests first from the transition table in the spec (c2 instruction); keep the enum and table in one module with no engine imports so the fake provider and CLI both consume it"
+    },
+    {
+      "id": "t2",
+      "summary": "Result package schema and dual renderers (markdown default, JSON) with render-time byte bound in headspace/core/result.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "one result structure renders to markdown and JSON carrying identical fields, asserted by a rendering test",
+        "a multi-megabyte captured output yields a package within the configured byte bound, with truncation markers referencing the inspect path"
+      ],
+      "deps": [],
+      "covers": [
+        "c3",
+        "h2",
+        "c19",
+        "h13"
+      ],
+      "instruction": "build the result dataclass first, then two pure renderers over it (c19 instruction: data-first, never format-then-parse); enforce the byte bound in the renderer with truncation markers naming the inspect verb"
+    },
+    {
+      "id": "t3",
+      "summary": "Policy and budget model with enforced-vs-measured effective-policy view in headspace/core/policy.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "policy objects declare network, filesystem, and resource budgets; the effective-policy view labels every limit enforced or measured",
+        "requesting a policy the capability snapshot cannot satisfy raises a policy error before any job runs"
+      ],
+      "deps": [],
+      "covers": [
+        "c21"
+      ],
+      "instruction": "model limits as declared-vs-effective pairs; the effective view consumes the provider capability snapshot persisted by t9 but this module must not import any provider \u2014 keep it pure data"
+    },
+    {
+      "id": "t4",
+      "summary": "State store under ~/.headspace with schema_version fail-closed and per-workspace advisory lock in headspace/core/store.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a state file with a future schema_version makes every load fail with the version error and hint \u2014 no traceback, no mutation",
+        "two processes contending for one workspace lock serialize; store writes are atomic via temp-and-rename"
+      ],
+      "deps": [],
+      "covers": [
+        "c27",
+        "h21",
+        "c24"
+      ],
+      "instruction": "one store module owns all filesystem access under ~/.headspace (c27 instruction: centralize the schema check); os.replace for atomicity, fcntl advisory lock per workspace id; honor a HEADSPACE_HOME env override so tests never touch the real store"
+    },
+    {
+      "id": "t5",
+      "summary": "Runtime profiles resolving to digest-pinned images in headspace/core/profiles.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "each profile maps to a digest-pinned image reference; two resolutions of one profile return the same digest until the profile is explicitly updated",
+        "an unresolvable image fails create explicitly with a policy-grade error, never a silent substitute"
+      ],
+      "deps": [],
+      "covers": [
+        "c20",
+        "h14"
+      ],
+      "instruction": "profiles are data: name maps to an image ref pinned by sha256 digest in one module (c20 instruction); resolution returns the digest without pulling \u2014 the provider pulls; ship a python 3.12 default profile"
+    },
+    {
+      "id": "t6",
+      "summary": "Artifact inventory and atomic digest-verified export in headspace/core/artifacts.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "export streams to a partial path, verifies the digest, then renames; interrupting mid-copy leaves no file at the final path",
+        "the inventory records name, type, size, digest, and retention status for every declared artifact"
+      ],
+      "deps": [],
+      "covers": [
+        "c23",
+        "h17"
+      ],
+      "instruction": "hash with sha256 while streaming to a .partial path, fsync, verify, os.replace (c23 instruction); inventory entries are plain structures feeding the result package artifact section"
+    },
+    {
+      "id": "t7",
+      "summary": "Failure-taxonomy exit codes in the reserved 3+ band plus learn output update in headspace/cli/_errors.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "policy denial, timeout, cancellation, computational failure, and infrastructure failure map to distinct documented exit codes; user error stays 1, environment error stays 2",
+        "each category is distinguishable in text and --json error output and listed in learn"
+      ],
+      "deps": [],
+      "covers": [
+        "c6",
+        "h5"
+      ],
+      "instruction": "extend the 3+ band in _errors.py with policy-denied, timeout, and infrastructure constants and document them in learn output (c6 instruction); never renumber 0 1 2"
+    },
+    {
+      "id": "t8",
+      "summary": "Provider interface plus in-memory fake and conformance suite skeleton in headspace/providers/",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "the conformance suite runs green against the fake provider and is parametrized to accept any provider implementation",
+        "no provider-specific field appears in any structure the interface returns"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3"
+      ],
+      "covers": [
+        "c4",
+        "h3"
+      ],
+      "instruction": "define the provider Protocol from the verbs the workspace layer needs \u2014 create, run job, inspect, remove; the conformance suite is a pytest class parametrized by a provider fixture (c4 instruction) so the Docker provider reuses it unchanged"
+    },
+    {
+      "id": "t9",
+      "summary": "Docker provider \u2014 SDK client, ownership labels, closed-by-default creation, capability probe, capture-time log caps in headspace/providers/docker.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "the conformance suite passes against the Docker provider on a live engine",
+        "created containers show NetworkMode none, budget-derived memory cpu pids limits, workspace-volume-only binds, no devices, no engine socket \u2014 asserted from HostConfig",
+        "the create-time capability probe persists an enforced-vs-measured snapshot and job containers carry log-driver size caps"
+      ],
+      "deps": [
+        "t8",
+        "t5"
+      ],
+      "covers": [
+        "c4",
+        "h3",
+        "c11",
+        "c21",
+        "c22",
+        "c25",
+        "c26"
+      ],
+      "instruction": "docker SDK imports live only in this module; every engine object gets a headspace workspace-id label (c22 instruction); create with network none, memory cpu pids from the budget, log-driver size caps (c25 instruction); probe engine capabilities once and persist the snapshot (c21 instruction)"
+    },
+    {
+      "id": "t10",
+      "summary": "Workspace orchestration \u2014 lifecycle flows, intent journal, orphan reconciliation, destroy guard in headspace/core/workspace.py",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "create, run, inspect, export, and destroy flows validate transitions and pass unit tests against the fake provider",
+        "a simulated crash between engine call and state write leaves a journaled orphan the next invocation reconciles and reports in attention items",
+        "destroy with unexported declared artifacts refuses without force and removes nothing; destroy during an active job takes the documented path"
+      ],
+      "deps": [
+        "t4",
+        "t6",
+        "t8"
+      ],
+      "covers": [
+        "c22",
+        "h16",
+        "c24",
+        "c28",
+        "h22"
+      ],
+      "instruction": "journal intent to the store before each engine mutation and reconcile labeled orphans at entry (c22 instruction); destroy diffs declared artifacts against the export log and gates on force (c28 instruction); depend only on the provider Protocol, never on docker directly"
+    },
+    {
+      "id": "t11",
+      "summary": "CLI verbs create, run, inspect, export, destroy via the register(sub) extension point",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "five _commands modules register without editing _dispatch, _output, or the parser plumbing; every verb honors --json",
+        "uv run teken cli doctor . --strict passes with the new verbs registered"
+      ],
+      "deps": [
+        "t10",
+        "t7"
+      ],
+      "covers": [
+        "c5",
+        "h4",
+        "c7",
+        "h8"
+      ],
+      "instruction": "one module per verb under _commands following the register(sub) pattern (c5 instruction); render through the t2 result renderers; exit codes from t7; run the strict rubric gate before finishing"
+    },
+    {
+      "id": "t12",
+      "summary": "Docker integration suite \u2014 isolation, limits, crash recovery, flooding, concurrency against a live engine",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "egress from a default workspace fails; declared budgets appear in docker inspect; unsupported policy fails before any job runs",
+        "the kill-based orphan test reconciles and reports; an interrupted export leaves no final-path file; a gigabyte-writer job leaves only bounded capture with a truncation warning",
+        "parallel verbs against one workspace never corrupt state or double-start; destroy-during-run follows the documented path"
+      ],
+      "deps": [
+        "t9",
+        "t10"
+      ],
+      "covers": [
+        "h6",
+        "h15",
+        "h16",
+        "h18",
+        "h19",
+        "h20"
+      ],
+      "instruction": "mark these tests integration and skip cleanly when no engine socket is present (c12: unit coverage never needs a daemon); each of h6 h15 h16 h18 h19 h20 gets a named test"
+    },
+    {
+      "id": "t13",
+      "summary": "End-to-end MVP success test plus section 11 traceability table",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "the scripted delegation creates a workspace, runs a noisy artifact-producing job, asserts a bounded evidence-bearing package, recovers the artifact by digest, destroys, and checks the disposition report",
+        "docs/traceability.md maps every section 11 acceptance criterion to a test id or documented manual check and CI runs the automated ones"
+      ],
+      "deps": [
+        "t11",
+        "t12"
+      ],
+      "covers": [
+        "c1",
+        "h7",
+        "c16",
+        "h11",
+        "c17",
+        "h12"
+      ],
+      "instruction": "script the doc section 11 MVP success test literally (c1 instruction); the traceability table lists criterion, test id or documented manual check, and status (c17 instruction) \u2014 no criterion waved through"
+    },
+    {
+      "id": "t14",
+      "summary": "Packaging and docs \u2014 docker dependency pin, README rewrite, explain catalog for new verbs, version bump",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "pyproject pins the docker SDK; README replaces the zero-dependency claim, documents the new verbs, and quotes the doc section 2 problem statement as the before-state",
+        "explain covers every new verb path and markdownlint plus the rubric gate stay green"
+      ],
+      "deps": [
+        "t11"
+      ],
+      "covers": [
+        "c15",
+        "h10",
+        "c7"
+      ],
+      "instruction": "pin the docker SDK with a compatible-release specifier probed against engine 29.1.3 (c30); README keeps the agent-first quickstart shape; use the version-bump skill so pyproject and CHANGELOG move together (CI blocks otherwise)"
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "rootless or non-Linux Docker hosts may not enforce cgroup limits; the integration suite targets rootful Linux only (frame v7) \u2014 enforced-vs-measured reporting is the mitigation",
+      "kind": "unknown_nonblocking",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r2",
+      "text": "docker SDK release cadence versus engine API drift \u2014 SDK pinned (7.x probed against engine 29.1.3); the conformance suite is the canary",
+      "kind": "unknown_nonblocking",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r3",
+      "text": "Docker-in-CI flakiness and latency for the integration suite \u2014 may need a dedicated job, retries, or a nightly split; unit coverage stays daemon-free by design",
+      "kind": "unknown_nonblocking",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r4",
+      "text": "file the shell-cli issue describing the execution seam headspace reserves (frame decision c18) once the provider interface stabilizes in t8",
+      "kind": "follow_up",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    }
+  ]
+}

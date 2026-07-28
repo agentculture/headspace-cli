@@ -1,0 +1,112 @@
+{
+  "plan_slug": "headspace-on-docker",
+  "schema_version": 1,
+  "created": "2026-07-27T23:07:34Z",
+  "updated": "2026-07-28T06:27:06Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "PolicyError subclasses CliError and carries EXIT_POLICY_DENIED (3) instead of being a structural look-alike with exit code 1",
+      "task_ref": "t3",
+      "reason": "t3's brief told it to keep core free of CLI imports while t1 and t5 were told to import CliError, so wave 0 shipped two error contracts; main() catches CliError by name and wraps anything else as 'unexpected: file a bug', so a policy refusal would have surfaced as an internal defect. Exit code 1 also contradicted spec honesty condition h5, which requires policy denial to carry its own documented code \u2014 t3 used 1 only because its brief predated t7's taxonomy band. APPLIED DURING THE MERGE GATE before this record was written.",
+      "affects": [
+        "t1",
+        "t5",
+        "t7",
+        "c6",
+        "h5"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d2",
+      "what": "failure-category tag renders in emit_error instead of being prefixed onto CliError.message",
+      "task_ref": "t7",
+      "reason": "t7's acceptance criterion required the category to be distinguishable in TEXT error output, but its brief scoped headspace/cli/_output.py out of its file list, leaving message mutation as the only reachable workaround. That mutated a field callers read and duplicated the category already present in to_dict(). The fix edits _output.py, which no wave-0 task owned. t7's tests asserted the behaviour rather than the mechanism, so they pass unchanged. APPLIED DURING THE MERGE GATE before this record was written.",
+      "affects": [
+        "c6",
+        "h5"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d3",
+      "what": "assign the ArtifactRecord to result.Artifact mapping explicitly to t10",
+      "task_ref": "t10",
+      "reason": "t2 and t6 independently defined artifact vocabularies that do not line up (t6: name, content_type, purpose, retention, size_bytes, sha256; t2: name, purpose, media_type, digest, size_bytes, reference). t6's to_list() is documented as feeding the result package's artifact section but cannot construct t2's Artifact directly. The plan gave t2 and t7 a shared status vocabulary but never gave t2 and t6 a shared artifact one, so no task owns the mapping. NOT YET APPLIED \u2014 this amends t10's brief before wave 2 starts.",
+      "affects": [
+        "t2",
+        "t6",
+        "c3"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up"
+    },
+    {
+      "id": "d4",
+      "what": "workspaces hold at ready with an active_jobs count and never enter the running state; t10 adds a running->ready edge so the spec's running state becomes real",
+      "task_ref": "t8",
+      "reason": "t1 built TRANSITIONS as a strict DAG with no edge back to ready, so ready->running->completed would exhaust a workspace's lifecycle on its first job \u2014 yet spec FR-07 requires multiple jobs to share one session and doc section 6 stage 4 (Execute) describes exactly that. t8 resolved the conflict by never entering running, which leaves a state named in spec claim c2 unreachable in practice and forces t8's destroy-during-run refusal to synthesize its error by asking the table about a transition no workspace actually makes. Resolution assigned to t10: add running->ready to states.py and drive ready->running->ready around each job, which makes the state real and turns the synthesized guard into a genuine one.",
+      "affects": [
+        "t1",
+        "t10",
+        "c2",
+        "h1"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "needs-follow-up"
+    },
+    {
+      "id": "d5",
+      "what": "the docker SDK runtime dependency lands in wave 2 instead of wave 4",
+      "task_ref": "t14",
+      "reason": "t9 (wave 2) cannot import the docker SDK unless pyproject declares it, but the plan assigned dependency pinning to t14 in wave 4. Sequencing the plan strictly would force t9 to either edit a file the plan gave to another task or build against an uninstallable import. Landing only the dependency early (docker>=7.1,<8, probed as SDK 7.2.0 against engine 29.1.3 / API 1.52); t14 retains the README rewrite, the zero-dependency claim removal, the explain catalog, and the version bump.",
+      "affects": [
+        "t9",
+        "c15",
+        "h10"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d6",
+      "what": "add an artifact read-back verb to the Provider seam so export can retrieve bytes from a workspace",
+      "task_ref": "t10",
+      "reason": "The Provider Protocol shipped with capabilities/create/run/inspect/remove and no way to read bytes OUT of a workspace, so Orchestrator.export takes the byte source as a caller-supplied parameter. That is unimplementable for the CLI: 'headspace export <id> <artifact>' must pull the bytes from inside the Docker volume, and no task owns that capability. Blocks t11's export verb, t13's MVP success test (recover the artifact by digest), and the section 11 acceptance criterion on explicit artifact export. Neither t8 nor t9 was at fault \u2014 the plan's five-verb seam was specified without a read-back path. Resolution: a dedicated task extends the Protocol, the fake, the Docker provider, and the conformance suite, and wires export to pull from the provider when no explicit source is given.",
+      "affects": [
+        "t8",
+        "t9",
+        "t11",
+        "t13",
+        "c1",
+        "h7"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "risky"
+    },
+    {
+      "id": "d7",
+      "what": "rewrite the agent-facing self-description in learn and overview, which still advertised the repo as a clonable scaffold",
+      "task_ref": "t14",
+      "reason": "t14's scope named the README and the explain catalog but not headspace/cli/_commands/learn.py or overview.py. Those carry the CLI's own self-teaching prompt and descriptive snapshot \u2014 the surface an AGENT reads to learn what the tool does \u2014 and both still said 'Scaffold for a new Culture mesh agent... Clone it, rename the package' while listing only the five introspection verbs, omitting all five lifecycle verbs. More consequential than the README, since learn is what an agent consumer reads. Also corrects the top-level parser description and registers the pytest integration marker. Found and reported by t14, which could not fix it within its file list.",
+      "affects": [
+        "t11",
+        "c15",
+        "h10",
+        "c19"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "acceptable"
+    }
+  ]
+}

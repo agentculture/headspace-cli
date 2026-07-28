@@ -1,6 +1,6 @@
 [project]
 name = "headspace-cli"
-version = "0.6.1"
+version = "0.8.1"
 description = "Headspace is an ephemeral computational workspace for agents. It lets models offload execution, experimentation, and calculation without polluting their reasoning context, then exports only the results and evidence worth retaining."
 readme = "README.md"
 license = "Apache-2.0"
@@ -13,7 +13,14 @@ classifiers = [
     "Topic :: Software Development",
     "Intended Audience :: Developers",
 ]
-dependencies = []
+dependencies = [
+    # The Docker SDK is the first runtime dependency, per the converged spec's
+    # recorded decision (frame headspace-on-docker, q1). Compatible-release
+    # bound: probed against engine 29.1.3 / API 1.52 with SDK 7.2.0. Only
+    # headspace/providers/docker.py may import it — every other layer talks to
+    # the backend-neutral Provider protocol in headspace/providers/base.py.
+    "docker>=7.1,<8",
+]
 
 [project.urls]
 Homepage = "https://github.com/agentculture/headspace-cli"
@@ -73,3 +80,9 @@ skips = ["B101", "B404", "B603"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    # Live-engine tests. They skip cleanly when no Docker socket is reachable,
+    # so CI's unit lane never depends on a daemon — but they are slow, and
+    # naming the mark lets a developer deselect them with `-m 'not integration'`.
+    "integration: exercises a live container engine",
+]
