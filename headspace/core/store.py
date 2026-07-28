@@ -393,7 +393,7 @@ class Store:
             raise CliError(
                 EXIT_ENV_ERROR,
                 f"cannot use the headspace store at {self.root}: {err}",
-                f"Ensure {self.root} is a writable directory, or set " f"{HOME_ENV_VAR} to one.",
+                f"Ensure {self.root} is a writable directory, or set {HOME_ENV_VAR} to one.",
             ) from err
         return directory
 
