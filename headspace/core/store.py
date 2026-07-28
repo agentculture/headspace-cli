@@ -81,6 +81,19 @@ _UPGRADE_HINT = (
     "headspace never rewrites state it cannot read."
 )
 
+# Every way the store can fail to take bytes it was asked to write — creating a
+# temp file, appending to the journal, renaming into place — ends in the same
+# two questions, so they are asked with one voice.
+_UNWRITABLE_HINT = "Check permissions and free space on the store filesystem."
+
+# A file that parsed as something other than the record it should be. The
+# refusal to overwrite is the load-bearing half: the operator's copy is the only
+# copy, and a store that repaired itself would destroy the evidence.
+_CORRUPT_FILE_HINT = (
+    "The store file is corrupt. Move it aside and let headspace "
+    "recreate the workspace; headspace will not overwrite it for you."
+)
+
 
 def store_root() -> Path:
     """Resolve the store root: ``$HEADSPACE_HOME`` when set, else ``~/.headspace``.
@@ -294,7 +307,7 @@ class Store:
                 raise CliError(
                     EXIT_ENV_ERROR,
                     f"cannot append to {path}: {err}",
-                    "Check permissions and free space on the store filesystem.",
+                    _UNWRITABLE_HINT,
                 ) from err
         return JournalEntry(recorded_at=recorded_at, entry=dict(entry))
 
@@ -393,7 +406,7 @@ class Store:
             raise CliError(
                 EXIT_ENV_ERROR,
                 f"cannot use the headspace store at {self.root}: {err}",
-                f"Ensure {self.root} is a writable directory, or set " f"{HOME_ENV_VAR} to one.",
+                f"Ensure {self.root} is a writable directory, or set {HOME_ENV_VAR} to one.",
             ) from err
         return directory
 
@@ -436,15 +449,13 @@ def _decode_json(raw: str, path: Path, *, line_number: int | None = None) -> dic
         raise CliError(
             EXIT_ENV_ERROR,
             f"{where} is not valid JSON: {err}",
-            "The store file is corrupt. Move it aside and let headspace "
-            "recreate the workspace; headspace will not overwrite it for you.",
+            _CORRUPT_FILE_HINT,
         ) from err
     if not isinstance(document, dict):
         raise CliError(
             EXIT_ENV_ERROR,
             f"{where} is not a JSON object",
-            "The store file is corrupt. Move it aside and let headspace "
-            "recreate the workspace; headspace will not overwrite it for you.",
+            _CORRUPT_FILE_HINT,
         )
     return document
 
@@ -486,8 +497,7 @@ def _require_mapping(value: Any, path: Path, field_name: str) -> dict[str, Any]:
         raise CliError(
             EXIT_ENV_ERROR,
             f"{path} has a {field_name!r} field that is not an object",
-            "The store file is corrupt. Move it aside and let headspace "
-            "recreate the workspace; headspace will not overwrite it for you.",
+            _CORRUPT_FILE_HINT,
         )
     return value
 
@@ -526,7 +536,7 @@ def _write_json_atomically(path: Path, document: Mapping[str, Any], *, what: str
         raise CliError(
             EXIT_ENV_ERROR,
             f"cannot create a temporary file in {directory}: {err}",
-            "Check permissions and free space on the store filesystem.",
+            _UNWRITABLE_HINT,
         ) from err
     temp_path = Path(temp_name)
     try:
@@ -540,7 +550,7 @@ def _write_json_atomically(path: Path, document: Mapping[str, Any], *, what: str
         raise CliError(
             EXIT_ENV_ERROR,
             f"cannot write {path}: {err}",
-            "Check permissions and free space on the store filesystem.",
+            _UNWRITABLE_HINT,
         ) from err
     except BaseException:
         temp_path.unlink(missing_ok=True)
