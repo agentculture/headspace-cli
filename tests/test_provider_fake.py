@@ -47,6 +47,7 @@ from headspace.providers.base import (
     ENVIRONMENT_DIGEST_RE,
     REMOVABLE_RESOURCES,
     REMOVAL_PATHS,
+    ByteStream,
     JobOutcome,
     OpaqueRef,
     Provider,
@@ -57,6 +58,7 @@ from headspace.providers.base import (
     guard_removable,
     requested_limit,
     require_command,
+    require_workspace_path,
 )
 from headspace.providers.fake import FakeProvider, JobPlan
 from tests.conformance import (
@@ -76,8 +78,13 @@ SUCCEEDING = ("headspace-echo", "conformance-ok")
 FAILING = ("headspace-exit", "7")
 SLOW = ("headspace-sleep", "forever")
 FLOODING = ("headspace-flood",)
+WRITING = ("headspace-write", "artifact.bin")
 ECHO_TEXT = "conformance-ok"
 FLOOD_BUDGET = 4096
+#: The same bytes the Docker binding's writing command produces, so both
+#: bindings hold the seam to one artifact rather than to two.
+ARTIFACT_PATH = "artifact.bin"
+ARTIFACT_BYTES = (b"headspace\n" * 820)[:8192]
 
 
 def _scripted(provider: FakeProvider) -> FakeProvider:
@@ -87,10 +94,19 @@ def _scripted(provider: FakeProvider) -> FakeProvider:
     # A genuine over-budget capture: the fake really truncates this string, so
     # the conformance assertion exercises the same code path a live engine does.
     provider.script_command(FLOODING, JobPlan.flooding("headspace " * 8192))
+    # A job that really writes into the workspace — the read-back tests fetch
+    # what this left behind, never content injected past the provider.
+    provider.script_command(WRITING, JobPlan.succeeding(writes={ARTIFACT_PATH: ARTIFACT_BYTES}))
     return provider
 
 
 def _case_for(provider: FakeProvider) -> ProviderCase:
+    def break_engine() -> None:
+        # The fake is armed per verb and the arming is one-shot, so both verbs
+        # the suite breaks are armed together; each test consumes exactly one.
+        provider.break_next("run")
+        provider.break_next("read")
+
     return ProviderCase(
         provider=_scripted(provider),
         environment=profiles.resolve(profiles.DEFAULT_PROFILE),
@@ -102,7 +118,10 @@ def _case_for(provider: FakeProvider) -> ProviderCase:
         slow_seconds=1,
         flooding_command=FLOODING,
         flood_budget_bytes=FLOOD_BUDGET,
-        break_engine=lambda: provider.break_next("run"),
+        writing_command=WRITING,
+        artifact_path=ARTIFACT_PATH,
+        artifact_bytes=ARTIFACT_BYTES,
+        break_engine=break_engine,
         workspace_prefix="conf-fake",
     )
 
@@ -414,15 +433,17 @@ def test_provider_error_is_a_cli_error_in_the_infrastructure_slot() -> None:
     assert err.remediation
 
 
-@pytest.mark.parametrize("operation", ["capabilities", "create", "inspect", "remove"])
+@pytest.mark.parametrize("operation", ["capabilities", "create", "inspect", "read", "remove"])
 def test_every_verb_reports_engine_breakage_as_infrastructure_failure(operation: str) -> None:
     provider = FakeProvider()
     policy = effective_policy(provider)
     provider.create("ws-break", profiles.resolve(profiles.DEFAULT_PROFILE), policy)
+    provider.write_file("ws-break", "out.bin", b"payload")
     calls = {
         "capabilities": lambda: provider.capabilities(),
         "create": lambda: provider.create("ws-break-2", "env", policy),
         "inspect": lambda: provider.inspect("ws-break"),
+        "read": lambda: provider.read("ws-break", "out.bin"),
         "remove": lambda: provider.remove("ws-break"),
     }
     provider.break_next(operation)
@@ -622,3 +643,163 @@ def test_a_command_must_be_a_sequence_of_strings() -> None:
     with pytest.raises(CliError) as caught:
         provider.run("ws-argv", bad, policy, job_id="j")
     assert caught.value.code == EXIT_USER_ERROR
+
+
+# --- reading bytes back out -------------------------------------------------
+
+
+def _seeded(content: bytes = b"payload", path: str = "out.bin") -> FakeProvider:
+    provider = FakeProvider()
+    provider.create("ws-read", "env", effective_policy(provider))
+    provider.write_file("ws-read", path, content)
+    return provider
+
+
+def test_the_fake_can_be_seeded_with_workspace_content_directly() -> None:
+    """``write_file`` is how a test puts bytes in a workspace with no job to run.
+
+    The scripted-job route (:attr:`JobPlan.writes`) is what the conformance
+    suite uses, because it proves the whole path; this is the shortcut for tests
+    whose subject is the read, not the write.
+    """
+    provider = _seeded(b"a,b\n1,2\n", "results/out.csv")
+    with provider.read("ws-read", "results/out.csv") as stream:
+        assert b"".join(stream) == b"a,b\n1,2\n"
+
+
+def test_a_scripted_job_writes_files_the_read_verb_finds() -> None:
+    provider = FakeProvider()
+    provider.script_command(("write",), JobPlan.succeeding(writes={"out.bin": b"from the job"}))
+    policy = effective_policy(provider)
+    provider.create("ws-writes", "env", policy)
+    provider.run("ws-writes", ("write",), policy, job_id="j")
+    with provider.read("ws-writes", "out.bin") as stream:
+        assert b"".join(stream) == b"from the job"
+
+
+def test_bytes_written_into_a_workspace_count_as_measured_storage() -> None:
+    """A file in a workspace occupies it — the fake simulates semantics, not stubs."""
+    provider = _seeded(b"x" * 512)
+    assert provider.inspect("ws-read").storage_bytes == 512
+    provider.write_file("ws-read", "second.bin", b"y" * 128)
+    assert provider.inspect("ws-read").storage_bytes == 640
+
+
+def test_the_read_chunk_size_bounds_every_chunk_the_fake_yields() -> None:
+    provider = _seeded(b"z" * 5000)
+    with provider.read("ws-read", "out.bin", chunk_size=1024) as stream:
+        chunks = list(stream)
+    assert [len(chunk) for chunk in chunks] == [1024, 1024, 1024, 1024, 904]
+
+
+def test_reading_an_empty_file_yields_nothing_and_is_not_an_error() -> None:
+    """An empty artifact is an artifact: zero chunks, no exception, no digest lie."""
+    provider = _seeded(b"")
+    with provider.read("ws-read", "out.bin") as stream:
+        assert list(stream) == []
+
+
+def test_seeding_a_workspace_the_fake_does_not_hold_is_a_user_error() -> None:
+    provider = FakeProvider()
+    with pytest.raises(CliError) as caught:
+        provider.write_file("ws-nowhere", "out.bin", b"x")
+    assert caught.value.code == EXIT_USER_ERROR
+
+
+def test_reading_a_removed_workspace_forgets_its_content() -> None:
+    """Everything in a workspace is disposable; only an export outlives it."""
+    provider = _seeded()
+    provider.remove("ws-read")
+    with pytest.raises(CliError) as caught:
+        provider.read("ws-read", "out.bin")
+    assert caught.value.code == EXIT_USER_ERROR
+
+
+# --- the path rule every backend shares -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("out.bin", "out.bin"),
+        ("./out.bin", "out.bin"),
+        ("results//out.csv", "results/out.csv"),
+        ("results/./out.csv", "results/out.csv"),
+        ("results/out.csv", "results/out.csv"),
+        ("out.bin/", "out.bin"),
+    ],
+)
+def test_a_workspace_path_is_normalised_to_one_canonical_form(raw: str, expected: str) -> None:
+    assert require_workspace_path(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "..",
+        "../out.bin",
+        "results/../../out.bin",
+        "/etc/passwd",
+        "/workspace/out.bin",  # an absolute path presumes a layout the seam has none of
+        "out\x00.bin",
+        ".",
+    ],
+)
+def test_a_workspace_path_that_could_leave_the_workspace_is_refused(raw: str) -> None:
+    with pytest.raises(CliError) as caught:
+        require_workspace_path(raw)
+    assert caught.value.code == EXIT_USER_ERROR
+    assert caught.value.remediation
+
+
+def test_a_workspace_path_must_be_a_string() -> None:
+    with pytest.raises(CliError):
+        require_workspace_path(b"out.bin")  # type: ignore[arg-type]
+
+
+# --- the stream contract itself ---------------------------------------------
+
+
+def test_a_byte_stream_releases_once_when_it_is_exhausted() -> None:
+    released: list[int] = []
+    stream = ByteStream([b"a", b"b"], release=lambda: released.append(1))
+
+    assert list(stream) == [b"a", b"b"]
+    assert released == [1]
+    stream.close()
+    assert released == [1], "the release runs once, however often it is asked for"
+
+
+def test_a_byte_stream_releases_when_the_consumer_stops_early() -> None:
+    released: list[int] = []
+    stream = ByteStream([b"a", b"b", b"c"], release=lambda: released.append(1))
+
+    with stream:
+        assert next(iter(stream)) == b"a"
+    assert released == [1]
+    assert list(stream) == [], "a released stream yields nothing more"
+
+
+def test_a_byte_stream_releases_when_the_source_raises_mid_flight() -> None:
+    """The failure path matters most: a broken engine must not also leak."""
+    released: list[int] = []
+
+    def failing() -> object:
+        yield b"a"
+        raise ProviderError("the engine died mid-artifact")
+
+    stream = ByteStream(failing(), release=lambda: released.append(1))
+    with pytest.raises(ProviderError):
+        list(stream)
+    assert released == [1]
+
+
+def test_a_byte_stream_offers_no_read_method() -> None:
+    """Deliberate: ``export_artifact`` re-chunks anything with ``.read()``.
+
+    The backend is the side that knows what a cheap read looks like on its own
+    transport, so the stream keeps its own chunk boundaries all the way to disk.
+    """
+    assert not hasattr(ByteStream([b""]), "read")

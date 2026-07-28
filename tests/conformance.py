@@ -8,7 +8,7 @@ backend. A promise like that cannot live in prose — every backend has to be
 held to the *same executable* description of the seam, or the second backend
 quietly redefines it. This module is that description: a pytest mixin whose
 ``test_*`` methods exercise :class:`headspace.providers.base.Provider` through
-its five verbs and assert the normalized structures that come back, without
+its six verbs and assert the normalized structures that come back, without
 ever naming a backend.
 
 It is deliberately **not** collected on its own. The file is named
@@ -44,6 +44,11 @@ Create ``tests/test_provider_<backend>.py``. **Do not edit this module.**
                 slow_seconds=1,
                 flooding_command=("/bin/sh", "-c", "yes headspace | head -c 200000"),
                 flood_budget_bytes=4096,
+                writing_command=(
+                    "/bin/sh", "-c", "yes headspace | head -c 8192 > /workspace/artifact.bin"
+                ),
+                artifact_path="artifact.bin",
+                artifact_bytes=(b"headspace\n" * 820)[:8192],
                 break_engine=None,               # or a callable, see ProviderCase
                 workspace_prefix="conf-docker",
             )
@@ -103,6 +108,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import re
 import uuid
@@ -128,12 +134,20 @@ from headspace.providers.base import (
     JOB_STATUSES,
     OPAQUE_KEY,
     REMOVABLE_RESOURCES,
+    ByteStream,
     JobOutcome,
     Provider,
     ProviderError,
     RemovalDisposition,
     WorkspaceDescriptor,
 )
+
+#: The chunk size the read-back tests ask for. Deliberately small, and
+#: deliberately not any backend's natural granularity: a backend that ignored it
+#: and handed back one object would fail the bounded-chunk assertion rather than
+#: pass it by accident. :attr:`ProviderCase.artifact_bytes` must be larger than
+#: this, or "it arrived in more than one chunk" would be unprovable.
+READ_CHUNK_BYTES = 1024
 
 # --- the binding value object ----------------------------------------------
 
@@ -164,10 +178,21 @@ class ProviderCase:
     #: A command whose output exceeds :attr:`flood_budget_bytes`.
     flooding_command: Sequence[str]
     flood_budget_bytes: int
-    #: Optional hook that arms the backend so the NEXT :meth:`Provider.run`
-    #: raises :class:`ProviderError`. ``None`` skips the taxonomy test — a live
-    #: engine cannot always be broken on demand, and faking the break would
-    #: test the fake, not the provider.
+    #: A command that writes :attr:`artifact_bytes` into the workspace, at
+    #: :attr:`artifact_path`. Read-back is exercised against what a *job* wrote,
+    #: never against content a test placed behind the backend's back — an
+    #: artifact nobody produced proves nothing about artifacts leaving.
+    writing_command: Sequence[str]
+    #: Where :attr:`writing_command` leaves it, relative to the workspace root.
+    artifact_path: str
+    #: The exact bytes it writes. MUST be longer than :data:`READ_CHUNK_BYTES`,
+    #: because "it arrived in bounded chunks" is unprovable for an artifact that
+    #: fits in one.
+    artifact_bytes: bytes
+    #: Optional hook that arms the backend so the NEXT engine call — the suite
+    #: uses it for ``run`` and for ``read`` — raises :class:`ProviderError`.
+    #: ``None`` skips the taxonomy tests: a live engine cannot always be broken
+    #: on demand, and faking the break would test the fake, not the provider.
     break_engine: Callable[[], None] | None = None
     #: Prefix for generated workspace ids, so a failed run is traceable.
     workspace_prefix: str = "conformance"
@@ -683,6 +708,153 @@ class ProviderConformance:
             )
         assert caught.value.code == EXIT_INFRASTRUCTURE_FAILURE
         assert isinstance(caught.value, CliError)
+        assert caught.value.remediation
+
+    # --- read -------------------------------------------------------------
+
+    def _written(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+        job_id: str,
+    ) -> str:
+        """A workspace holding the case's artifact, put there by a real job."""
+        descriptor = workspaces()
+        outcome = provider.run(
+            descriptor.workspace_id,
+            provider_case.writing_command,
+            effective_policy(provider),
+            job_id=job_id,
+        )
+        assert outcome.status == STATUS_SUCCESS, (
+            f"the writing command did not succeed: {outcome.status} / {outcome.output!r}"
+        )
+        return descriptor.workspace_id
+
+    def test_read_streams_back_exactly_what_a_job_wrote(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """The product's whole promise: what a workspace produced can leave it."""
+        workspace_id = self._written(provider, provider_case, workspaces, "job-writes")
+
+        stream = provider.read(workspace_id, provider_case.artifact_path)
+        assert isinstance(stream, ByteStream)
+        with stream:
+            content = b"".join(stream)
+
+        assert content == provider_case.artifact_bytes
+        assert (
+            hashlib.sha256(content).hexdigest()
+            == hashlib.sha256(provider_case.artifact_bytes).hexdigest()
+        ), "the artifact that left is not the artifact the job wrote"
+
+    def test_read_delivers_bounded_chunks_rather_than_one_object(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """Streamed, observably: an artifact may be larger than the host's memory."""
+        workspace_id = self._written(provider, provider_case, workspaces, "job-writes-chunked")
+        with provider.read(
+            workspace_id, provider_case.artifact_path, chunk_size=READ_CHUNK_BYTES
+        ) as stream:
+            chunks = list(stream)
+
+        assert len(chunks) > 1, "the artifact arrived as one object, not as a stream"
+        assert all(isinstance(chunk, bytes) for chunk in chunks)
+        assert max(len(chunk) for chunk in chunks) <= READ_CHUNK_BYTES
+        assert b"".join(chunks) == provider_case.artifact_bytes
+
+    def test_an_abandoned_read_releases_whatever_it_opened(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """A consumer that stops half way must strand nothing behind the seam.
+
+        The export path abandons a stream whenever a digest fails to verify or a
+        destination fills up, so "read the whole thing or leak" would be a real
+        failure mode, not a theoretical one.
+        """
+        workspace_id = self._written(provider, provider_case, workspaces, "job-writes-abandoned")
+
+        stream = provider.read(
+            workspace_id, provider_case.artifact_path, chunk_size=READ_CHUNK_BYTES
+        )
+        first = next(iter(stream))
+        assert len(first) == READ_CHUNK_BYTES
+        stream.close()
+        stream.close()  # idempotent: the release runs once, not once per call
+        assert list(stream) == [], "a closed stream must not keep yielding"
+
+        # The proof the release actually released: the same path reads again.
+        with provider.read(workspace_id, provider_case.artifact_path) as again:
+            assert b"".join(again) == provider_case.artifact_bytes
+
+    def test_read_of_a_path_the_workspace_does_not_hold_is_a_user_error(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """A missing artifact is the caller's mistake — never a broken engine."""
+        descriptor = workspaces()  # nothing has written anything into it
+        with pytest.raises(CliError) as caught:
+            provider.read(descriptor.workspace_id, provider_case.artifact_path)
+        assert caught.value.code == EXIT_USER_ERROR
+        assert caught.value.remediation
+        assert not isinstance(caught.value, ProviderError)
+
+    def test_read_of_an_unknown_workspace_is_a_user_error(
+        self, provider: Provider, provider_case: ProviderCase
+    ) -> None:
+        with pytest.raises(CliError) as caught:
+            provider.read(provider_case.workspace_id(), provider_case.artifact_path)
+        assert caught.value.code == EXIT_USER_ERROR
+
+    @pytest.mark.parametrize("escape", ["../etc/passwd", "/etc/passwd", "a/../../b", "", "   "])
+    def test_read_refuses_a_path_that_leaves_the_workspace(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+        escape: str,
+    ) -> None:
+        """The workspace is a boundary; a read that steps outside it is refused here.
+
+        Refused at the seam rather than at each backend, because the engine
+        underneath may well resolve ``..`` happily — a Docker archive request
+        for ``/workspace/../etc/hostname`` returns the container's own file.
+        """
+        descriptor = workspaces()
+        with pytest.raises(CliError) as caught:
+            provider.read(descriptor.workspace_id, escape)
+        assert caught.value.code == EXIT_USER_ERROR
+        assert not isinstance(caught.value, ProviderError)
+
+    def test_read_reports_engine_breakage_as_infrastructure_failure(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """NFR-07 again, on the path that carries the artifacts out.
+
+        An artifact that cannot be fetched because the engine died is exit 7: a
+        caller must retry the fetch, not conclude its work was lost.
+        """
+        if provider_case.break_engine is None:
+            pytest.skip("this backend cannot be broken on demand (ProviderCase.break_engine)")
+        workspace_id = self._written(provider, provider_case, workspaces, "job-writes-broken")
+        provider_case.break_engine()
+        with pytest.raises(ProviderError) as caught:
+            provider.read(workspace_id, provider_case.artifact_path)
+        assert caught.value.code == EXIT_INFRASTRUCTURE_FAILURE
         assert caught.value.remediation
 
     # --- remove -----------------------------------------------------------

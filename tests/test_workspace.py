@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import io
 import json
 from collections.abc import Mapping
@@ -98,7 +99,7 @@ from headspace.core.workspace import (
     new_workspace_id,
     result_artifact,
 )
-from headspace.providers.base import ProviderError
+from headspace.providers.base import ByteStream, ProviderError
 from headspace.providers.fake import FakeProvider, JobPlan
 
 WS = "ws-alpha"
@@ -480,6 +481,182 @@ def test_a_failed_export_publishes_nothing_and_leaves_no_orphan(
     assert not destination.exists()
     assert artifacts_on_disk(store)[0]["retention"] == RETENTION_DECLARED
     assert not open_intents(store), "a handled failure is not a crash"
+
+
+# --- export pulls the bytes through the seam (issue #3 / deviation d6) ----
+
+
+WRITER = ("write", "out.csv")
+WRITTEN = b"a,b\n" + b"1,2\n" * 4096
+
+
+def _writing_provider(cls: type[FakeProvider] = FakeProvider) -> FakeProvider:
+    """A fake whose scripted job really leaves a file in the workspace."""
+    provider = cls(script={ECHO: JobPlan.succeeding("hello\n")})
+    provider.script_command(WRITER, JobPlan.succeeding(writes={"out.csv": WRITTEN}))
+    return provider
+
+
+def _prepared(store: Store, provider: FakeProvider | None = None) -> Orchestrator:
+    """A workspace whose job has run and declared the artifact it wrote."""
+    orch = Orchestrator(provider if provider is not None else _writing_provider(), store)
+    orch.create(workspace_id=WS)
+    orch.run(WS, WRITER, declares=[ArtifactDeclaration("out.csv", "the measurements", "text/csv")])
+    return orch
+
+
+def test_export_pulls_the_bytes_from_the_provider_when_no_source_is_given(
+    store: Store, tmp_path: Path
+) -> None:
+    """The gap issue #3 named: the CLI has no bytes to hand over, only a name."""
+    orch = _prepared(store)
+    destination = tmp_path / "out.csv"
+
+    package = orch.export(WS, "out.csv", destination=destination)
+
+    assert destination.read_bytes() == WRITTEN
+    record = artifacts_on_disk(store)[0]
+    assert record["retention"] == RETENTION_EXPORTED
+    assert record["size_bytes"] == len(WRITTEN)
+    assert record["sha256"] == hashlib.sha256(WRITTEN).hexdigest()
+    (entry,) = package.artifacts
+    assert entry.digest == hashlib.sha256(WRITTEN).hexdigest()
+    assert entry.reference == str(destination)
+
+
+def test_a_provider_pulled_export_still_verifies_an_expected_digest(
+    store: Store, tmp_path: Path
+) -> None:
+    """The durability boundary did not move: the digest is still the gate."""
+    orch = _prepared(store)
+    destination = tmp_path / "out.csv"
+
+    orch.export(WS, "out.csv", destination=destination, expected_sha256=hashlib.sha256(WRITTEN).hexdigest())
+    assert destination.read_bytes() == WRITTEN
+
+    with pytest.raises(CliError):
+        orch.export(WS, "out.csv", destination=tmp_path / "again.csv", expected_sha256="0" * 64)
+    assert not (tmp_path / "again.csv").exists()
+
+
+def test_export_reads_the_workspace_path_when_it_differs_from_the_artifact_name(
+    store: Store, tmp_path: Path
+) -> None:
+    provider = _writing_provider()
+    orch = Orchestrator(provider, store)
+    orch.create(workspace_id=WS)
+    orch.run(WS, ECHO, declares=[ArtifactDeclaration("report", "the measurements")])
+    provider.write_file(WS, "results/final.csv", WRITTEN)
+
+    orch.export(WS, "report", destination=tmp_path / "report", path="results/final.csv")
+
+    assert (tmp_path / "report").read_bytes() == WRITTEN
+
+
+def test_a_caller_that_already_holds_the_bytes_never_touches_the_provider(
+    store: Store, tmp_path: Path
+) -> None:
+    """The existing parameter keeps working, and keeps short-circuiting the read."""
+
+    class Unreadable(FakeProvider):
+        def read(self, workspace_id: str, path: str, *, chunk_size: int = 1) -> Any:
+            raise AssertionError("export must not read a workspace it was handed bytes for")
+
+    orch = _prepared(store, provider=_writing_provider(Unreadable))
+    destination = tmp_path / "out.csv"
+
+    orch.export(WS, "out.csv", io.BytesIO(b"handed over"), destination)
+
+    assert destination.read_bytes() == b"handed over"
+
+
+def test_export_consumes_the_provider_stream_in_bounded_chunks(
+    store: Store, tmp_path: Path
+) -> None:
+    """Streaming end to end: the export writes what the provider yields, chunk by chunk.
+
+    Observed, not asserted about: the stream records what it actually handed
+    over, so a provider (or an export) that materialised the artifact would show
+    a single chunk the size of the whole file.
+    """
+    handed: list[int] = []
+
+    class RecordingProvider(FakeProvider):
+        def read(self, workspace_id: str, path: str, *, chunk_size: int = 1 << 20) -> ByteStream:
+            inner = super().read(workspace_id, path, chunk_size=1024)
+
+            def recorded() -> Any:
+                for chunk in inner:
+                    handed.append(len(chunk))
+                    yield chunk
+
+            return ByteStream(recorded(), release=inner.close)
+
+    orch = _prepared(store, provider=_writing_provider(RecordingProvider))
+    orch.export(WS, "out.csv", destination=tmp_path / "out.csv")
+
+    assert len(handed) > 1, "the artifact was handed over as one object, not streamed"
+    assert max(handed) <= 1024
+    assert sum(handed) == len(WRITTEN)
+
+
+def test_export_of_a_path_the_workspace_does_not_hold_is_a_user_error(
+    store: Store, tmp_path: Path
+) -> None:
+    """A missing file is the caller's mistake — exit 1, and nothing published."""
+    orch = _prepared(store)
+    destination = tmp_path / "gone.csv"
+
+    with pytest.raises(CliError) as exc_info:
+        orch.export(WS, "out.csv", destination=destination, path="never-written.csv")
+
+    assert exc_info.value.code == EXIT_USER_ERROR
+    assert not isinstance(exc_info.value, ProviderError)
+    assert not destination.exists()
+    assert artifacts_on_disk(store)[0]["retention"] == RETENTION_DECLARED
+    assert not open_intents(store), "a handled failure is not a crash"
+
+
+def test_export_reports_a_broken_engine_as_infrastructure_failure(
+    store: Store, tmp_path: Path
+) -> None:
+    """NFR-07 on the export path: retry the fetch, do not conclude the work is lost."""
+    provider = _writing_provider()
+    orch = _prepared(store, provider=provider)
+    destination = tmp_path / "out.csv"
+    provider.break_next("read")
+
+    with pytest.raises(ProviderError) as exc_info:
+        orch.export(WS, "out.csv", destination=destination)
+
+    assert exc_info.value.code == EXIT_INFRASTRUCTURE_FAILURE
+    assert not destination.exists()
+    assert artifacts_on_disk(store)[0]["retention"] == RETENTION_DECLARED
+    assert not open_intents(store)
+
+
+def test_a_failed_export_releases_the_stream_it_pulled(store: Store, tmp_path: Path) -> None:
+    """A digest that does not verify must not also strand the backend's resources."""
+    released: list[int] = []
+
+    class TrackingProvider(FakeProvider):
+        def read(self, workspace_id: str, path: str, *, chunk_size: int = 1 << 20) -> ByteStream:
+            inner = super().read(workspace_id, path, chunk_size=chunk_size)
+            return ByteStream(inner, release=lambda: released.append(1))
+
+    orch = _prepared(store, provider=_writing_provider(TrackingProvider))
+    with pytest.raises(CliError):
+        orch.export(WS, "out.csv", destination=tmp_path / "out.csv", expected_sha256="0" * 64)
+
+    assert released == [1]
+
+
+def test_export_without_a_destination_is_refused(store: Store, tmp_path: Path) -> None:
+    orch = _prepared(store)
+    with pytest.raises(CliError) as exc_info:
+        orch.export(WS, "out.csv")
+    assert exc_info.value.code == EXIT_USER_ERROR
+    assert exc_info.value.remediation
 
 
 # --- criterion 3: the destroy guard ---------------------------------------
