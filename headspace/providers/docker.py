@@ -156,6 +156,15 @@ needed was a running daemon. The connection itself is opened per verb rather
 than cached, which matches production exactly — each CLI invocation is its own
 process — and keeps the failure honest: an engine that dies between two verbs
 is discovered by the second one.
+
+There is exactly one exception, and it proves the rule rather than bending it:
+an engine 400 that says *the container's init step could not exec the command*
+is not the engine failing, it is the caller naming a binary the image does not
+have. :func:`not_executable_exit_status` recognises that one case by the
+engine's own marker and :meth:`DockerProvider._start` returns it as a failed
+:class:`~headspace.providers.base.JobOutcome` (126 or 127) instead of exit 7.
+Everything the matcher does not recognise re-raises untouched, so the exception
+can only ever narrow the exit-7 set — never widen it.
 """
 
 from __future__ import annotations
@@ -169,7 +178,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from typing import IO, Any
 
 import docker
@@ -324,6 +333,154 @@ ARCHIVE_STREAM_MODE = "r|"
 #: transfer archive is the engine failing to deliver bytes it said it had — a
 #: broken engine (exit 7), never a caller that asked for the wrong thing.
 _ENGINE_FAILURES: tuple[type[BaseException], ...] = (DockerException, OSError, tarfile.TarError)
+
+# --- a command the image cannot execute -------------------------------------
+#
+# :data:`_ENGINE_FAILURES` catches :class:`DockerException`, and
+# :class:`APIError` is a subclass of it — so before this section existed, an
+# engine 400 saying "your command is not in the image" arrived at the caller as
+# exit 7 with a "retry" hint. That is wrong twice over. An autonomous consumer
+# that believes the hint retries a deterministic failure forever, and the raw
+# API string it retries on carries a container id and the engine's internal
+# endpoint URL into the very context headspace exists to keep clean.
+#
+# The reclassification below is deliberately *narrow*, and the direction of the
+# safety is the reason. Reading a caller's mistake as a broken engine costs a
+# retry loop; reading a broken engine as a caller's mistake makes an agent
+# abandon work it should have retried, which is the worse error. So anything
+# that does not match confidently re-raises untouched and keeps exit 7 — this
+# whole section can only ever move cases *out* of exit 7, never into it.
+
+#: The engine's own marker for "the container's init step could not exec what it
+#: was handed". Probed against Docker 29.1.3 / API 1.52 (2026-07-28): all four
+#: shapes of not-runnable command — absent from ``$PATH``, an absolute path that
+#: is not there, a directory, and a file without the execute bit — carry this
+#: substring and nothing else the provider sees does. It is the whole matcher:
+#: "any 400" would sweep up port conflicts, name conflicts and busy devices,
+#: which are the engine's problem and must stay retryable.
+EXEC_INIT_MARKER = "error during container init: exec:"
+
+#: The shell's two answers, kept apart on purpose. Collapsing both to 127 would
+#: tell an agent to re-spell a command that was sitting right there — the fix is
+#: for *what* to do next, so the two cases cannot share a number.
+EXIT_COMMAND_NOT_EXECUTABLE = 126
+EXIT_COMMAND_NOT_FOUND = 127
+
+#: Reason wordings that mean nothing exists under that name. Everything else in
+#: the exec-init family is "there, but not runnable" — the conservative default,
+#: because 126 never sends anyone off to fix a spelling that was already right.
+NOT_FOUND_WORDINGS: tuple[str, ...] = (
+    "executable file not found",
+    "no such file or directory",
+)
+
+#: What the exec step's detail looks like: the caller's own ``argv[0]``, quoted,
+#: then the engine's reason. Split so the reason is read *past* the command —
+#: a caller who runs ``/tmp/no such file or directory`` must not be told their
+#: command was missing when the engine said it was there and unrunnable.
+_EXEC_INIT_DETAIL = re.compile(r'\s*"(?P<argv0>.*?)":\s*(?P<reason>.+)\Z', re.DOTALL)
+
+#: What replaces an engine handle or endpoint that must not reach a caller.
+REDACTED = "[redacted]"
+
+#: The transport envelope ``requests`` wraps an engine error in — the HTTP
+#: status phrase and the internal endpoint, which is where the container id
+#: leaked from. Stripped rather than trusted absent, because the fallback path
+#: below may have to fall back to ``str(err)``.
+_TRANSPORT_ENVELOPE_RE = re.compile(r"\b\d{3} (?:Client|Server) Error for \S+\s*")
+
+#: Any URL-shaped token. The endpoint above is the one that matters; this is the
+#: net under it, so a wording change in the SDK cannot restore the leak.
+_ENGINE_URL_RE = re.compile(r"\b[A-Za-z][\w.+-]*://\S*")
+
+#: The prefix length the engine and its CLI use for a short container id. Both
+#: forms are redacted, because either identifies the object.
+_SHORT_HANDLE_CHARS = 12
+
+
+def not_executable_exit_status(message: str) -> int | None:
+    """``126``/``127`` if this engine message means the image cannot run the command.
+
+    ``None`` for everything else, and ``None`` is what keeps this honest: the
+    caller re-raises on it, so an unmatched message is a no-op rather than a
+    guess. Pure and public so the mapping can be pinned against the engine's
+    recorded wordings without an engine.
+    """
+    if EXEC_INIT_MARKER not in message:
+        return None
+    detail = message.partition(EXEC_INIT_MARKER)[2]
+    found = _EXEC_INIT_DETAIL.match(detail)
+    reason = found.group("reason") if found else detail
+    if any(wording in reason for wording in NOT_FOUND_WORDINGS):
+        return EXIT_COMMAND_NOT_FOUND
+    return EXIT_COMMAND_NOT_EXECUTABLE
+
+
+def redact_engine_text(text: str, handle: str = "") -> str:
+    """An engine string with its transport envelope and its handles removed.
+
+    Two mechanisms because they fail differently: ``handle`` is exact knowledge
+    (the provider holds the id it just created, so it can remove it by name),
+    and the patterns are the general net for whatever else the engine puts in
+    front of its own sentence. What survives is the engine's *diagnosis*, which
+    is the part a reader needs and the part that names nothing internal.
+    """
+    cleaned = _TRANSPORT_ENVELOPE_RE.sub("", text)
+    cleaned = _ENGINE_URL_RE.sub(REDACTED, cleaned)
+    if handle:
+        for token in (handle, handle[:_SHORT_HANDLE_CHARS]):
+            cleaned = cleaned.replace(token, REDACTED)
+    return cleaned.strip()
+
+
+@dataclass(frozen=True)
+class _RefusedCommand:
+    """The engine refused to exec the caller's command: a job outcome, not a fault.
+
+    Carries the two things :meth:`DockerProvider.run` needs to report it — the
+    POSIX status and the text that goes on the job's captured-output path —
+    rather than letting either be recomputed at the call site.
+    """
+
+    exit_status: int
+    report: str
+
+    @property
+    def produced(self) -> int:
+        return len(self.report.encode("utf-8"))
+
+
+def _refused_command(
+    err: APIError, argv: Sequence[str], environment: str, handle: str
+) -> _RefusedCommand | None:
+    """Classify a failed ``start``; ``None`` means "not ours — re-raise unchanged".
+
+    The report is built from what *headspace* knows — the environment reference
+    and the caller's own ``argv[0]`` — and the engine's sentence is appended
+    beneath it, redacted, rather than interpolated into it. That ordering is the
+    contract: the first line is the fact the caller acts on, and the engine's
+    words are evidence kept for the case where this classification was wrong.
+    """
+    message = str(err)
+    exit_status = not_executable_exit_status(message)
+    if exit_status is None:
+        return None
+    command = argv[0] if argv else ""
+    reason = (
+        f"no executable named {command!r} exists in this environment"
+        if exit_status == EXIT_COMMAND_NOT_FOUND
+        else f"{command!r} exists in this environment but cannot be executed"
+    )
+    detail = redact_engine_text(str(err.explanation) if err.explanation else message, handle)
+    return _RefusedCommand(
+        exit_status=exit_status,
+        report=(
+            f"headspace: the command was not run — {reason} "
+            f"(exit status {exit_status}).\n"
+            f"environment: {environment}\n"
+            f"engine: {detail}\n"
+        ),
+    )
 
 
 def log_cap_bytes(output_budget: int) -> int:
@@ -640,8 +797,9 @@ class DockerProvider:
 
         with self._engine(f"running a job in workspace {workspace_id}") as client:
             anchor = self._require(client, workspace_id)
+            environment = anchor.labels.get(LABEL_ENVIRONMENT, anchor.attrs["Config"]["Image"])
             container = client.containers.create(
-                image=anchor.labels.get(LABEL_ENVIRONMENT, anchor.attrs["Config"]["Image"]),
+                image=environment,
                 command=list(argv),
                 name=f"{self._container_name(workspace_id)}-{_slug(job_id)}-{uuid.uuid4().hex[:8]}",
                 labels={
@@ -671,12 +829,19 @@ class DockerProvider:
                     output_budget,
                 )
                 capture.start()
-                container.start()
+                refused = self._start(container, argv, environment)
                 usage = _Usage()
-                timed_out = self._await_exit(container, wall_budget, usage)
+                timed_out = refused is None and self._await_exit(container, wall_budget, usage)
                 capture.join(CAPTURE_GRACE_SECONDS)
-                exit_status = int(container.attrs["State"].get("ExitCode") or 0)
-                output, produced, truncated = self._captured(container, capture, output_budget)
+                if refused is None:
+                    exit_status = int(container.attrs["State"].get("ExitCode") or 0)
+                    output, produced, truncated = self._captured(container, capture, output_budget)
+                else:
+                    # Nothing ran, so there is nothing to have captured: the
+                    # report *is* the job's whole output, and the usage figures
+                    # below are honestly zero rather than absent.
+                    exit_status = refused.exit_status
+                    output, produced, truncated = refused.report, refused.produced, False
                 storage_bytes = self._volume_bytes(client, workspace_id)
             finally:
                 # A job container that outlives its job is a stray, and the
@@ -1093,6 +1258,31 @@ class DockerProvider:
         )
 
     # --- running one job --------------------------------------------------
+
+    @staticmethod
+    def _start(
+        container: Container, argv: Sequence[str], environment: str
+    ) -> _RefusedCommand | None:
+        """Start the job's container; report a command the image cannot exec.
+
+        The one narrow place where an :class:`APIError` is *not* an engine
+        failure. Returning ``None`` means the container started and the job is
+        the caller's to wait on; returning a :class:`_RefusedCommand` means the
+        engine refused to exec what it was handed, which is the caller's error
+        and belongs in a :class:`~headspace.providers.base.JobOutcome`.
+
+        Every other ``APIError`` leaves here untouched and lands in
+        :data:`_ENGINE_FAILURES` exactly as it always did — so this method can
+        only ever narrow exit 7, never widen it.
+        """
+        try:
+            container.start()
+        except APIError as err:
+            refused = _refused_command(err, argv, environment, str(container.id or ""))
+            if refused is None:
+                raise
+            return refused
+        return None
 
     def _await_exit(self, container: Container, wall_budget: float, usage: _Usage) -> bool:
         """Block until the job settles or outruns its budget; kill it if it does.
