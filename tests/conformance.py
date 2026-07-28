@@ -511,11 +511,12 @@ class ProviderConformance:
         self, provider_case: ProviderCase, workspaces: Callable[..., WorkspaceDescriptor]
     ) -> None:
         descriptor = workspaces()
+        policy = effective_policy(provider_case.provider)
         with pytest.raises(CliError) as caught:
             provider_case.provider.create(
                 descriptor.workspace_id,
                 provider_case.environment,
-                effective_policy(provider_case.provider),
+                policy,
             )
         assert caught.value.code == EXIT_USER_ERROR
         assert caught.value.remediation
@@ -549,8 +550,9 @@ class ProviderConformance:
     def test_inspect_of_an_unknown_workspace_is_a_user_error(
         self, provider: Provider, provider_case: ProviderCase
     ) -> None:
+        unknown_workspace_id = provider_case.workspace_id()
         with pytest.raises(CliError) as caught:
-            provider.inspect(provider_case.workspace_id())
+            provider.inspect(unknown_workspace_id)
         assert caught.value.code == EXIT_USER_ERROR
         assert caught.value.remediation
 
@@ -626,11 +628,13 @@ class ProviderConformance:
     def test_run_of_an_unknown_workspace_is_a_user_error(
         self, provider: Provider, provider_case: ProviderCase
     ) -> None:
+        unknown_workspace_id = provider_case.workspace_id()
+        policy = effective_policy(provider)
         with pytest.raises(CliError) as caught:
             provider.run(
-                provider_case.workspace_id(),
+                unknown_workspace_id,
                 provider_case.succeeding_command,
-                effective_policy(provider),
+                policy,
                 job_id="job-nowhere",
             )
         assert caught.value.code == EXIT_USER_ERROR
@@ -699,11 +703,12 @@ class ProviderConformance:
             pytest.skip("this backend cannot be broken on demand (ProviderCase.break_engine)")
         descriptor = workspaces()
         provider_case.break_engine()
+        policy = effective_policy(provider)
         with pytest.raises(ProviderError) as caught:
             provider.run(
                 descriptor.workspace_id,
                 provider_case.succeeding_command,
-                effective_policy(provider),
+                policy,
                 job_id="job-broken",
             )
         assert caught.value.code == EXIT_INFRASTRUCTURE_FAILURE
@@ -814,8 +819,9 @@ class ProviderConformance:
     def test_read_of_an_unknown_workspace_is_a_user_error(
         self, provider: Provider, provider_case: ProviderCase
     ) -> None:
+        unknown_workspace_id = provider_case.workspace_id()
         with pytest.raises(CliError) as caught:
-            provider.read(provider_case.workspace_id(), provider_case.artifact_path)
+            provider.read(unknown_workspace_id, provider_case.artifact_path)
         assert caught.value.code == EXIT_USER_ERROR
 
     @pytest.mark.parametrize("escape", ["../etc/passwd", "/etc/passwd", "a/../../b", "", "   "])

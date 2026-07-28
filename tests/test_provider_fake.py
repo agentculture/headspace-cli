@@ -367,6 +367,7 @@ def test_destroy_during_a_running_job_takes_the_documented_path() -> None:
 @pytest.mark.parametrize("status", [STATUS_INFRASTRUCTURE_FAILURE, STATUS_POLICY_DENIED])
 def test_a_job_outcome_cannot_claim_a_raised_status(status: str) -> None:
     """Infrastructure failure and policy denial are raised, never returned."""
+    usage = ResourceUsage()
     with pytest.raises(CliError) as caught:
         JobOutcome(
             job_id="j",
@@ -377,7 +378,7 @@ def test_a_job_outcome_cannot_claim_a_raised_status(status: str) -> None:
             truncated=False,
             started_at="t0",
             finished_at="t1",
-            usage=ResourceUsage(),
+            usage=usage,
         )
     assert caught.value.code == EXIT_USER_ERROR
     assert "raised" in caught.value.remediation
@@ -395,6 +396,7 @@ def test_a_job_outcome_cannot_claim_a_raised_status(status: str) -> None:
 def test_a_job_outcome_rejects_an_inconsistent_exit_status(
     status: str, exit_status: int | None
 ) -> None:
+    usage = ResourceUsage()
     with pytest.raises(CliError):
         JobOutcome(
             job_id="j",
@@ -405,12 +407,13 @@ def test_a_job_outcome_rejects_an_inconsistent_exit_status(
             truncated=False,
             started_at="t0",
             finished_at="t1",
-            usage=ResourceUsage(),
+            usage=usage,
         )
 
 
 def test_a_job_outcome_cannot_report_less_volume_than_it_captured() -> None:
     """Captured output can never exceed the volume the job actually produced."""
+    usage = ResourceUsage(output_bytes=3)
     with pytest.raises(CliError):
         JobOutcome(
             job_id="j",
@@ -421,7 +424,7 @@ def test_a_job_outcome_cannot_report_less_volume_than_it_captured() -> None:
             truncated=False,
             started_at="t0",
             finished_at="t1",
-            usage=ResourceUsage(output_bytes=3),
+            usage=usage,
         )
 
 
@@ -576,8 +579,9 @@ def test_the_fake_accumulates_workspace_storage_across_jobs() -> None:
 
 def test_the_fake_refuses_a_workspace_id_it_cannot_name() -> None:
     provider = FakeProvider()
+    policy = effective_policy(provider)
     with pytest.raises(CliError) as caught:
-        provider.create("  ", "env", effective_policy(provider))
+        provider.create("  ", "env", policy)
     assert caught.value.code == EXIT_USER_ERROR
 
 
