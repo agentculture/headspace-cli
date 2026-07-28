@@ -25,9 +25,10 @@ Programmable, because failure paths need testing too
 ----------------------------------------------------
 A real engine cannot be asked to fail on cue, so the honest failure paths —
 a job that exits non-zero, a job that outruns its budget, a job that floods its
-output, an engine that breaks mid-run — would otherwise be untested until
-production. This provider is therefore a small programmable execution engine:
-:meth:`FakeProvider.script_command` maps an argv to a :class:`JobPlan`
+output, an engine that breaks mid-run, a command the image cannot execute, a
+job killed for exceeding its memory ceiling — would otherwise be untested
+until production. This provider is therefore a small programmable execution
+engine: :meth:`FakeProvider.script_command` maps an argv to a :class:`JobPlan`
 describing what running it does, and :meth:`FakeProvider.break_next` arms an
 infrastructure failure on the next call to a named verb. An unscripted command
 succeeds silently, so a test scripts only the behaviour it asserts.
@@ -50,7 +51,13 @@ from typing import Any
 
 from headspace.cli._errors import EXIT_USER_ERROR, CliError
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
-from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS, STATUS_TIMEOUT, ResourceUsage
+from headspace.core.result import (
+    STATUS_FAILURE,
+    STATUS_RESOURCE_EXHAUSTED,
+    STATUS_SUCCESS,
+    STATUS_TIMEOUT,
+    ResourceUsage,
+)
 from headspace.core.states import State, validate_transition
 from headspace.providers.base import (
     DEFAULT_READ_CHUNK_BYTES,
@@ -77,6 +84,26 @@ from headspace.providers.base import (
 #: expresses "runs forever" without knowing the budget it will be measured
 #: against.
 FOREVER_SECONDS = 10**9
+
+#: The POSIX exit statuses a command the image cannot execute reports.
+#: Identical in name and value to :data:`headspace.providers.docker.EXIT_COMMAND_NOT_EXECUTABLE`
+#: / :data:`~headspace.providers.docker.EXIT_COMMAND_NOT_FOUND` — duplicated here
+#: rather than imported, because importing anything from that module would pull
+#: the Docker SDK into the one provider that must build and run without it.
+#: ``NOT_FOUND`` (127) is nothing exists under that name; ``NOT_EXECUTABLE``
+#: (126) is it exists but cannot be run. Two numbers, never collapsed to one,
+#: because the fix differs: 126 never sends anyone off to re-spell a command
+#: that was sitting right where it asked.
+EXIT_COMMAND_NOT_FOUND = 127
+EXIT_COMMAND_NOT_EXECUTABLE = 126
+
+#: The exit status a real OOM kill reports on Linux: SIGKILL (9) folded into
+#: the shell's ``128 + signal`` convention, and the value :meth:`JobPlan.oom_killed`
+#: defaults to for realism. Unlike Docker — which has to tell a genuine kernel
+#: kill apart from a process that deliberately chose the same number by reading
+#: ``State.OOMKilled`` alongside it — a scripted plan states its
+#: :attr:`~JobPlan.status` directly, so no such disambiguation is needed here.
+EXIT_OOM_KILLED = 137
 
 #: The verbs :meth:`FakeProvider.break_next` can break. All six, because NFR-07
 #: applies to all six: the path that carries artifacts out has to report a dead
@@ -156,6 +183,39 @@ class JobPlan:
     @classmethod
     def failing(cls, exit_status: int = 1, output: str = "", **overrides: Any) -> JobPlan:
         return cls(status=STATUS_FAILURE, exit_status=exit_status, output=output, **overrides)
+
+    @classmethod
+    def not_executable(
+        cls, exit_status: int = EXIT_COMMAND_NOT_FOUND, output: str = "", **overrides: Any
+    ) -> JobPlan:
+        """A command the image cannot execute — the caller's mistake, not a broken engine.
+
+        Mirrors what :mod:`headspace.providers.docker` reports for the identical
+        case: ``status`` stays :data:`~headspace.core.result.STATUS_FAILURE` —
+        never ``infrastructure_failure`` — with ``exit_status`` one of
+        :data:`EXIT_COMMAND_NOT_FOUND` or :data:`EXIT_COMMAND_NOT_EXECUTABLE`. A
+        test picks which by passing the constant it means to assert; defaulting
+        to "not found" keeps the common case a bare call.
+        """
+        return cls.failing(exit_status=exit_status, output=output, **overrides)
+
+    @classmethod
+    def oom_killed(
+        cls, exit_status: int = EXIT_OOM_KILLED, output: str = "", **overrides: Any
+    ) -> JobPlan:
+        """A job stopped for exceeding its memory ceiling — ``resource_exhausted``.
+
+        Composes with ``wall_time_seconds`` exactly as every other plan does:
+        :meth:`FakeProvider.run` decides ``timeout`` before it looks at
+        ``status`` at all, so a plan scripted both ways still reports
+        :data:`~headspace.core.result.STATUS_TIMEOUT` — the same precedence
+        :mod:`headspace.providers.docker` keeps between its own wall-clock kill
+        and the kernel's memory kill, because headspace stopping a job on
+        purpose outranks the kernel stopping it for a different reason.
+        """
+        return cls(
+            status=STATUS_RESOURCE_EXHAUSTED, exit_status=exit_status, output=output, **overrides
+        )
 
     @classmethod
     def timing_out(cls, **overrides: Any) -> JobPlan:
