@@ -1,6 +1,6 @@
 [project]
 name = "headspace-cli"
-version = "0.8.1"
+version = "0.9.0"
 description = "Headspace is an ephemeral computational workspace for agents. It lets models offload execution, experimentation, and calculation without polluting their reasoning context, then exports only the results and evidence worth retaining."
 readme = "README.md"
 license = "Apache-2.0"
