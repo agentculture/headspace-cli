@@ -165,6 +165,27 @@ engine's own marker and :meth:`DockerProvider._start` returns it as a failed
 :class:`~headspace.providers.base.JobOutcome` (126 or 127) instead of exit 7.
 Everything the matcher does not recognise re-raises untouched, so the exception
 can only ever narrow the exit-7 set — never widen it.
+
+Killed for exceeding a ceiling, not merely killed
+--------------------------------------------------
+A job's exit status alone cannot distinguish a kernel OOM kill from a program
+that chose 137 for its own reasons — verified live: a genuine memory kill
+reports ``State.OOMKilled=true, ExitCode=137``, and
+``python -c "raise SystemExit(137)"`` reports ``OOMKilled=false, ExitCode=137``.
+So :meth:`DockerProvider._status` never infers from the number; it reads
+``State['OOMKilled']`` — fetched in :meth:`run` at the same point as
+``ExitCode``, off the same ``reload()`` :meth:`_await_exit` already performed,
+so classifying the kill costs no engine call of its own — and reports
+:data:`~headspace.core.result.STATUS_RESOURCE_EXHAUSTED` only when the engine
+itself says the kernel did this.
+
+Precedence still has to be decided, because headspace's own wall-clock
+enforcer (:meth:`_await_exit`) also stops a container with ``kill()``, and that
+yields the same 137 a kernel OOM kill does. ``_status`` checks ``timed_out``
+first: when headspace stopped the job deliberately, that outranks the kernel's
+budget, so a container that is *both* timed out and ``OOMKilled`` is still
+reported ``timeout`` — a case a test pins directly rather than leaving to
+branch order.
 """
 
 from __future__ import annotations
@@ -188,7 +209,13 @@ from docker.types import LogConfig, Mount
 
 from headspace.cli._errors import EXIT_USER_ERROR, CliError
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
-from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS, STATUS_TIMEOUT, ResourceUsage
+from headspace.core.result import (
+    STATUS_FAILURE,
+    STATUS_RESOURCE_EXHAUSTED,
+    STATUS_SUCCESS,
+    STATUS_TIMEOUT,
+    ResourceUsage,
+)
 from headspace.core.states import State, validate_transition
 from headspace.providers.base import (
     DEFAULT_READ_CHUNK_BYTES,
@@ -834,13 +861,20 @@ class DockerProvider:
                 timed_out = refused is None and self._await_exit(container, wall_budget, usage)
                 capture.join(CAPTURE_GRACE_SECONDS)
                 if refused is None:
-                    exit_status = int(container.attrs["State"].get("ExitCode") or 0)
+                    state = container.attrs["State"]
+                    exit_status = int(state.get("ExitCode") or 0)
+                    # ``reload()`` inside `_await_exit` already made this fresh;
+                    # no second engine call is spent to learn it. Read here and
+                    # nowhere else — see :meth:`_status` for why the exit status
+                    # itself is never trusted to mean the same thing.
+                    oom_killed = bool(state.get("OOMKilled"))
                     output, produced, truncated = self._captured(container, capture, output_budget)
                 else:
                     # Nothing ran, so there is nothing to have captured: the
                     # report *is* the job's whole output, and the usage figures
                     # below are honestly zero rather than absent.
                     exit_status = refused.exit_status
+                    oom_killed = False
                     output, produced, truncated = refused.report, refused.produced, False
                 storage_bytes = self._volume_bytes(client, workspace_id)
             finally:
@@ -854,7 +888,7 @@ class DockerProvider:
         return JobOutcome(
             job_id=job_id,
             workspace_id=workspace_id,
-            status=self._status(timed_out, exit_status),
+            status=self._status(timed_out, oom_killed, exit_status),
             exit_status=None if timed_out else exit_status,
             output=output,
             truncated=truncated,
@@ -1339,7 +1373,22 @@ class DockerProvider:
         return kept.decode("utf-8", "ignore"), produced, True
 
     @staticmethod
-    def _status(timed_out: bool, exit_status: int) -> str:
+    def _status(timed_out: bool, oom_killed: bool, exit_status: int) -> str:
+        """Name what actually stopped the job — never inferred from ``exit_status``.
+
+        ``timed_out`` is checked first on purpose: headspace's own wall-clock
+        enforcer also stops a container with ``kill()``, which yields the same
+        137 a kernel OOM kill does. When headspace deliberately stopped the
+        job, that outranks the kernel's own budget, so ``timeout`` wins even on
+        a container the engine also marks ``OOMKilled``.
+
+        ``oom_killed`` comes from ``State.OOMKilled`` alone. Exit status 137 is
+        not evidence of anything by itself — a program can call
+        ``sys.exit(137)`` on its own account, and reading that as a memory-ceiling
+        breach would misreport an honest computational failure as a budget one.
+        """
         if timed_out:
             return STATUS_TIMEOUT
+        if oom_killed:
+            return STATUS_RESOURCE_EXHAUSTED
         return STATUS_SUCCESS if exit_status == 0 else STATUS_FAILURE

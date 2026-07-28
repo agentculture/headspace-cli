@@ -55,11 +55,23 @@ from docker.errors import APIError
 import headspace.cli._commands.create as provider_registry
 from headspace.cli import main
 from headspace.cli._commands.inspect import collect_logs
-from headspace.cli._errors import EXIT_COMPUTATION_FAILED, EXIT_INFRASTRUCTURE_FAILURE
+from headspace.cli._errors import (
+    EXIT_COMPUTATION_FAILED,
+    EXIT_INFRASTRUCTURE_FAILURE,
+    EXIT_RESOURCE_EXHAUSTED,
+    EXIT_TIMEOUT,
+)
 from headspace.core import profiles
-from headspace.core.policy import EffectivePolicy, Policy
+from headspace.core.policy import EffectivePolicy, Policy, ResourceBudget
 from headspace.core.policy import resolve as resolve_policy
-from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS, render_json, render_markdown
+from headspace.core.result import (
+    STATUS_FAILURE,
+    STATUS_RESOURCE_EXHAUSTED,
+    STATUS_SUCCESS,
+    STATUS_TIMEOUT,
+    render_json,
+    render_markdown,
+)
 from headspace.core.store import HOME_ENV_VAR, Store
 from headspace.core.workspace import Orchestrator, exit_code_for_status
 from headspace.providers.base import ProviderError
@@ -184,6 +196,7 @@ class StubContainer:
         settles_to: str = "exited",
         exit_code: int = 0,
         frames: Sequence[bytes] = (),
+        oom_killed: bool = False,
     ) -> None:
         self.id = container_id
         self.labels = dict(labels)
@@ -197,6 +210,11 @@ class StubContainer:
         self._settles_to = settles_to
         self._exit_code = exit_code
         self._frames = list(frames)
+        #: What the engine would report in ``State.OOMKilled``. Carried through
+        #: both `start()`'s immediate settle and `kill()`'s — a wall-clock kill
+        #: can land on a container the engine also marks OOMKilled, which is
+        #: exactly the precedence case the OOM tests below pin.
+        self._oom_killed = oom_killed
 
     @property
     def status(self) -> str:
@@ -205,7 +223,11 @@ class StubContainer:
     def start(self) -> None:
         if self._start_error is not None:
             raise self._start_error
-        self.attrs["State"] = {"Status": self._settles_to, "ExitCode": self._exit_code}
+        self.attrs["State"] = {
+            "Status": self._settles_to,
+            "ExitCode": self._exit_code,
+            "OOMKilled": self._oom_killed,
+        }
 
     def reload(self) -> None:
         """The engine's state is already in ``attrs``; nothing to re-fetch."""
@@ -223,7 +245,10 @@ class StubContainer:
         return {}
 
     def kill(self) -> None:
-        self.attrs["State"] = {"Status": "exited", "ExitCode": 137}
+        # The wall-clock enforcer's own kill, which yields the same 137 a
+        # kernel OOM kill does — and, on a host under real memory pressure,
+        # can land on a container the engine also marks OOMKilled.
+        self.attrs["State"] = {"Status": "exited", "ExitCode": 137, "OOMKilled": self._oom_killed}
 
 
 class StubVolume:
@@ -248,6 +273,16 @@ class StubEngine:
         self.job_start_error: BaseException | None = None
         self.job_exit_code = 0
         self.job_frames: Sequence[bytes] = ()
+        #: ``State.OOMKilled`` the next job container reports — never inferred
+        #: by the stub from ``job_exit_code``, exactly as the real engine's two
+        #: fields are independent of each other.
+        self.job_oom_killed = False
+        #: What ``start()`` settles the next job container to. ``"exited"``
+        #: (the default) makes the job already-done by the first poll — the
+        #: shape every other test here wants. ``"running"`` keeps it alive
+        #: until something calls ``kill()``, which is how a wall-clock timeout
+        #: is driven without a real clock.
+        self.job_settles_to = "exited"
         self.closed = 0
 
     def version(self) -> dict[str, Any]:
@@ -304,9 +339,10 @@ class _StubContainers:
             image=image,
             network_mode=str(kwargs.get("network_mode") or "none"),
             start_error=self._engine.job_start_error if job else None,
-            settles_to="exited" if job else "running",
+            settles_to=self._engine.job_settles_to if job else "running",
             exit_code=self._engine.job_exit_code if job else 0,
             frames=self._engine.job_frames if job else (),
+            oom_killed=self._engine.job_oom_killed if job else False,
         )
         self._engine.registry.append(container)
         return container
@@ -519,6 +555,76 @@ def test_the_reported_output_volume_matches_what_was_captured(
     assert outcome.truncated is False
 
 
+# --- an OOM kill is resource_exhausted, never inferred from exit status 137 --
+#
+# Verified live on this host (Docker 29.1.3 / API 1.52, 2026-07-28): a genuine
+# memory kill reports ``State.OOMKilled=true, ExitCode=137``, and
+# ``python -c "raise SystemExit(137)"`` reports ``OOMKilled=false,
+# ExitCode=137``. So every test below drives ``OOMKilled`` and ``ExitCode``
+# independently through ``engine.job_oom_killed`` / ``engine.job_exit_code`` —
+# the same way the live engine's two fields are independent of each other —
+# rather than letting the stub infer one from the other.
+
+
+def test_an_oom_kill_is_reported_as_resource_exhausted(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """``State.OOMKilled=true`` is the whole signal; the number beside it is not."""
+    engine.job_exit_code = 137
+    engine.job_oom_killed = True
+
+    outcome = provider.run(workspace, ("stress-me",), policy, job_id="job-oom")
+
+    assert outcome.status == STATUS_RESOURCE_EXHAUSTED
+    assert outcome.exit_status == 137
+    assert exit_code_for_status(outcome.status) == EXIT_RESOURCE_EXHAUSTED
+
+
+def test_an_honest_exit_137_without_oomkilled_is_an_ordinary_failure(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """A program choosing 137 for itself is a failed computation, not a budget breach.
+
+    This is the case that makes the bare exit status ambiguous: nothing about
+    it distinguishes a kernel OOM kill from a command that picked the same
+    number on its own account. Only ``OOMKilled`` can, so a container that
+    exits 137 with ``OOMKilled=false`` must land on exit 6, not exit 8.
+    """
+    engine.job_exit_code = 137
+    engine.job_oom_killed = False
+
+    outcome = provider.run(
+        workspace, ("python3", "-c", "raise SystemExit(137)"), policy, job_id="job-self-137"
+    )
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == 137
+    assert exit_code_for_status(outcome.status) == EXIT_COMPUTATION_FAILED
+
+
+def test_a_wall_clock_kill_reports_timeout_even_when_oomkilled_is_true(
+    engine: StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """headspace stopping the job on purpose outranks the kernel's own budget.
+
+    ``_await_exit``'s own ``kill()`` yields the same 137 an OOM kill does, so
+    a container that is stopped by the wall-clock enforcer AND happens to
+    carry ``OOMKilled=true`` must still be reported ``timeout`` — pinned here
+    with both conditions true at once, rather than trusting branch order.
+    """
+    engine.job_settles_to = "running"  # stays alive until `kill()` is called
+    engine.job_oom_killed = True
+    tight_policy = resolve_policy(
+        Policy(budget=ResourceBudget(wall_clock_seconds=0)), provider.capabilities()
+    )
+
+    outcome = provider.run(workspace, ("sleep", "infinity"), tight_policy, job_id="job-wallclock")
+
+    assert outcome.status == STATUS_TIMEOUT
+    assert outcome.exit_status is None
+    assert exit_code_for_status(outcome.status) == EXIT_TIMEOUT
+
+
 # --- through the orchestrator, to the rendered package -----------------------
 
 
@@ -611,3 +717,29 @@ def test_the_cli_exits_six_and_leaks_nothing_on_a_command_the_image_cannot_run(
     assert payload["status"] == STATUS_FAILURE
     assert payload["provenance"]["profile"] == profiles.DEFAULT_PROFILE
     assert "definitely-not-a-binary" in json.dumps(payload)
+
+
+def test_the_cli_exits_eight_on_a_job_the_engine_marks_oomkilled(
+    cli_provider: DockerProvider,
+    engine: StubEngine,
+    store_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The end-to-end surface an autonomous consumer reads: exit 8, not exit 6.
+
+    This is the defect from live testing: without this, a memory-killed job
+    reported plain ``failure`` at exit 6 and an agent retried an identical job
+    that would be killed identically, instead of raising its memory ceiling.
+    """
+    del store_home, cli_provider
+    assert main(["create", "--workspace-id", WORKSPACE]) == 0
+    capsys.readouterr()
+
+    engine.job_exit_code = 137
+    engine.job_oom_killed = True
+    code = main(["run", "--json", "--job-id", "job-oom", WORKSPACE, "stress-me"])
+    captured = capsys.readouterr()
+
+    assert code == EXIT_RESOURCE_EXHAUSTED
+    payload = json.loads(captured.out)
+    assert payload["status"] == STATUS_RESOURCE_EXHAUSTED
