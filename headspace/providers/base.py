@@ -68,18 +68,27 @@ raised as :class:`ProviderError` (exit code 7), just as an unsatisfiable policy
 is raised as :class:`~headspace.core.policy.PolicyError` (exit code 3). What
 comes back from ``run`` is therefore always a statement about the *job*.
 
-Why the workspace never sits in ``running``
--------------------------------------------
-The lifecycle table in :mod:`headspace.core.states` is a DAG: ``running`` leads
-only to ``completed``/``failed``/``cancelled``, none of which lead back to
-``ready``. A workspace hosts *several* jobs by design ("run multiple jobs
-sharing state", doc section 11), so driving the workspace through
-``running -> completed`` per job would burn its lifecycle on the first command.
-Providers therefore hold the workspace at ``ready`` across every job and report
-in-flight work as :attr:`WorkspaceDescriptor.active_jobs`. The destroy guard
-still refuses correctly, and refuses in the table's own words:
+Why the *descriptor* never sits in ``running``
+----------------------------------------------
+A workspace hosts *several* jobs by design ("run multiple jobs sharing state",
+doc section 11). :mod:`headspace.core.states` supports that with exactly one
+cycle, ``ready -> running -> ready``, so the headspace's own lifecycle state
+does move to ``running`` for the duration of a job and back again — see
+deviation ``d4`` (issue #2), which added that edge precisely so a state the
+spec names is one a workspace genuinely occupies.
+
+What stays at ``ready`` is the *provider's* descriptor. The two are separate
+fields on the stored record on purpose: :mod:`headspace.core.workspace` owns
+the headspace lifecycle, while a descriptor reports the engine's view, and
+persisting the latter must never clobber the former — otherwise a concurrent
+destroy would stop seeing the job it has to refuse to interrupt. Providers
+therefore report in-flight work as :attr:`WorkspaceDescriptor.active_jobs` and
+leave lifecycle transitions to the layer above.
+
+The destroy guard refuses in the table's own words either way:
 :func:`guard_removable` asks ``validate_transition(running, destroyed)``, which
-is precisely the edge ``states.py`` deliberately omits.
+is precisely the edge ``states.py`` deliberately omits — and now asks it about
+a state the workspace is actually in.
 
 Why ``remove`` walks a path
 ---------------------------

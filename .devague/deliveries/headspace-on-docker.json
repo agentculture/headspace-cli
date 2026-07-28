@@ -2,7 +2,7 @@
   "plan_slug": "headspace-on-docker",
   "schema_version": 1,
   "created": "2026-07-27T23:07:34Z",
-  "updated": "2026-07-27T23:56:51Z",
+  "updated": "2026-07-28T04:00:55Z",
   "deviations": [
     {
       "id": "d1",
@@ -75,6 +75,23 @@
       "origin": "llm",
       "status": "approved",
       "classification": "acceptable"
+    },
+    {
+      "id": "d6",
+      "what": "add an artifact read-back verb to the Provider seam so export can retrieve bytes from a workspace",
+      "task_ref": "t10",
+      "reason": "The Provider Protocol shipped with capabilities/create/run/inspect/remove and no way to read bytes OUT of a workspace, so Orchestrator.export takes the byte source as a caller-supplied parameter. That is unimplementable for the CLI: 'headspace export <id> <artifact>' must pull the bytes from inside the Docker volume, and no task owns that capability. Blocks t11's export verb, t13's MVP success test (recover the artifact by digest), and the section 11 acceptance criterion on explicit artifact export. Neither t8 nor t9 was at fault \u2014 the plan's five-verb seam was specified without a read-back path. Resolution: a dedicated task extends the Protocol, the fake, the Docker provider, and the conformance suite, and wires export to pull from the provider when no explicit source is given.",
+      "affects": [
+        "t8",
+        "t9",
+        "t11",
+        "t13",
+        "c1",
+        "h7"
+      ],
+      "origin": "llm",
+      "status": "approved",
+      "classification": "risky"
     }
   ]
 }
