@@ -208,7 +208,7 @@ class ArtifactInventory:
 
     def mark_exported(self, name: str, *, size_bytes: int, sha256: str) -> ArtifactRecord:
         """Record a verified export — size and digest come from :func:`export_artifact`."""
-        record = replace(
+        record: ArtifactRecord = replace(
             self._require(name),
             retention=RETENTION_EXPORTED,
             size_bytes=size_bytes,
@@ -219,7 +219,7 @@ class ArtifactInventory:
 
     def mark_discarded(self, name: str) -> ArtifactRecord:
         """Record that a declared artifact went away unexported (a forced destroy)."""
-        record = replace(self._require(name), retention=RETENTION_DISCARDED)
+        record: ArtifactRecord = replace(self._require(name), retention=RETENTION_DISCARDED)
         self._records[name] = record
         return record
 
