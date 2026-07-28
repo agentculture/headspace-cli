@@ -19,18 +19,41 @@ imports nothing from the rest of the package — sanctioned for this task
 specifically to reuse the one error contract, not a general core -> cli
 allowance.
 
-The state graph is a DAG by design: no state ever transitions back to an
-earlier stage, and ``requested`` is the sole entry point (nothing legally
-targets it). ``destroyed`` is the only state with no outgoing edges.
-Crucially, ``running`` has no direct edge to ``destroyed`` — a running
+The graph flows forward, with exactly one deliberate cycle: ``ready`` and
+``running`` return to each other. Everything else moves strictly onward, and
+``requested`` is the sole entry point (nothing legally targets it);
+``destroyed`` is the only state with no outgoing edges.
+
+Why ``running -> ready`` exists (deviation d4)
+---------------------------------------------
+The table was first written as a strict DAG, which made ``ready -> running``
+a one-way door: a workspace that ran one job could never run another, since
+``completed``/``failed``/``cancelled`` do not lead back. But a headspace
+hosts *several* jobs by design ("run multiple jobs sharing state", doc
+section 11), so the orchestration layer's only options were to burn a
+workspace's lifecycle on its first command or to never enter ``running`` at
+all — and it chose the latter, leaving a state the spec explicitly names
+(section 6) unreachable in practice. A state no workspace can occupy is not
+a lifecycle, it is documentation.
+
+So ``running`` returns to ``ready``. A workspace now genuinely sits in
+``running`` for the duration of each job and is released back to ``ready``
+afterwards, whatever the job's *status* was — a job that exits non-zero
+leaves a perfectly good workspace, and ``completed``/``failed`` describe a
+workspace whose life ended that way, not a command that failed. The edge
+does double duty: it is also the edge crash reconciliation walks to release
+a workspace stranded in ``running`` by a CLI that died mid-job.
+
+Crucially, ``running`` still has no direct edge to ``destroyed`` — a running
 workspace must be cancelled (or reach ``completed``/``failed``) before it
 can be destroyed. That single omission encodes the product rule "destroy
 while a job runs either cancels it first or refuses": callers get the
 refusal for free, as a :class:`~headspace.cli._errors.CliError`, purely by
-construction of the table below — no orchestration-layer special case
-needed. Any later task adding a destroy path MUST NOT add a
-``running -> destroyed`` edge to work around this; it should drive the
-existing ``running -> cancelled -> destroyed`` path instead.
+construction of the table below — and now they get it about a state that is
+really occupied, rather than one synthesized for the occasion. Any later
+task adding a destroy path MUST NOT add a ``running -> destroyed`` edge to
+work around this; it should drive the existing
+``running -> cancelled -> destroyed`` path instead.
 """
 
 from __future__ import annotations
@@ -67,7 +90,9 @@ TRANSITIONS: dict[State, frozenset[State]] = {
     State.REQUESTED: frozenset({State.PROVISIONING, State.CANCELLED, State.FAILED, State.EXPIRED}),
     State.PROVISIONING: frozenset({State.READY, State.FAILED, State.CANCELLED}),
     State.READY: frozenset({State.RUNNING, State.CANCELLED, State.EXPIRED}),
-    State.RUNNING: frozenset({State.COMPLETED, State.FAILED, State.CANCELLED}),
+    # ready <-> running is the table's one cycle, and it is what lets a single
+    # workspace host many jobs. See the module docstring (deviation d4).
+    State.RUNNING: frozenset({State.READY, State.COMPLETED, State.FAILED, State.CANCELLED}),
     State.COMPLETED: frozenset({State.DESTROYED, State.EXPIRED}),
     State.FAILED: frozenset({State.DESTROYED, State.EXPIRED}),
     State.CANCELLED: frozenset({State.DESTROYED, State.EXPIRED}),

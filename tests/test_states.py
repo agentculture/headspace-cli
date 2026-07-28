@@ -10,12 +10,18 @@ the other way around, so the matrix test below is not tautological.
 
 Design notes a reviewer should check against the spec narrative:
 
-* The graph is a DAG — no state ever moves back to an earlier stage.
+* The graph flows forward with exactly one cycle: ``ready <-> running``.
+  Added by deviation d4 — without it, ``ready -> running`` is a one-way door
+  and a workspace can serve only one job, which contradicts "run multiple
+  jobs sharing state" (doc section 11) and left ``running`` unreachable in
+  practice. See :mod:`headspace.core.states` for the full rationale.
 * ``destroyed`` is the only terminal state (no outgoing edges).
 * ``running`` has no direct edge to ``destroyed``: a running workspace must
   be cancelled (or reach completed/failed) first. This encodes the spec's
   "destroy while a job runs either cancels it first or refuses" rule as a
-  structural property of the table, not an ad hoc check in a provider.
+  structural property of the table, not an ad hoc check in a provider. The
+  d4 cycle deliberately does *not* weaken this: it makes the refusal apply
+  to a state workspaces really occupy.
 * ``requested`` is the sole entry point: nothing transitions back to it.
 """
 
@@ -36,7 +42,7 @@ EXPECTED_TRANSITIONS: dict[State, frozenset[State]] = {
     State.REQUESTED: frozenset({State.PROVISIONING, State.CANCELLED, State.FAILED, State.EXPIRED}),
     State.PROVISIONING: frozenset({State.READY, State.FAILED, State.CANCELLED}),
     State.READY: frozenset({State.RUNNING, State.CANCELLED, State.EXPIRED}),
-    State.RUNNING: frozenset({State.COMPLETED, State.FAILED, State.CANCELLED}),
+    State.RUNNING: frozenset({State.READY, State.COMPLETED, State.FAILED, State.CANCELLED}),
     State.COMPLETED: frozenset({State.DESTROYED, State.EXPIRED}),
     State.FAILED: frozenset({State.DESTROYED, State.EXPIRED}),
     State.CANCELLED: frozenset({State.DESTROYED, State.EXPIRED}),
@@ -125,6 +131,34 @@ def test_nothing_transitions_back_to_requested() -> None:
 def test_destroyed_is_terminal() -> None:
     """destroyed has no legal outgoing transitions at all."""
     assert TRANSITIONS[State.DESTROYED] == frozenset()
+
+
+def test_running_returns_to_ready_so_one_workspace_can_host_many_jobs() -> None:
+    """Deviation d4: the table's one deliberate cycle, and why it is there.
+
+    A headspace is a *session* — the spec asks for multiple jobs sharing one
+    workspace's state. Without this edge, ``ready -> running`` spends the
+    workspace's remaining lifecycle on its first command, since nothing after
+    ``running`` leads back; the orchestration layer's only escape was to never
+    enter ``running``, which made a state the spec names (section 6)
+    unreachable. With it, ``running`` is a state a workspace genuinely
+    occupies for the duration of each job, and the destroy-during-run refusal
+    below applies to a real state rather than a synthesized one.
+    """
+    assert State.READY in TRANSITIONS[State.RUNNING]
+    assert State.RUNNING in TRANSITIONS[State.READY]
+    assert validate_transition(State.RUNNING, State.READY) is None
+
+
+def test_ready_and_running_form_the_tables_only_cycle() -> None:
+    """Every other edge still moves strictly forward; the cycle is deliberate, not drift."""
+    cycles = {
+        (state, target)
+        for state, targets in TRANSITIONS.items()
+        for target in targets
+        if state in TRANSITIONS[target]
+    }
+    assert cycles == {(State.READY, State.RUNNING), (State.RUNNING, State.READY)}
 
 
 def test_running_has_no_direct_edge_to_destroyed() -> None:
