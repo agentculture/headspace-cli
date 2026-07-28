@@ -22,6 +22,14 @@ are asserted here against ``HostConfig`` as the engine reports it, using the
 SDK directly. This file and ``headspace/providers/docker.py`` are the only two
 places in the repo that may import it.
 
+Two of those blind spots belong to the read-back verb, and both are the reason
+it exists at all. The suite cannot stop a workspace's runtime, so it cannot
+prove that an artifact survives a workspace whose container has exited — which
+is precisely the case a caller needs the verb for. And it cannot measure
+memory, so "streamed, not buffered" would be an assertion about an
+implementation rather than an observation of one: here a 16 MiB artifact is
+read back under :mod:`tracemalloc`, and the peak is the evidence.
+
 Running without an engine
 -------------------------
 The unit lane has no daemon and coverage must never require one, so engine
@@ -49,17 +57,21 @@ reaper's authority exactly as wide as its knowledge.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import hashlib
 import os
 import threading
 import time
+import tracemalloc
 import uuid
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import docker
 import pytest
 
-from headspace.cli._errors import EXIT_INFRASTRUCTURE_FAILURE
+from headspace.cli._errors import EXIT_INFRASTRUCTURE_FAILURE, EXIT_USER_ERROR, CliError
 from headspace.core import profiles
 from headspace.core.policy import (
     EffectivePolicy,
@@ -69,6 +81,9 @@ from headspace.core.policy import (
     ResourceBudget,
 )
 from headspace.core.policy import resolve as resolve_policy
+from headspace.core.states import State
+from headspace.core.store import HOME_ENV_VAR, Store
+from headspace.core.workspace import ArtifactDeclaration, Orchestrator
 from headspace.providers.base import ProviderError
 from headspace.providers.docker import (
     LABEL_CAPABILITY_PREFIX,
@@ -103,6 +118,17 @@ WORKER = os.environ.get("PYTEST_XDIST_WORKER", "solo")
 CONFORMANCE_PREFIX = f"conf-docker-{WORKER}"
 POSTURE_PREFIX = f"hs-posture-{WORKER}"
 OWNED_PREFIXES = (CONFORMANCE_PREFIX, POSTURE_PREFIX)
+
+#: The artifact the read-back tests fetch, and the job that writes it. ``yes``
+#: generates it, so the expected content is a Python expression rather than a
+#: fixture file — the test asserts the exact bytes, not just the size.
+ARTIFACT_PATH = "artifact.bin"
+ARTIFACT_BYTES = (b"headspace\n" * 820)[:8192]
+WRITING_COMMAND = (
+    "/bin/sh",
+    "-c",
+    f"yes headspace | head -c {len(ARTIFACT_BYTES)} > {WORKSPACE_MOUNT_PATH}/{ARTIFACT_PATH}",
+)
 
 
 @functools.cache
@@ -141,13 +167,22 @@ def _reap_engine_strays() -> Iterator[None]:
     engine-breakage test strands a workspace on purpose (its provider is
     pointed at a dead socket, so the suite's own cleanup cannot reach it), and
     a test that dies mid-``create`` can strand one by accident.
+
+    ``ignore_removed`` is load-bearing under ``-n auto``. The filter selects on
+    the label *key*, so the listing spans every worker's objects, and the SDK
+    re-inspects each id it listed — an object a sibling worker removed in
+    between therefore raises ``NotFound`` from the listing itself, aborting this
+    reaper before it reaches its own strays. The one thing a safety net must not
+    do is fail on someone else's tidiness.
     """
     yield
     if _engine_reason():
         return
     client = docker.from_env()
     try:
-        for container in client.containers.list(all=True, filters={"label": LABEL_WORKSPACE_ID}):
+        for container in client.containers.list(
+            all=True, filters={"label": LABEL_WORKSPACE_ID}, ignore_removed=True
+        ):
             if _owned(container.labels.get(LABEL_WORKSPACE_ID, "")):
                 container.remove(force=True)
         for volume in client.volumes.list(filters={"label": LABEL_WORKSPACE_ID}):
@@ -190,6 +225,9 @@ class TestDockerProviderConformance(ProviderConformance):
             slow_seconds=1,
             flooding_command=("/bin/sh", "-c", "yes headspace | head -c 200000"),
             flood_budget_bytes=4096,
+            writing_command=WRITING_COMMAND,
+            artifact_path=ARTIFACT_PATH,
+            artifact_bytes=ARTIFACT_BYTES,
             break_engine=break_engine,
             workspace_prefix=CONFORMANCE_PREFIX,
         )
@@ -382,6 +420,171 @@ def _await_job_container(
     raise AssertionError(f"no job container appeared for {workspace_id}")
 
 
+# --- reading artifacts back out, where the suite cannot look ----------------
+
+
+class TestReadingArtifactsBackOut:
+    """The two properties the backend-agnostic suite structurally cannot check."""
+
+    def test_an_artifact_outlives_a_workspace_whose_runtime_has_exited(
+        self,
+        engine: docker.DockerClient,
+        provider: DockerProvider,
+        workspace: Callable[..., str],
+    ) -> None:
+        """The case the verb exists for: the box died, the work must not die with it.
+
+        A workspace whose container has exited reports ``failed`` — the runtime
+        is gone. Its *storage* is not, and the artifacts are in the storage, so
+        a read that needed a live container would lose exactly the work a caller
+        most needs back.
+        """
+        workspace_id = workspace()
+        provider.run(workspace_id, WRITING_COMMAND, _default_policy(provider), job_id="writer")
+
+        _anchor(engine, workspace_id).stop(timeout=10)
+        assert provider.inspect(workspace_id).state is State.FAILED
+
+        with provider.read(workspace_id, ARTIFACT_PATH) as stream:
+            assert b"".join(stream) == ARTIFACT_BYTES
+
+    def test_reading_creates_no_engine_object_of_its_own(
+        self,
+        engine: docker.DockerClient,
+        provider: DockerProvider,
+        workspace: Callable[..., str],
+    ) -> None:
+        """Nothing to leak, because nothing is created: the read is a plain fetch.
+
+        A read that spun up a helper container to reach the volume would have to
+        be trusted to reap it on every failure path. This backend reads through
+        the workspace container it already owns, so the strongest guarantee is
+        available: the engine's object count does not move.
+        """
+        workspace_id = workspace()
+        provider.run(workspace_id, WRITING_COMMAND, _default_policy(provider), job_id="writer")
+
+        def objects() -> tuple[int, int]:
+            containers = engine.containers.list(all=True, filters={"label": LABEL_WORKSPACE_ID})
+            volumes = engine.volumes.list(filters={"label": LABEL_WORKSPACE_ID})
+            return len(containers), len(volumes)
+
+        before = objects()
+        with provider.read(workspace_id, ARTIFACT_PATH) as stream:
+            assert b"".join(stream) == ARTIFACT_BYTES
+        # ...and again, abandoned half way, which is the path a failed digest takes.
+        abandoned = provider.read(workspace_id, ARTIFACT_PATH, chunk_size=64)
+        next(iter(abandoned))
+        abandoned.close()
+        assert objects() == before
+
+    def test_a_large_artifact_is_streamed_rather_than_materialised(
+        self, provider: DockerProvider, workspace: Callable[..., str]
+    ) -> None:
+        """Criterion: streamed, measured rather than asserted.
+
+        16 MiB is written into the workspace and read back while
+        :mod:`tracemalloc` watches every Python allocation. A backend that
+        buffered the artifact anywhere — the transfer archive, the HTTP
+        response, a ``b"".join`` — would show a peak at least as large as the
+        artifact itself. The ceiling asserted here is a quarter of it.
+        """
+        megabytes = 16
+        workspace_id = workspace()
+        provider.run(
+            workspace_id,
+            (
+                "/bin/sh",
+                "-c",
+                f"dd if=/dev/zero of={WORKSPACE_MOUNT_PATH}/big.bin bs=1M count={megabytes}",
+            ),
+            _default_policy(provider),
+            job_id="big-writer",
+        )
+
+        tracemalloc.start()
+        try:
+            total = 0
+            widest = 0
+            with provider.read(workspace_id, "big.bin", chunk_size=256 * 1024) as stream:
+                for chunk in stream:
+                    total += len(chunk)
+                    widest = max(widest, len(chunk))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert total == megabytes * 1024 * 1024
+        assert widest <= 256 * 1024
+        assert peak < 4 * 1024 * 1024, (
+            f"peak allocation was {peak} bytes reading a {total}-byte artifact: "
+            "it was buffered, not streamed"
+        )
+
+    def test_a_directory_and_a_symlink_are_refused_rather_than_half_exported(
+        self, provider: DockerProvider, workspace: Callable[..., str]
+    ) -> None:
+        """An artifact is one file's bytes; anything else is refused as a user error.
+
+        The symlink half is a boundary check, not a nicety. A job can plant a
+        link to a path outside the workspace volume, and the engine's own
+        archive endpoint resolves such a link within the container's filesystem
+        — so the refusal is what keeps a read to the storage it was asked for.
+        """
+        workspace_id = workspace()
+        provider.run(
+            workspace_id,
+            (
+                "/bin/sh",
+                "-c",
+                f"mkdir -p {WORKSPACE_MOUNT_PATH}/sub && "
+                f"ln -s /etc/hostname {WORKSPACE_MOUNT_PATH}/escape",
+            ),
+            _default_policy(provider),
+            job_id="odd-writer",
+        )
+
+        for path in ("sub", "escape"):
+            with pytest.raises(CliError) as caught:
+                provider.read(workspace_id, path)
+            assert caught.value.code == EXIT_USER_ERROR
+            assert not isinstance(caught.value, ProviderError)
+            assert caught.value.remediation
+
+
+class TestExportPullsBytesOutOfTheEngine:
+    """Criterion 1, end to end: a job's file becomes a durable, verified artifact."""
+
+    def test_export_recovers_the_artifact_by_digest_with_no_caller_supplied_source(
+        self,
+        provider: DockerProvider,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(HOME_ENV_VAR, str(tmp_path / "headspace-home"))
+        orchestrator = Orchestrator(provider, Store())
+        workspace_id = f"{POSTURE_PREFIX}-{uuid.uuid4().hex[:12]}"
+        destination = tmp_path / ARTIFACT_PATH
+
+        try:
+            orchestrator.create(workspace_id=workspace_id)
+            orchestrator.run(
+                workspace_id,
+                WRITING_COMMAND,
+                declares=[ArtifactDeclaration(ARTIFACT_PATH, "the artifact under test")],
+            )
+            package = orchestrator.export(workspace_id, ARTIFACT_PATH, destination=destination)
+        finally:
+            with contextlib.suppress(Exception):
+                provider.remove(workspace_id)
+
+        assert destination.read_bytes() == ARTIFACT_BYTES
+        (artifact,) = package.artifacts
+        assert artifact.digest == hashlib.sha256(ARTIFACT_BYTES).hexdigest()
+        assert artifact.size_bytes == len(ARTIFACT_BYTES)
+        assert artifact.reference == str(destination)
+
+
 # --- acceptance criterion 3: the probe is measured, and it is persisted -----
 
 
@@ -478,7 +681,7 @@ class TestUnreachableEngineIsInfrastructureFailure:
         monkeypatch.delenv("DOCKER_CERT_PATH", raising=False)
         return DockerProvider()
 
-    @pytest.mark.parametrize("verb", ["capabilities", "create", "run", "inspect", "remove"])
+    @pytest.mark.parametrize("verb", ["capabilities", "create", "run", "inspect", "read", "remove"])
     def test_every_verb_raises_provider_error(self, unreachable: DockerProvider, verb: str) -> None:
         policy = resolve_policy(Policy(), _snapshot_without_an_engine())
         dead = f"{POSTURE_PREFIX}-unreachable"
@@ -487,6 +690,7 @@ class TestUnreachableEngineIsInfrastructureFailure:
             "create": lambda: unreachable.create(dead, "python:3.12-slim", policy),
             "run": lambda: unreachable.run(dead, ("true",), policy, job_id="dead-job"),
             "inspect": lambda: unreachable.inspect(dead),
+            "read": lambda: unreachable.read(dead, ARTIFACT_PATH),
             "remove": lambda: unreachable.remove(dead),
         }
         with pytest.raises(ProviderError) as caught:
