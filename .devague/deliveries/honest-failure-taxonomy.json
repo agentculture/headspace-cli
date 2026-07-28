@@ -1,0 +1,62 @@
+{
+  "plan_slug": "honest-failure-taxonomy",
+  "schema_version": 1,
+  "created": "2026-07-28T22:15:30Z",
+  "updated": "2026-07-28T23:09:15Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "expand t1's file ownership to include test_status_vocabulary_is_the_shared_seven in tests/test_result.py \u2014 update its expected tuple and rename it \u2014 rather than leaving the suite red until t4 lands in wave 2",
+      "task_ref": "t1",
+      "reason": "the plan split files by path, but this assertion pins STATUSES by exact tuple equality, which is t1's concern (the vocabulary) not t4's (result rendering); t1 correctly refused to reach outside its file list, so merging t1 alone would leave the suite red across a wave boundary and violate the TDD gate's requirement that tests pass before AND after every merge",
+      "affects": [
+        "t4",
+        "c18",
+        "h8"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d2",
+      "what": "move t2's acceptance criterion 5 \u2014 'the key finding names the profile and the caller's argv[0]' \u2014 into t4's scope as a one-line branch in _job_findings keyed on exit_status in (126, 127)",
+      "task_ref": "t2",
+      "reason": "key_findings is built by _job_findings in core/workspace.py:1402, which t2 does not own and which t1 and t4 both edit; the provider also deliberately never learns profile NAMES (it holds only the environment reference, since profiles.py lives above the seam). The rendered package already names both facts elsewhere \u2014 provenance.profile plus argv[0] in the outcome summary and evidence excerpt \u2014 so t7's acceptance passes today, but the literal key_findings placement needs t4's region",
+      "affects": [
+        "t4",
+        "c2",
+        "h1"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d3",
+      "what": "narrow t2's acceptance criterion 6 to: the RAW engine message (transport envelope, URL, container id) is absent from every rendered section, while the engine's redacted diagnosis appears bounded in the evidence excerpt and in full via inspect --logs",
+      "task_ref": "t2",
+      "reason": "criterion 6's two halves are in tension as written: core/workspace.py:589 renders outcome.output AS the captured-output evidence excerpt, so anything on the retrievable path is by construction in a rendered section. The narrowed reading is what confirmed honesty condition h26 actually describes \u2014 raw message absent, diagnosis recoverable through the existing bounded-evidence escape hatch \u2014 and it satisfies c12, c33 and c34 in substance",
+      "affects": [
+        "c33",
+        "h26"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d4",
+      "what": "t7's acceptance criterion 4 asserts exact per-outcome codes [6, 8, 6, 7] plus mutual distinguishability by (process exit code, command's own exit_status) signature, rather than the 'four distinct exit codes' the criterion literally demanded",
+      "task_ref": "t7",
+      "reason": "the criterion is unsatisfiable as written, and t7 was right to refuse to bend anything to make it look satisfied: an unrunnable command and an ordinary failing computation BOTH exit 6, which is precisely what the t2 fix establishes (both are the caller's computation reporting a result) rather than a gap in it. The four outcomes occupy three taxonomy slots; they remain mutually distinguishable because the 6-pair separates on exit_status 127 vs 137 and the 137-pair separates on process exit 6 vs 8. I authored the criterion without noticing two of its four cases legitimately share a code",
+      "affects": [
+        "c23",
+        "h18"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    }
+  ]
+}
