@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/). This project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-07-28
+
+### Fixed
+
+- **SonarCloud gate blocker** (`new_reliability_rating` 4 -> A) -- `parse_command` in `headspace/cli/_commands/run.py` now uses the empty-safe slice `argv[:1] == ["--"]` instead of `argv and argv[0] == "--"`. The original was correct (short-circuit evaluation means the index is only reached when the list is non-empty), but rule S6466 has to *prove* that; the slice form is correct without an argument.
+- **markdownlint on CI** -- `.markdownlint-cli2.yaml` now ignores `.venv/**` and `**/site-packages/**`. Installed third-party packages ship their own `LICENSE.md` files, which are not ours to reformat. They only appear once dependencies are synced, which is why CI caught this and a local run made before `uv sync` did not.
+
 ## [0.8.0] - 2026-07-28
 
 ### Added

@@ -17,6 +17,11 @@ config:
 ignores:
   - "node_modules/**"
   - ".local/**"
+  # Installed third-party packages. Their LICENSE.md files are not ours to
+  # reformat, and they only appear once dependencies are synced — which is why
+  # CI caught this and a local run before `uv sync` did not.
+  - ".venv/**"
+  - "**/site-packages/**"
   - ".afi/**"
   - ".teken/**"
   # Vendored skills are cited verbatim from guildmaster — do not reformat them.

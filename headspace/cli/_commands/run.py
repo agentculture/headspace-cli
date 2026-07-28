@@ -75,7 +75,11 @@ def parse_declarations(values: Sequence[str] | None) -> list[ArtifactDeclaration
 def parse_command(values: Sequence[str] | None) -> list[str]:
     """The job's argv: everything after the workspace id, minus a leading ``--``."""
     argv = list(values or ())
-    if argv and argv[0] == "--":
+    # Slice rather than index: `argv[:1] == ["--"]` is empty-safe by
+    # construction, where `argv and argv[0] == "--"` relies on short-circuit
+    # evaluation that a static analyser has to prove. Both are correct; this
+    # one is correct without an argument (SonarCloud S6466).
+    if argv[:1] == ["--"]:
         argv = argv[1:]
     if not argv:
         raise CliError(
