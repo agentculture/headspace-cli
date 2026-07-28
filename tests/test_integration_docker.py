@@ -62,6 +62,30 @@ h20
     directly — carries no socket mount, no host bind mount, ``NetworkMode
     none`` by default, and exactly one writable mount: the workspace volume.
 
+The two defects, pinned where they were found
+----------------------------------------------
+The last group is not an honesty condition. It is the pair of failures that
+were found by hand against a live engine, and it lives here — rather than only
+in ``tests/test_docker_classification.py``, where a stub engine scripts both —
+because a stub can only produce the engine sentence a test author already
+believed in. These reproductions get the sentence from the engine itself:
+``definitely-not-a-binary`` really is absent from a real image's ``PATH``, and
+a real 512 MiB allocation really is killed under a real 128 MiB cgroup ceiling.
+If Docker ever changes the wording, the shape of its OOM state, or the status
+it reports for an unrunnable command, these fail and the stub-backed suite does
+not.
+
+They assert at the **process** boundary — argv in, exit code and ``--json`` on
+stdout out — because that is what a subprocess consumer actually reads, and
+because both defects were failures of that surface: an exit code that sent an
+agent down the wrong recovery path, and a result package that gave it nothing
+to change. Every number they assert is written as a literal with the constant
+it mirrors named in a comment, never imported: these tests are the fail-first
+evidence for the fix, so they must stay runnable against a revision where
+``EXIT_RESOURCE_EXHAUSTED`` does not exist yet. An import of a symbol the
+pre-fix tree lacks turns a *failing* test into a collection *error*, and a
+collection error proves nothing about behaviour.
+
 Running without an engine, and leaving nothing behind
 -------------------------------------------------------
 Same discipline as ``test_provider_docker.py``: :func:`_skip_without_engine`
@@ -82,7 +106,10 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -95,6 +122,7 @@ import pytest
 
 from headspace.cli._errors import CliError
 from headspace.core.policy import Policy, PolicyError, ResourceBudget
+from headspace.core.profiles import DEFAULT_PROFILE
 from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS
 from headspace.core.states import State
 from headspace.core.store import HOME_ENV_VAR, Store
@@ -699,3 +727,332 @@ def test_h20_a_job_run_through_the_orchestrator_has_no_socket_no_host_binds_no_n
     finally:
         runner.join(60)
     assert not runner.is_alive()
+
+
+# --- the two defects from live testing, pinned at the process boundary ------
+
+#: The exit codes asserted below, written as literals on purpose — see this
+#: module's docstring. Each mirrors the like-named constant in
+#: ``headspace.cli._errors``; the comment is the only link, and that is the
+#: point, because importing the constant would make these tests uncollectable
+#: on the revision they exist to fail against.
+_EXIT_COMPUTATION_FAILED = 6  # mirrors _errors.EXIT_COMPUTATION_FAILED
+_EXIT_INFRASTRUCTURE_FAILURE = 7  # mirrors _errors.EXIT_INFRASTRUCTURE_FAILURE
+_EXIT_RESOURCE_EXHAUSTED = 8  # mirrors _errors.EXIT_RESOURCE_EXHAUSTED
+
+#: Likewise for the status this change introduced. ``STATUS_FAILURE`` is
+#: imported at the top of this module because it predates the change; this one
+#: cannot be, for the same reason the exit codes cannot.
+_STATUS_RESOURCE_EXHAUSTED = "resource_exhausted"  # mirrors result.STATUS_RESOURCE_EXHAUSTED
+
+#: The command's own exit statuses for the two shapes an image cannot run.
+#: Both are POSIX shell convention, not headspace's invention, and both map to
+#: the *same* process exit code — which is exactly why
+#: :func:`test_regression_process_exit_six_and_the_commands_own_exit_status_stay_two_numbers`
+#: exists.
+_STATUS_COMMAND_NOT_FOUND = 127
+_STATUS_NOT_EXECUTABLE = 126
+
+#: The ceiling from the original reproduction, and an allocation four times
+#: over it — a decisive breach, not a near-miss another host might let through.
+_MEMORY_CEILING_BYTES = 134217728  # 128 MiB
+_OVERSHOOT_BYTES = 512 * 1024 * 1024
+
+#: A ``DOCKER_HOST`` that resolves to nothing, so the fourth outcome below is a
+#: genuinely broken engine rather than a simulated one. Same address the
+#: no-engine run named in this module's docstring uses.
+_UNREACHABLE_ENGINE = "unix:///nonexistent/docker.sock"
+
+#: What the first defect leaked into a caller's context: the raw engine handles
+#: from a ``docker.errors.APIError``, and the retry hint an autonomous agent
+#: trusted into an endless loop on a deterministic failure. Literals rather
+#: than imports of the product's own wording — a test that quotes the code it
+#: guards agrees with it by construction and guards nothing.
+_ENGINE_HANDLE_MARKERS = ("http+docker", "400 Client Error")
+_RETRY_HINT_FRAGMENT = "the execution engine failed, not the job"
+
+#: Generous: a cold ``create`` pulls the profile's pinned image, and every
+#: invocation below pays a fresh interpreter start. A bound rather than no
+#: bound so a wedged engine fails the test instead of hanging the suite.
+_CLI_TIMEOUT_SECONDS = 300.0
+
+
+def _cli(
+    *argv: str, home: Path, docker_host: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Drive the CLI out of process — argv in, exit code and streams out.
+
+    Not ``headspace.cli.main`` in-process: the exit code is the whole subject
+    of these tests, and in-process that number is a return value a test could
+    read even if ``main`` never propagated it. Here it is the real thing the
+    kernel reports, read the way a subprocess consumer reads it.
+
+    ``env`` is inherited rather than minimised (the idiom
+    ``tests/test_cli_verbs.py`` uses for its no-SDK-import proof) because these
+    tests need the operator's real engine settings — everything except
+    ``HEADSPACE_HOME``, which is forced to the per-test throwaway root, and
+    ``DOCKER_HOST`` when a caller deliberately breaks it.
+    """
+    env = dict(os.environ)
+    env[HOME_ENV_VAR] = str(home)
+    if docker_host is not None:
+        env["DOCKER_HOST"] = docker_host
+    return subprocess.run(
+        [sys.executable, "-m", "headspace", *argv],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        timeout=_CLI_TIMEOUT_SECONDS,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+
+
+def _create_workspace(home: Path, workspace_id: str, *extra: str) -> None:
+    created = _cli("create", "--workspace-id", workspace_id, "--json", *extra, home=home)
+    assert created.returncode == 0, f"create failed: {created.stderr}"
+
+
+def _package(result: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    """The ``--json`` result package a consumer parses off stdout."""
+    assert result.stdout, f"nothing on stdout to parse; stderr was: {result.stderr}"
+    parsed: dict[str, Any] = json.loads(result.stdout)
+    return parsed
+
+
+def _findings(package: dict[str, Any]) -> str:
+    return " | ".join(package["key_findings"])
+
+
+def _recorded_job(home: Path, job_id: str) -> dict[str, Any]:
+    """The job record ``headspace inspect <job> --logs --json`` hands back.
+
+    The one caller-facing surface carrying the *command's* own exit status as a
+    number rather than inside a sentence, which is what lets the pairing below
+    be asserted rather than substring-matched.
+    """
+    logs = _cli("inspect", job_id, "--logs", "--json", home=home)
+    assert logs.returncode == 0, f"inspect --logs failed: {logs.stderr}"
+    (job,) = json.loads(logs.stdout)["jobs"]
+    recorded: dict[str, Any] = job
+    return recorded
+
+
+def test_regression_a_command_the_image_cannot_run_exits_six_with_a_full_result_package(
+    home: Path, workspace: Any
+) -> None:
+    """Defect 1, at the surface it was found on.
+
+    ``headspace run <ws> definitely-not-a-binary`` used to exit 7
+    (``infrastructure_failure``), hint "check the engine is running and
+    reachable, then retry", and hand the caller a raw Docker API string. An
+    agent that believed the hint retried a deterministic failure forever. It is
+    a *computation* that failed — nothing about the engine was wrong — so it
+    exits 6 and reports a full result package instead of an error, and that
+    package names the profile that was asked and the executable it lacked,
+    which is what makes the next attempt different from this one.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id)
+
+    result = _cli(
+        "run",
+        "--json",
+        "--job-id",
+        "job-not-runnable",
+        workspace_id,
+        "definitely-not-a-binary",
+        home=home,
+    )
+
+    assert result.returncode == _EXIT_COMPUTATION_FAILED, (
+        f"exit {result.returncode}, expected {_EXIT_COMPUTATION_FAILED}; "
+        f"stderr: {result.stderr}"
+    )
+    package = _package(result)
+    assert package["status"] == STATUS_FAILURE
+    # A full result package, not an error payload: the profile that was asked,
+    # and the name the caller typed, both from what headspace already knew.
+    assert package["provenance"]["profile"] == DEFAULT_PROFILE
+    findings = _findings(package)
+    assert DEFAULT_PROFILE in findings
+    assert "definitely-not-a-binary" in findings
+    assert str(_STATUS_COMMAND_NOT_FOUND) in findings
+
+    combined = result.stdout + result.stderr
+    for marker in _ENGINE_HANDLE_MARKERS:
+        assert marker not in combined, f"the engine handle {marker!r} reached the caller"
+    assert _RETRY_HINT_FRAGMENT not in combined, "the hint that caused the retry loop is back"
+    assert "infrastructure_failure" not in combined
+
+
+def test_regression_an_allocation_over_the_ceiling_exits_eight_naming_the_ceiling_and_a_remedy(
+    home: Path, workspace: Any
+) -> None:
+    """Defect 2, at the surface it was found on.
+
+    A 512 MiB allocation under a 128 MiB ceiling used to exit 6 saying only
+    "the command completed with exit status 137", with empty warnings and empty
+    attention — indistinguishable from an ordinary failing computation, so the
+    caller's only sane next move was to rerun the identical job. Three things
+    have to hold for that to be fixed, and all three are asserted here: the
+    exit code separates it from an ordinary failure, a key finding names the
+    number that was breached, and attention names something the caller can
+    actually change.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id, "--memory-bytes", str(_MEMORY_CEILING_BYTES))
+
+    result = _cli(
+        "run",
+        "--json",
+        "--job-id",
+        "job-killed",
+        workspace_id,
+        "python3",
+        "-c",
+        f"x = bytearray({_OVERSHOOT_BYTES})",
+        home=home,
+    )
+
+    assert result.returncode == _EXIT_RESOURCE_EXHAUSTED, (
+        f"exit {result.returncode}, expected {_EXIT_RESOURCE_EXHAUSTED}; "
+        f"stderr: {result.stderr}"
+    )
+    package = _package(result)
+    assert package["status"] == _STATUS_RESOURCE_EXHAUSTED
+
+    findings = _findings(package)
+    assert str(_MEMORY_CEILING_BYTES) in findings, "the ceiling that was breached is not named"
+    assert (
+        "the command completed with exit status 137" not in findings
+    ), "the uninterpreted sentence from the defect is back"
+
+    assert package["attention"], "an exhausted result with empty attention IS the defect"
+    remedies = [item for item in package["attention"] if "--memory-bytes" in item]
+    assert remedies, f"attention names no remedy the caller can act on: {package['attention']}"
+    assert (
+        str(_MEMORY_CEILING_BYTES) in remedies[0]
+    ), "a remedy that does not say what the ceiling is now cannot be acted on"
+
+
+def test_regression_one_workspace_tells_four_outcomes_apart(home: Path, workspace: Any) -> None:
+    """One workspace, four ways for a job to end, and what a caller can tell apart.
+
+    Driven from a single workspace on purpose: the four are separated by *what
+    happened*, never by how the workspace was configured, so no assertion here
+    can be satisfied by a difference the test itself introduced.
+
+    Three exit codes for four outcomes, which is the honest count. A command
+    the image cannot run and a command that ran and failed share exit 6,
+    because both are the caller's computation reporting a result — that is the
+    fix, not a gap in it. They separate one level down, on the command's own
+    exit status, which is asserted here and pinned as a contract by the test
+    below. The two that must never collapse into 6 do not: the budget kill
+    (8, "your ceiling stopped this") and the broken engine (7, "nothing about
+    your job was wrong"). And a job that deliberately exits 137 stays an
+    ordinary failure — the OOM verdict comes from the engine's kill flag, not
+    from a number a command is free to choose.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id, "--memory-bytes", str(_MEMORY_CEILING_BYTES))
+
+    def run(job_id: str, *command: str, docker_host: str | None = None) -> Any:
+        return _cli(
+            "run",
+            "--json",
+            "--job-id",
+            job_id,
+            workspace_id,
+            *command,
+            home=home,
+            docker_host=docker_host,
+        )
+
+    not_runnable = run("job-not-runnable", "definitely-not-a-binary")
+    killed = run("job-killed", "python3", "-c", f"x = bytearray({_OVERSHOOT_BYTES})")
+    failed = run("job-failed", "python3", "-c", "raise SystemExit(137)")
+    engine_broke = run("job-engine", "python3", "-c", "print(1)", docker_host=_UNREACHABLE_ENGINE)
+
+    codes = [
+        not_runnable.returncode,
+        killed.returncode,
+        failed.returncode,
+        engine_broke.returncode,
+    ]
+    assert codes == [
+        _EXIT_COMPUTATION_FAILED,
+        _EXIT_RESOURCE_EXHAUSTED,
+        _EXIT_COMPUTATION_FAILED,
+        _EXIT_INFRASTRUCTURE_FAILURE,
+    ], f"the four outcomes came back as {codes}"
+
+    assert _package(not_runnable)["status"] == STATUS_FAILURE
+    assert _package(killed)["status"] == _STATUS_RESOURCE_EXHAUSTED
+    assert _package(failed)["status"] == STATUS_FAILURE
+    # The broken engine is raised, never returned as a job status (NFR-07):
+    # a structured error on stderr, and no result package at all on stdout.
+    assert not engine_broke.stdout
+    assert json.loads(engine_broke.stderr)["category"] == "infrastructure_failure"
+
+    # The three jobs that really ran, as headspace recorded them. The broken
+    # engine recorded nothing, because no job of the caller's ever started.
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    assert set(recorded) == {"job-not-runnable", "job-killed", "job-failed"}
+    assert recorded["job-not-runnable"]["exit_status"] == _STATUS_COMMAND_NOT_FOUND
+    assert recorded["job-killed"]["status"] == _STATUS_RESOURCE_EXHAUSTED
+    # Same 137 the kernel's kill reports, chosen by the command itself — and
+    # still an ordinary failure, because nothing exceeded a ceiling.
+    assert recorded["job-failed"]["exit_status"] == 137
+    assert recorded["job-failed"]["status"] == STATUS_FAILURE
+
+    # Four outcomes, three taxonomy slots, and still four answers a caller can
+    # tell apart — the pair sharing exit 6 separates on the command's own exit
+    # status, and the pair sharing exit status 137 separates on the code. This
+    # is the claim that actually holds; "four distinct exit codes" does not,
+    # and asserting it would mean bending the taxonomy to fit a test.
+    signatures = {
+        (not_runnable.returncode, recorded["job-not-runnable"]["exit_status"]),
+        (killed.returncode, recorded["job-killed"]["exit_status"]),
+        (failed.returncode, recorded["job-failed"]["exit_status"]),
+        (engine_broke.returncode, None),  # no job of the caller's ever ran
+    }
+    assert len(signatures) == 4, f"two of the four outcomes are indistinguishable: {signatures}"
+
+
+def test_regression_process_exit_six_and_the_commands_own_exit_status_stay_two_numbers(
+    home: Path, workspace: Any
+) -> None:
+    """Exit 6 and exit status 127/126 answer different questions. Both, together.
+
+    6 is headspace's taxonomy category — *this was your computation, not our
+    engine*. 127 and 126 are the command's own status — *absent from PATH* and
+    *found but not executable*. A later change that made the process exit 127
+    "because that is what the command returned" would lose the category, and
+    one that dropped 127 from the record would lose the diagnosis. Asserting
+    them in the same breath is what stops either from happening quietly. Both
+    not-runnable shapes are covered here rather than one, because they are the
+    two that share a process exit code and so are the pair most likely to be
+    collapsed into each other.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id)
+
+    for job_id, command, command_status in (
+        ("job-absent-from-path", "definitely-not-a-binary", _STATUS_COMMAND_NOT_FOUND),
+        ("job-not-executable", "/tmp", _STATUS_NOT_EXECUTABLE),
+    ):
+        result = _cli("run", "--json", "--job-id", job_id, workspace_id, command, home=home)
+
+        assert result.returncode == _EXIT_COMPUTATION_FAILED, (
+            f"{command!r} exited {result.returncode}, expected "
+            f"{_EXIT_COMPUTATION_FAILED}; stderr: {result.stderr}"
+        )
+        assert f"exit status {command_status}" in _findings(_package(result))
+
+        recorded = _recorded_job(home, job_id)
+        assert recorded["exit_status"] == command_status
+        assert recorded["exit_status"] != result.returncode, (
+            "the command's own exit status and headspace's taxonomy code have "
+            "been collapsed into one number"
+        )
