@@ -84,6 +84,31 @@ redaction pass: the only thing this module ever holds is an
 :class:`~headspace.core.inputs.InputEntry`, and an ``InputEntry`` has no content
 field to leak.
 
+**5. A secret travels by name, and only the name is written down.**
+:class:`JobEnvironment` is the other half of the same problem (issue #13). Before
+it, argv was the only way to hand a job a value, and argv is recorded verbatim in
+four places: ``outcome_summary``, ``provenance.inputs``, ``journal.jsonl`` and
+``state.json``. A caller who needed to give a job an API key therefore had no
+correct move. So ``run`` gained an environment channel whose *values* are read
+from the caller's own environment, by name, and are handed to the provider and to
+nothing else — while what is recorded is the key set of that very mapping. The
+guarantee is again structural rather than a redaction pass: every recording
+helper below reads :attr:`JobEnvironment.names`, and ``names`` is derived from
+the mapping's keys, so there is no code path along which a value could be written
+down even by accident.
+
+Note what is deliberately *absent*: there is no redaction pass over argv. A
+caller who types a secret into the command line still has it recorded verbatim,
+because headspace cannot know which argv token is a secret, and a guessing
+redactor that misses once is worse than a documented absence — a caller who
+believes their transcript is clean stops checking. The answer to a secret in argv
+is the channel that does not need argv, which is what this is.
+
+The edge of the guarantee is stated rather than glossed: a *job* that prints its
+own environment writes the value into its captured output, and captured output is
+kept. That is the job's doing, not headspace's, and no recording discipline on
+this side can unsee it — so ``run --help`` says so where the flags are.
+
 Three deviations from the plan are implemented here
 ---------------------------------------------------
 **d4 — ``running`` is a state workspaces genuinely occupy.** The lifecycle
@@ -170,7 +195,8 @@ import dataclasses
 import os
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, BinaryIO
 
 from headspace.cli._errors import (
@@ -372,6 +398,23 @@ _STATE_KEY = "state"
 #: part of it — see the module docstring's fourth rule.
 _INPUTS_KEY = "inputs"
 
+#: "This job forwards nothing." An empty :class:`~types.MappingProxyType` built
+#: once at import, never a ``{}`` literal in a signature default: a mutable
+#: default is created once and shared by every caller that omits the argument,
+#: so one caller's incidental mutation of "no env" would become every other
+#: caller's "no env" for the rest of the process. The same reasoning, and the
+#: same constant, as :data:`headspace.providers.fake.EMPTY_ENV` — the closed
+#: default is structural on both sides of the seam or it is a convention.
+_NO_ENV: Mapping[str, str] = MappingProxyType({})
+
+#: The characters a variable *name* may never contain, whatever grammar the
+#: caller-facing flag enforces on top. ``=`` would make the assignment
+#: ambiguous to every engine that renders an environment as ``NAME=VALUE``
+#: lines, and a null byte cannot survive ``execve`` at all. Checked here, at
+#: the type, so a name that reached the orchestrator through some path other
+#: than the CLI is still refused.
+_UNUSABLE_IN_ENV_NAME = ("=", "\x00")
+
 
 # --- small public helpers ---------------------------------------------------
 
@@ -447,6 +490,127 @@ class ArtifactDeclaration:
     name: str
     purpose: str
     content_type: str = DEFAULT_CONTENT_TYPE
+
+
+@dataclass(frozen=True)
+class InputRequest:
+    """One host payload a job wants copied in first: where it lives, where it lands.
+
+    The destination is put through
+    :func:`~headspace.providers.base.require_workspace_path` in ``__post_init__``,
+    which is what makes "validated before any engine contact" a property of the
+    *type* rather than of the order some caller happened to write its statements
+    in. A CLI that parses its flags into these objects before it constructs a
+    provider has satisfied the rule structurally, and a caller that reaches
+    :meth:`Orchestrator.run` directly gets the same boundary for free.
+
+    ``host_path`` is not validated here on purpose. Whether it exists, whether it
+    is a file or a directory, whether it holds a symlink — those are questions
+    :func:`~headspace.core.inputs.expand_input` answers by *looking*, and
+    answering them twice would mean answering them two subtly different ways.
+    """
+
+    host_path: str | os.PathLike[str]
+    destination: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "destination", require_workspace_path(self.destination))
+
+
+@dataclass(frozen=True, repr=False)
+class JobEnvironment:
+    """The environment one job runs with: values for the engine, names for the record.
+
+    The split is the whole point (issue #13). ``values`` is handed to the
+    provider and to nothing else; ``names`` — derived from ``values``' own keys,
+    never stored separately — is what every recording surface is given. Because
+    the recorded form is *computed from* the mapping rather than maintained
+    alongside it, the two cannot drift, and there is no code path along which a
+    value could be written down: a helper that wanted to record one would have to
+    reach past :attr:`names` to do it.
+
+    ``sources`` carries the host paths an ``--env-file`` was read from. A path is
+    lineage, not payload — it says where a name came from without saying what the
+    name is worth — so it is recorded, and the file's contents never are.
+
+    ``__repr__`` is overridden for the same reason the error messages around this
+    feature name jobs by id and never by command line: a debugger, a log line, an
+    ``f"{environment}"`` written in haste, or a ``pytest`` assertion diff are all
+    surfaces, and a dataclass's generated repr would print every value on all of
+    them. Immutability is enforced rather than promised — the mapping is wrapped
+    in :class:`~types.MappingProxyType` — so a value cannot be added to a
+    ``JobEnvironment`` after the names it reports were taken from it.
+    """
+
+    values: Mapping[str, str] = field(default_factory=lambda: _NO_ENV)
+    sources: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name, value in self.values.items():
+            self._require_usable(name, value)
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        object.__setattr__(self, "sources", tuple(self.sources))
+
+    @staticmethod
+    def _require_usable(name: str, value: str) -> None:
+        """Refuse a name or value no engine could carry — naming neither value."""
+        if not name.strip():
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message="an environment variable must have a name",
+                remediation="name every variable that is forwarded into a job",
+            )
+        for character in _UNUSABLE_IN_ENV_NAME:
+            if character in name:
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=f"environment variable name {name!r} is not usable",
+                    remediation=(
+                        "a name may not contain '=' or a null byte; pass --env NAME and let "
+                        "headspace read the value out of your environment by that name"
+                    ),
+                )
+        if "\x00" in value:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"the value of environment variable '{name}' contains a null byte",
+                remediation=(
+                    "a null byte cannot survive execve, so no job could receive this value; "
+                    "the value itself is not quoted here, because an error message is a "
+                    "recording surface like any other"
+                ),
+            )
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """The recorded form: the key set of the mapping the job actually gets.
+
+        In declaration order, because that is the order the caller wrote and the
+        order a reader comparing a journal entry against a command will expect.
+        """
+        return tuple(self.values)
+
+    def provider_kwargs(self) -> dict[str, Mapping[str, str]]:
+        """The ``env=`` keyword for :meth:`~headspace.providers.base.Provider.run`.
+
+        Present only when there is an environment to pass. That is not a
+        micro-optimisation: the seam's own default *is* the empty mapping, so
+        "no env" is expressed at the seam by absence, and a job that forwards
+        nothing produces exactly the call it produced before this feature
+        existed. Backends are structurally typed here (see
+        :mod:`headspace.providers.base` on why ``Provider`` is a ``Protocol``
+        rather than a base class), which means a correct backend written against
+        the seam as it stood is still a correct backend for every job that does
+        not use an environment — and it is not this module's place to break one
+        over a feature it was never asked to serve.
+        """
+        return {"env": self.values} if self.values else {}
+
+    def __bool__(self) -> bool:
+        return bool(self.values) or bool(self.sources)
+
+    def __repr__(self) -> str:
+        return f"JobEnvironment(names={list(self.names)}, sources={list(self.sources)})"
 
 
 @dataclass(frozen=True)
@@ -614,6 +778,8 @@ class Orchestrator:
         command: Sequence[str],
         *,
         declares: Iterable[ArtifactDeclaration] = (),
+        inputs: Sequence[InputRequest] = (),
+        environment: JobEnvironment | None = None,
         job_id: str | None = None,
     ) -> ResultPackage:
         """Execute one command in an existing workspace: ``ready -> running -> ready``.
@@ -621,9 +787,35 @@ class Orchestrator:
         The lock is held for the whole job, which is what stops two invocations
         double-starting one workspace (c24). A concurrent destroy does not queue
         behind it — it reads the persisted ``running`` state and refuses.
+
+        ``inputs`` are copied in *first*, through :meth:`_copy_in` — the same
+        method :meth:`put` drives, called rather than re-implemented, because a
+        second copy of the journal-then-engine-then-state ordering would be a
+        second place for it to drift. The lock is already held here, which is
+        precisely what ``_copy_in`` is factored to allow: it takes none itself.
+
+        Order inside the lock is not incidental:
+
+        1. the transition and every declaration are validated, but neither is
+           written anywhere — a rejected move or a duplicate declaration is a
+           caller's mistake, not a death, and must not leave an open intent;
+        2. the payload is expanded and budget-checked on the host, which is the
+           last point at which a refusal costs nothing;
+        3. the copy-in runs, journalling and settling its own ``put`` intent, so
+           a CLI killed mid-copy leaves a workspace still in ``ready`` with an
+           open ``put`` intent — the shape reconciliation already knows;
+        4. only then are the declarations persisted and the run intent opened.
+
+        ``environment`` is the secret channel (issue #13). Its *values* go to the
+        provider and nowhere else; its names, and the paths any ``--env-file``
+        was read from, are what the journal, the state record, the summary and
+        the provenance carry. See :class:`JobEnvironment` for why that is a
+        structural property rather than a discipline, and for the edge it does
+        not cover: a job that prints its own environment.
         """
         attention = self._take_attention()
         job_id = job_id or new_job_id()
+        environment = environment if environment is not None else JobEnvironment()
 
         with self._store.lock(workspace_id):
             record = self._read(workspace_id)
@@ -639,15 +831,27 @@ class Orchestrator:
                     purpose=declaration.purpose,
                     content_type=declaration.content_type,
                 )
+
+            landed = self._copy_inputs(workspace_id, record, inputs, policy=effective)
+            # Persisted only now: a copy-in that failed part-way already wrote
+            # the ledger for what landed, and folding a declaration into that
+            # write would leave a workspace owing an artifact from a job that
+            # never started — and a destroy refusing over it.
             record["artifacts"] = inventory.to_list()
 
             intent_id = self._intend(
-                workspace_id, INTENT_RUN, {"command": list(command), "job_id": job_id}
+                workspace_id, INTENT_RUN, _run_intent(command, job_id, environment)
             )
             record = self._advance(workspace_id, record, State.RUNNING)
 
             try:
-                outcome = self._provider.run(workspace_id, command, effective, job_id=job_id)
+                outcome = self._provider.run(
+                    workspace_id,
+                    command,
+                    effective,
+                    job_id=job_id,
+                    **environment.provider_kwargs(),
+                )
             except CliError as err:
                 # Infrastructure failure, raised — never returned as a job
                 # status (NFR-07). The workspace is released first so a broken
@@ -656,7 +860,7 @@ class Orchestrator:
                 self._close(workspace_id, INTENT_RUN, intent_id, PHASE_ABANDONED, err)
                 raise
 
-            record = _append_job(record, outcome)
+            record = _append_job(record, outcome, environment)
             if outcome.usage.storage_bytes and record.get("descriptor"):
                 record["descriptor"]["storage_bytes"] = outcome.usage.storage_bytes
             record = self._advance(workspace_id, record, State.READY)
@@ -669,18 +873,25 @@ class Orchestrator:
                 {"job_id": job_id, "status": outcome.status},
             )
 
-        warnings = _measured_warnings(effective) + _job_warnings(record, outcome)
+        warnings = (
+            _measured_warnings(effective)
+            + _job_warnings(record, outcome)
+            + _env_warnings(environment)
+        )
         return ResultPackage(
-            outcome_summary=(
-                f"job {job_id} ran {' '.join(command)} in workspace {workspace_id} "
-                f"and reported {outcome.status}"
+            outcome_summary=_run_summary(
+                workspace_id, job_id, command, outcome, landed, environment
             ),
             status=outcome.status,
-            key_findings=_job_findings(
-                outcome,
-                policy=effective,
-                profile=str(record.get("profile", "")),
-                command=command,
+            key_findings=(
+                _job_findings(
+                    outcome,
+                    policy=effective,
+                    profile=str(record.get("profile", "")),
+                    command=command,
+                )
+                + _copied_findings(landed)
+                + _env_findings(environment)
             ),
             evidence=[
                 Evidence(
@@ -697,13 +908,53 @@ class Orchestrator:
             artifacts=_artifact_section(record),
             warnings=warnings,
             resource_usage=outcome.usage,
-            provenance=self._provenance(record, effective, None, outcome=outcome, command=command),
+            provenance=self._provenance(
+                record,
+                effective,
+                None,
+                outcome=outcome,
+                command=command,
+                inputs=_input_provenance(landed) + _env_provenance(environment),
+            ),
             attention=(
                 attention
                 + _resource_attention(outcome, effective)
                 + _pending_artifact_attention(record)
             ),
         )
+
+    def _copy_inputs(
+        self,
+        workspace_id: str,
+        record: dict[str, Any],
+        inputs: Sequence[InputRequest],
+        *,
+        policy: EffectivePolicy,
+    ) -> list[dict[str, Any]]:
+        """Expand, budget-check and copy in a job's ``--input`` payloads.
+
+        The host-side half of :meth:`put`, hoisted so ``run`` performs it in the
+        same order and with the same refusals, and then hands the result to the
+        same :meth:`_copy_in`. What ``put`` does that this does not is take a
+        lock and read state: ``run``'s caller is already inside both.
+
+        ``overwrite`` is not offered. A job's inputs arrive into a workspace that
+        may already hold a previous job's outputs, and silently replacing one of
+        those would destroy work with no record that anything was lost —
+        replacement is a deliberate act, and it belongs to the verb a caller can
+        deliberately give permission to.
+        """
+        if not inputs:
+            return []
+        manifest = _expand_inputs(inputs)
+        # Budget before journal, and before the engine: an over-budget payload
+        # costs nothing and leaves nothing. Checked against the whole payload
+        # rather than one --input at a time, because the budget is a property of
+        # the workspace and the caller asked for all of them at once.
+        precheck_storage_budget(
+            manifest, storage_bytes_remaining=_storage_remaining(record, policy)
+        )
+        return self._copy_in(workspace_id, record, _bounded_entries(manifest), overwrite=False)
 
     def inspect(self, workspace_id: str) -> ResultPackage:
         """Report headspace's lifecycle view and the engine's, side by side."""
@@ -1821,9 +2072,20 @@ def _stored_descriptor(record: Mapping[str, Any]) -> WorkspaceDescriptor | None:
     return WorkspaceDescriptor.from_dict(stored) if stored else None
 
 
-def _append_job(record: dict[str, Any], outcome: JobOutcome) -> dict[str, Any]:
+def _append_job(
+    record: dict[str, Any], outcome: JobOutcome, environment: JobEnvironment
+) -> dict[str, Any]:
+    """Record one job outcome, plus the *names* the job's environment carried.
+
+    ``state.json`` is one of the four surfaces issue #13 measured, so the names
+    belong here — a reader who wants to know why a job behaved differently from
+    an identical-looking one needs to see that it was handed something. The keys
+    are omitted entirely when a job forwarded nothing, so a record written for a
+    job with no environment is byte-identical to one written before this feature
+    existed: absence is how the closed default reads back.
+    """
     jobs = list(record.get("jobs", []))
-    jobs.append(outcome.to_dict())
+    jobs.append({**outcome.to_dict(), **_env_record(environment)})
     dropped = int(record.get("jobs_dropped", 0))
     if len(jobs) > MAX_RETAINED_JOBS:
         dropped += len(jobs) - MAX_RETAINED_JOBS
@@ -1912,6 +2174,123 @@ def _storage_remaining(record: Mapping[str, Any], policy: EffectivePolicy) -> in
     return max(0, budget - max(measured, _ledger_total(record)))
 
 
+def _expand_inputs(requests: Sequence[InputRequest]) -> InputManifest:
+    """Expand every ``--input`` into one manifest, refusing two that collide.
+
+    Each request is expanded on its own — :func:`~headspace.core.inputs.expand_input`
+    is what decides whether a host path is a file, a directory or something a
+    copy-in refuses — and the results are merged and re-sorted by destination, so
+    a caller who writes the same two flags in the other order gets the same
+    manifest, the same journal entry and the same ledger.
+
+    Two requests that land at one destination are refused *here*, before the
+    journal. The copy-in would refuse them too, at the second file, having
+    already written the first — a half-done copy for a mistake that was fully
+    visible before anything moved. The refusal names the destination, which is
+    a path the caller typed, and neither host file's contents.
+    """
+    entries: list[InputEntry] = []
+    claimed: set[str] = set()
+    for request in requests:
+        manifest = expand_input(request.host_path, request.destination)
+        if not manifest.entries:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"input '{os.fspath(request.host_path)}' holds no regular files",
+                remediation=(
+                    "point --input at a file, or at a directory that contains one; a copy "
+                    "that moves nothing is a mistake, not an empty success"
+                ),
+            )
+        for entry in manifest:
+            if entry.destination in claimed:
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=(
+                        f"two inputs both land at '{entry.destination}', and nothing " "was copied"
+                    ),
+                    remediation=(
+                        "give each --input its own destination; headspace refuses rather "
+                        "than letting one payload silently overwrite the other"
+                    ),
+                )
+            claimed.add(entry.destination)
+            entries.append(entry)
+    entries.sort(key=lambda entry: entry.destination)
+    return InputManifest(tuple(entries))
+
+
+def _run_intent(command: Sequence[str], job_id: str, environment: JobEnvironment) -> dict[str, Any]:
+    """The ``run`` intent's journal payload: argv, job id, and env *names*.
+
+    ``command`` is journalled verbatim, as it always was — see the module
+    docstring on why there is no redaction pass over argv. The environment is
+    journalled by :attr:`JobEnvironment.names` and by the paths any values were
+    read from, and by nothing else.
+    """
+    return {"command": list(command), "job_id": job_id, **_env_record(environment)}
+
+
+def _env_record(environment: JobEnvironment) -> dict[str, Any]:
+    """The persistable form of a job's environment: names and source paths.
+
+    One function, used by both durable surfaces (the journal entry and the state
+    record's job row), so the two cannot come to disagree about what a job was
+    handed. Empty for a job that forwarded nothing, which is what keeps a
+    no-environment record identical to one written before the flag existed.
+    """
+    record: dict[str, Any] = {}
+    if environment.names:
+        record["env"] = list(environment.names)
+    if environment.sources:
+        record["env_files"] = list(environment.sources)
+    return record
+
+
+def _env_findings(environment: JobEnvironment) -> list[str]:
+    """What the caller is told about the environment their job ran with."""
+    if not environment:
+        return []
+    findings = []
+    if environment.names:
+        findings.append(
+            f"the job was handed {len(environment.names)} environment variable(s) by name: "
+            + ", ".join(environment.names)
+            + " — headspace records the names and never the values"
+        )
+    findings.extend(
+        f"names were read from the env-file {path}, whose contents are not recorded"
+        for path in environment.sources
+    )
+    return findings
+
+
+def _env_provenance(environment: JobEnvironment) -> list[str]:
+    """The environment's lineage lines: one per name, one per file it came from."""
+    return [f"env {name} (name only; no value is recorded)" for name in environment.names] + [
+        f"env-file {path} (names only; no value is recorded)" for path in environment.sources
+    ]
+
+
+def _env_warnings(environment: JobEnvironment) -> list[str]:
+    """The edge of the no-value guarantee, stated on every run that relies on it.
+
+    headspace records no value of its own. It cannot make the same promise about
+    the job: a command that prints its environment — ``env``, ``printenv``, a
+    traceback that dumps ``os.environ`` — writes the value into its captured
+    output, and captured output is kept, in the result package and in the job's
+    row in ``state.json``. A guarantee that did not say so would be read as
+    covering a case it does not cover, which is worse than the gap itself.
+    """
+    if not environment.names:
+        return []
+    return [
+        "headspace records the names of forwarded environment variables and never their "
+        "values — but a job that prints its own environment (env, printenv, a traceback) "
+        "writes the value into its captured output, which is kept"
+    ]
+
+
 def _bounded_entries(manifest: InputManifest) -> list[InputEntry]:
     """Re-express every destination in the seam's own path grammar, before the journal.
 
@@ -1976,8 +2355,46 @@ def _copy_in_summary(
     )
 
 
+def _run_summary(
+    workspace_id: str,
+    job_id: str,
+    command: Sequence[str],
+    outcome: JobOutcome,
+    landed: Sequence[Mapping[str, Any]],
+    environment: JobEnvironment,
+) -> str:
+    """One sentence for a job: what ran, what it was given, and how it ended.
+
+    The command is rendered verbatim, as it always has been. The copy-in is named
+    by count and volume — the per-file digests are in the key findings, and a
+    summary that listed a thousand of them would be a transcript. The environment
+    is named by :attr:`JobEnvironment.names`, in brackets, so that the *shape* a
+    caller grepping this line is looking for (``env: [COLLEAGUE_API_KEY]``) is
+    unmistakably a list of names and could not be mistaken for an assignment.
+    """
+    summary = (
+        f"job {job_id} ran {' '.join(command)} in workspace {workspace_id} "
+        f"and reported {outcome.status}"
+    )
+    if landed:
+        summary += (
+            f"; {len(landed)} file(s) totalling {_landed_bytes(landed)} bytes "
+            "were copied in first"
+        )
+    if environment.names:
+        summary += "; env: [" + ", ".join(environment.names) + "]"
+    return summary
+
+
 def _copied_findings(landed: Sequence[Mapping[str, Any]]) -> list[str]:
-    """One line per copied file, bounded, with the remainder named as a remainder."""
+    """One line per copied file, bounded, with the remainder named as a remainder.
+
+    Empty for a verb that copied nothing — ``run`` calls this unconditionally, and
+    a job with no ``--input`` must not be told anything about inputs, least of all
+    the note about what a destroy does with them.
+    """
+    if not landed:
+        return []
     findings = [
         f"{row['destination']} <- {row['source']} ({row['size_bytes']} bytes, "
         f"sha256:{row['sha256']})"
