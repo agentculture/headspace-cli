@@ -2221,7 +2221,7 @@ class DockerProvider:
 
     # --- stopping a job -----------------------------------------------------
 
-    def stop(self, workspace_id: str) -> dict[str, Any]:
+    def stop(self, workspace_id: str) -> StopOutcome:
         """End whatever job is running in a workspace, right now — and nothing else.
 
         Boundary contract, and the one that matters most: this method never

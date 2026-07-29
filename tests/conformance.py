@@ -1118,6 +1118,37 @@ class ProviderConformance:
         with provider.read(descriptor.workspace_id, "chunked.bin") as stream:
             assert b"".join(stream) == content
 
+    def test_write_refuses_a_bare_bytes_object_on_every_backend(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """A bare ``bytes`` is not a ``ByteSource``, and both backends say so.
+
+        It satisfies ``Iterable`` structurally while iterating to ``int``, one
+        per byte — the wrong type, and ruinously slow besides. The outbound
+        path has always refused it (:func:`headspace.core.artifacts._reject_non_bytes`)
+        and the Docker backend refuses it inbound.
+
+        This test exists because the two backends once disagreed here: the fake
+        special-cased a bare ``bytes`` and accepted it, so a call that passed
+        against the fake failed against a real engine. That is the single
+        failure mode a fake exists to prevent, and a suite that lets the
+        stand-in be *more permissive* than the thing it stands in for is
+        manufacturing false confidence. Pinned on both backends so the
+        divergence cannot quietly return.
+        """
+        descriptor = workspaces()
+        content = b"a bare bytes object is not a byte source\n"
+
+        with pytest.raises(CliError):
+            provider.write(
+                descriptor.workspace_id,
+                "bare.bin",
+                content,
+                expected_sha256=hashlib.sha256(content).hexdigest(),
+            )
+
     def test_write_refuses_a_digest_that_does_not_describe_the_source(
         self,
         provider: Provider,

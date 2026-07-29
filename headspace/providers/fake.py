@@ -675,21 +675,38 @@ def _chunked(content: bytes, chunk_size: int) -> Iterator[bytes]:
 def _iter_source(source: ByteSource) -> Iterator[bytes]:
     """Yield ``source`` as a sequence of byte chunks, whichever shape it arrived in.
 
-    Three shapes are accepted. A bare ``bytes`` (or ``bytearray``) is handled
-    first and specially: it satisfies ``Iterable`` structurally, but iterating
-    it yields ``int`` — one per byte — which is both the wrong type and
-    ruinously slow for anything but a trivial payload, so it is yielded whole
-    rather than left to fall into the general iterable branch below. Anything
-    with a callable ``.read()`` is read in bounded pieces, exactly as
+    Two shapes are accepted, and a third is refused on purpose. Anything with a
+    callable ``.read()`` is read in bounded pieces, exactly as
     :func:`headspace.core.artifacts._iter_chunks` reads a file object — the
     ``.read()`` branch is checked before the plain-iterable branch for the
     same reason it is there: iterating a binary file object yields *lines*,
     which is not what a caller pushing bytes into a workspace means. Anything
     else — a generator, a list of chunks — is iterated directly.
+
+    A bare ``bytes`` (or ``bytearray``) is **refused**, and the refusal is the
+    whole point rather than a missing convenience. It satisfies ``Iterable``
+    structurally while iterating to ``int``, so it is not a ``ByteSource`` in
+    anything but shape — which is exactly why
+    :func:`headspace.core.artifacts._reject_non_bytes` refuses it on the
+    outbound path and why the Docker backend refuses it inbound. This fake
+    briefly accepted it, and a conformance test caught the divergence: a call
+    that worked here would have failed against a real engine, which is the one
+    failure mode a fake exists to prevent. Being *more permissive* than the
+    backend it stands in for is worse than being wrong in the same direction,
+    because it turns the test suite into a source of false confidence.
     """
     if isinstance(source, (bytes, bytearray)):
-        yield bytes(source)
-        return
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"a bare {type(source).__name__} is not a byte source: iterating it yields "
+                "int, one per byte"
+            ),
+            remediation=(
+                "wrap the payload in io.BytesIO(...), or pass a list of byte chunks — the "
+                "same shapes the Docker backend and export_artifact accept"
+            ),
+        )
     read = getattr(source, "read", None)
     if callable(read):
         while True:
