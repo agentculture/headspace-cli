@@ -1856,9 +1856,7 @@ class Orchestrator:
         it, rather than being quietly closed by this one.
         """
         detail = dict(latest.get("detail", {}))
-        destinations = [
-            str(row.get("destination", "")) for row in list(detail.get("inputs", [])) if row
-        ]
+        destinations = [str(row.get("destination", "")) for row in detail.get("inputs", []) if row]
         named = ", ".join(destinations[:MAX_RENDERED_INPUTS]) or "an unnamed file"
         if len(destinations) > MAX_RENDERED_INPUTS:
             named += f" and {len(destinations) - MAX_RENDERED_INPUTS} more"

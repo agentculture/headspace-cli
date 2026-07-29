@@ -751,6 +751,12 @@ EXEC_START_MARKER = "unable to start container process: exec:"
 #: carrying a container id.
 NOT_RUNNING_MARKER = "is not running"
 
+#: What a refusal says when the shell could not resolve the path it was asked
+#: about. ``realpath`` failing is not the same as resolving somewhere outside
+#: the volume, but both end the same way — nothing is renamed — and the caller
+#: is owed a phrase that does not pretend to know more than the script did.
+UNRESOLVABLE_PATH = "somewhere unresolvable"
+
 #: The one container status a copy-in accepts. Deliberately narrower than
 #: :data:`LIVE_STATUSES`: ``created`` and ``paused`` both mean the runtime
 #: object exists, and neither can execute the verification this verb depends
@@ -2091,9 +2097,7 @@ class DockerProvider:
                     workspace_id, environment, _first_detail(details) or "a POSIX tool"
                 )
             if status == WRITE_STAGING_UNUSABLE:
-                raise _staging_unusable(
-                    workspace_id, _first_detail(details) or "somewhere unresolvable"
-                )
+                raise _staging_unusable(workspace_id, _first_detail(details) or UNRESOLVABLE_PATH)
             if status != 0:
                 raise self._script_broke(
                     workspace_id,
@@ -2136,7 +2140,7 @@ class DockerProvider:
         if status == WRITE_MISSING_TOOL:
             raise _missing_write_tool(landing.workspace_id, environment, detail or "a POSIX tool")
         if status == WRITE_STAGING_UNUSABLE:
-            raise _staging_unusable(landing.workspace_id, detail or "somewhere unresolvable")
+            raise _staging_unusable(landing.workspace_id, detail or UNRESOLVABLE_PATH)
         if status != 0:
             raise self._script_broke(
                 landing.workspace_id,
@@ -2173,7 +2177,7 @@ class DockerProvider:
             )
         if status == WRITE_ESCAPES_VOLUME:
             raise _escapes_workspace_volume(
-                landing.workspace_id, landing.relative, detail or "somewhere unresolvable"
+                landing.workspace_id, landing.relative, detail or UNRESOLVABLE_PATH
             )
         if status == WRITE_DESTINATION_EXISTS:
             raise _destination_exists(landing.workspace_id, landing.relative)

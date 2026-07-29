@@ -107,7 +107,13 @@ ASSIGNMENT_SEPARATOR = "="
 #: Enforced here rather than left to the engine because a name the engine
 #: silently drops is a job that runs *without* the credential it asked for, and
 #: fails later for a reason that names something else entirely.
-ENV_NAME_PATTERN = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+#:
+#: ``re.ASCII`` is load-bearing, not decoration. Python's ``\w`` is Unicode-aware
+#: by default, so the concise spelling would quietly accept ``PASSWORDé`` — the
+#: opposite of "the POSIX portable name", and a name the engine would then drop.
+#: The flag pins ``\w`` to exactly ``[A-Za-z0-9_]``, which is what this pattern
+#: has always meant.
+ENV_NAME_PATTERN = re.compile(r"\A[A-Za-z_]\w*\Z", re.ASCII)
 
 #: An env-file line whose first non-blank character is this is a comment. Blank
 #: lines and comments are the only two things skipped; everything else must be
