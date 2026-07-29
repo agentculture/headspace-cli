@@ -2,7 +2,7 @@
   "plan_slug": "honest-failure-taxonomy",
   "schema_version": 1,
   "created": "2026-07-28T22:15:30Z",
-  "updated": "2026-07-28T23:09:15Z",
+  "updated": "2026-07-29T00:04:22Z",
   "deviations": [
     {
       "id": "d1",
@@ -15,7 +15,7 @@
         "h8"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     },
     {
@@ -29,7 +29,7 @@
         "h1"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     },
     {
@@ -42,7 +42,7 @@
         "h26"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     },
     {
@@ -55,7 +55,7 @@
         "h18"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     }
   ]

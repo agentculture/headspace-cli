@@ -476,6 +476,20 @@ class _RefusedCommand:
     def produced(self) -> int:
         return len(self.report.encode("utf-8"))
 
+    def bounded(self, budget: int) -> tuple[str, int, bool]:
+        """The report clipped to ``budget``, with what it really produced.
+
+        Mirrors what :meth:`DockerProvider._captured` does for a container's own
+        output: keep a bounded prefix, report the *full* volume as produced, and
+        say plainly whether anything was dropped. Clipping on the encoded bytes
+        and decoding with ``ignore`` keeps a multi-byte character from being cut
+        in half at the boundary.
+        """
+        raw = self.report.encode("utf-8")
+        if len(raw) <= budget:
+            return self.report, self.produced, False
+        return raw[:budget].decode("utf-8", "ignore"), self.produced, True
+
 
 def _refused_command(
     err: APIError, argv: Sequence[str], environment: str, handle: str
@@ -872,10 +886,13 @@ class DockerProvider:
                 else:
                     # Nothing ran, so there is nothing to have captured: the
                     # report *is* the job's whole output, and the usage figures
-                    # below are honestly zero rather than absent.
+                    # below are honestly zero rather than absent. It still obeys
+                    # the caller's declared output budget — a synthesized report
+                    # is output like any other, and `JobOutcome.output` is
+                    # contractually bounded before it is ever persisted.
                     exit_status = refused.exit_status
                     oom_killed = False
-                    output, produced, truncated = refused.report, refused.produced, False
+                    output, produced, truncated = refused.bounded(output_budget)
                 storage_bytes = self._volume_bytes(client, workspace_id)
             finally:
                 # A job container that outlives its job is a stray, and the
@@ -892,6 +909,9 @@ class DockerProvider:
             exit_status=None if timed_out else exit_status,
             output=output,
             truncated=truncated,
+            # Only this branch watched the exec fail, so only it may assert the
+            # refusal — downstream must never re-derive it from the status.
+            command_refused=refused is not None,
             started_at=started_at,
             finished_at=utc_now(),
             usage=ResourceUsage(

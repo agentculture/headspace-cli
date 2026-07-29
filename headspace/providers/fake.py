@@ -173,6 +173,11 @@ class JobPlan:
     max_memory_bytes: int = 0
     storage_bytes: int = 0
     infrastructure_failure: str = ""
+    #: Whether this scripted job models an environment that refused to exec
+    #: ``argv[0]``. Kept a separate field rather than inferred from
+    #: ``exit_status``, exactly as the real provider keeps it separate: a
+    #: command that ran can return 126 or 127 on its own account.
+    command_refused: bool = False
     during: Callable[[], None] | None = None
     writes: Mapping[str, bytes] = field(default_factory=dict)
 
@@ -197,6 +202,7 @@ class JobPlan:
         test picks which by passing the constant it means to assert; defaulting
         to "not found" keeps the common case a bare call.
         """
+        overrides.setdefault("command_refused", True)
         return cls.failing(exit_status=exit_status, output=output, **overrides)
 
     @classmethod
@@ -397,6 +403,8 @@ class FakeProvider:
             exit_status=None if timed_out else plan.exit_status,
             output=output,
             truncated=truncated,
+            # A job stopped by the clock never got far enough to be refused.
+            command_refused=plan.command_refused and not timed_out,
             started_at=started_at,
             finished_at=utc_now(),
             usage=ResourceUsage(

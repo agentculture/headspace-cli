@@ -504,7 +504,9 @@ def test_a_command_the_image_cannot_run_names_the_profile_and_argv0(
     store: Store, exit_status: int, wording: str
 ) -> None:
     command = ("definitely-not-a-binary", "--iterations=4")
-    package = _job_package(JobPlan.failing(exit_status=exit_status), command, store)
+    # `not_executable`, not `failing`: the finding is gated on the backend having
+    # OBSERVED the refusal, because a command that ran can return 126/127 itself.
+    package = _job_package(JobPlan.not_executable(exit_status=exit_status), command, store)
 
     findings = " ".join(json.loads(render_json(package))["key_findings"])
     assert DEFAULT_PROFILE in findings
@@ -518,9 +520,9 @@ def test_a_command_the_image_cannot_run_names_the_profile_and_argv0(
 def test_the_two_not_executable_statuses_do_not_share_a_finding(store: Store) -> None:
     """126 and 127 tell a caller to do different things, so they cannot read alike."""
     command = ("definitely-not-a-binary",)
-    not_found = _job_package(JobPlan.failing(exit_status=127), command, store)
+    not_found = _job_package(JobPlan.not_executable(exit_status=127), command, store)
     not_executable = _job_package(
-        JobPlan.failing(exit_status=126), command, store, workspace_id="ws-126"
+        JobPlan.not_executable(exit_status=126), command, store, workspace_id="ws-126"
     )
     # Differing in the digits alone would not count: the two must say different
     # things about what to do next, not just report different numbers.

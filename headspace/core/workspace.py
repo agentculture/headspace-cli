@@ -1472,12 +1472,18 @@ def _job_findings(
             f"exit status {outcome.exit_status} reports that kill, not an answer the "
             "command chose",
         ]
-    diagnosis = _UNRUNNABLE_COMMAND_DIAGNOSES.get(outcome.exit_status)
+    # Gated on what the backend OBSERVED, never on the number alone. A command
+    # that really ran can return 126 or 127 itself — `/bin/sh -c missing-tool`
+    # runs the shell perfectly and returns 127 about a name the shell looked
+    # for — and naming argv[0] there sends the caller to fix the wrong thing.
+    diagnosis = (
+        _UNRUNNABLE_COMMAND_DIAGNOSES.get(outcome.exit_status) if outcome.command_refused else None
+    )
     if diagnosis is not None:
         argv0 = command[0] if command else ""
         return [
-            f"exit status {outcome.exit_status} conventionally means the command "
-            f"{diagnosis}: the {profile} profile was asked to run '{argv0}'"
+            f"the {profile} profile could not run '{argv0}': the command "
+            f"{diagnosis} (exit status {outcome.exit_status})"
         ]
     return [f"the command completed with exit status {outcome.exit_status}"]
 
