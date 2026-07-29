@@ -57,6 +57,33 @@ and names every artifact it discarded, with the digest field present and empty,
 because an artifact that was never exported has no digest and inventing one
 would be the lie the guard exists to prevent.
 
+**4. A copy-in refuses rather than waits, and what it carries is not an artifact.**
+:meth:`Orchestrator.put` is the one verb that puts host bytes *into* a
+workspace, and it takes the workspace lock **non-blocking**, exactly as
+``destroy`` does. The reason is :meth:`Orchestrator.run`: it holds that lock for
+a job's entire duration, so a blocking ``put`` would not fail, it would *hang* —
+for up to the wall-clock budget — with no output and nothing to act on. An
+immediate refusal that names the job in flight and points at ``stop`` is the
+honest answer to "the workspace is busy", and it is the same answer whether the
+job's CLI still holds the lock or only the persisted ``running`` state survives
+it. The refusal names the job by **id, never by command line**: an argv is
+exactly the surface this copy-in path exists to stop leaking (issues #13/#14),
+and a refusal message is still a surface.
+
+What lands is recorded in an ``inputs`` ledger that is deliberately *not* the
+artifact inventory. The destroy guard protects unexported **products** — work
+that exists nowhere but inside the workspace and dies with it. A host-sourced
+input is re-puttable by definition: its source still sits on the host, so
+guarding it would refuse a teardown over a file the caller already has. The
+ledger therefore renders separately, gates nothing, and leaves
+:class:`~headspace.core.artifacts.ArtifactInventory` untouched.
+
+Every one of those records carries the host path, the workspace destination, the
+size and the sha256 — and never a byte of content. That is structural, not a
+redaction pass: the only thing this module ever holds is an
+:class:`~headspace.core.inputs.InputEntry`, and an ``InputEntry`` has no content
+field to leak.
+
 Three deviations from the plan are implemented here
 ---------------------------------------------------
 **d4 — ``running`` is a state workspaces genuinely occupy.** The lifecycle
@@ -121,6 +148,11 @@ One JSON object per workspace, inside the store's schema envelope::
     descriptor                    the engine's own view, as last observed
     artifacts,                    the inventory, and where each export landed
     artifact_references
+    inputs                        the copy-in ledger: one row per destination
+                                  ever written into the workspace from the host,
+                                  carrying source path, destination, size and
+                                  sha256 — never contents, and never consulted
+                                  by the destroy guard
     jobs, jobs_dropped            budget-bounded outcomes, newest last
 
 ``state`` and ``descriptor["state"]`` are deliberately *not* the same field.
@@ -139,7 +171,7 @@ import os
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, BinaryIO
 
 from headspace.cli._errors import (
     EXIT_CANCELLED,
@@ -162,6 +194,7 @@ from headspace.core.artifacts import (
     ByteSource,
     export_artifact,
 )
+from headspace.core.inputs import InputEntry, InputManifest, expand_input, precheck_storage_budget
 from headspace.core.policy import (
     CapabilitySnapshot,
     EffectivePolicy,
@@ -201,19 +234,29 @@ from headspace.providers.base import (
     guard_removable,
     removal_path,
     requested_limit,
+    require_workspace_path,
     utc_now,
 )
 
 # --- vocabularies -----------------------------------------------------------
 
-#: The four things a verb can intend to do. Only the first, second and fourth
-#: touch an engine; ``export`` is journalled too so an interrupted export is
-#: still visible to a reader of the journal.
+#: The five things a verb can intend to do. Four of them touch an engine;
+#: ``export`` is journalled too so an interrupted export is still visible to a
+#: reader of the journal. ``put`` is the inbound counterpart of ``export`` and
+#: the only intent whose payload names *host* paths, because it is the only one
+#: whose recovery needs to know which host bytes were promised to a workspace.
 INTENT_CREATE = "create"
 INTENT_RUN = "run"
+INTENT_PUT = "put"
 INTENT_EXPORT = "export"
 INTENT_REMOVE = "remove"
-INTENTS: tuple[str, ...] = (INTENT_CREATE, INTENT_RUN, INTENT_EXPORT, INTENT_REMOVE)
+INTENTS: tuple[str, ...] = (
+    INTENT_CREATE,
+    INTENT_RUN,
+    INTENT_PUT,
+    INTENT_EXPORT,
+    INTENT_REMOVE,
+)
 
 #: An intent's phase. ``intended`` with no later entry carrying the same
 #: ``intent_id`` is the crash signature, and the only one — a *handled* failure
@@ -248,6 +291,29 @@ DISPOSITIONS: tuple[str, ...] = (
     DISPOSITION_RESOLVED,
     DISPOSITION_REPORTED,
 )
+
+#: The optional provider hook reconciliation calls to clear a workspace's
+#: copy-in staging area, looked up by name rather than declared on the
+#: :class:`~headspace.providers.base.Provider` protocol.
+#:
+#: A backend that commits a copy-in by staging inside the workspace and then
+#: renaming (the Docker one does, under a reserved prefix) can be killed between
+#: those two steps, and what it leaves behind is a file only that backend knows
+#: how to find. So the reap has to be the backend's own operation, and this
+#: module can only ask for it. It is *optional* because a backend whose write
+#: commits in one step has no staging area to clear and should not be forced to
+#: implement an empty method — and because the honest report for a backend that
+#: cannot reap is "residue was left in place", never "there was none". The hook
+#: takes a workspace id and returns whatever it removed; reconciliation counts
+#: it and reports the number.
+STAGING_REAPER = "reap_staging"
+
+#: How many copied-in files a single result package lists individually before it
+#: summarises the rest. A directory copy-in can hold thousands of files, and the
+#: package is bounded (see :mod:`headspace.core.result`) — so the cut is made
+#: here, where the remainder can be *named as a remainder*, rather than by a
+#: renderer that would silently drop the tail.
+MAX_RENDERED_INPUTS = 10
 
 #: How many job outcomes a workspace keeps. Each is already bounded by the
 #: policy's output budget, but a long-lived session is otherwise unbounded in
@@ -301,6 +367,10 @@ _UNRUNNABLE_COMMAND_DIAGNOSES: dict[int, str] = {
 }
 
 _STATE_KEY = "state"
+
+#: The state record's copy-in ledger. A sibling of ``artifacts`` and never a
+#: part of it — see the module docstring's fourth rule.
+_INPUTS_KEY = "inputs"
 
 
 # --- small public helpers ---------------------------------------------------
@@ -406,7 +476,7 @@ class Reconciliation:
 
 
 class Orchestrator:
-    """The five lifecycle flows, over any :class:`~headspace.providers.base.Provider`.
+    """The lifecycle flows, over any :class:`~headspace.providers.base.Provider`.
 
     One instance per CLI invocation. It reconciles once, on the first verb it
     serves, and hands the dispositions to that verb's result package — so the
@@ -486,6 +556,7 @@ class Orchestrator:
                 "descriptor": None,
                 "artifacts": [],
                 "artifact_references": {},
+                _INPUTS_KEY: [],
                 "jobs": [],
                 "jobs_dropped": 0,
             }
@@ -652,6 +723,7 @@ class Orchestrator:
         jobs = list(record.get("jobs", []))
         findings = _descriptor_findings(_state_of(record), descriptor)
         findings.append(f"{len(jobs)} job(s) recorded in this session")
+        findings.extend(_ledger_findings(record))
         evidence: list[Evidence] = []
         if jobs:
             last = jobs[-1]
@@ -801,6 +873,275 @@ class Orchestrator:
             provenance=self._provenance(record, self._effective_policy(record), None),
             attention=attention + _pending_artifact_attention(record),
         )
+
+    def put(
+        self,
+        workspace_id: str,
+        host_path: str | os.PathLike[str],
+        destination: str,
+        *,
+        overwrite: bool = False,
+    ) -> ResultPackage:
+        """Copy host bytes *into* a workspace, and record the paths — never the bytes.
+
+        ``export``'s mirror image, and modelled on it deliberately: take the
+        lock, validate, journal an intent that names paths, call the engine, and
+        settle or abandon that intent on every way out. Three things about this
+        direction are different, and each is a decision rather than an accident.
+
+        **The lock is taken non-blocking, and it is taken first.**
+        :meth:`run` holds a workspace's lock for the entire duration of a job, so
+        a blocking acquisition here would not report a conflict — it would sit
+        silently for up to the wall-clock budget and then behave as if nothing
+        had happened. What the caller needs instead is the fact: a job is in
+        flight, here is its id, end it with ``headspace stop`` or wait.
+
+        It is taken *first* for a separate reason. Reading state and then locking
+        is the shape of the open TOCTOU in :meth:`destroy` (issue #11), where the
+        window between the guard's read and the engine call belongs to whoever
+        else is running. Every guard below is instead evaluated against state
+        read *inside* the critical section, so what the guard saw is what the
+        engine is asked about — and a destroy racing a copy-in either waits for
+        this lock or refuses, with no interleaving that leaves an unjournalled
+        write or a workspace destroyed mid-copy.
+
+        **The intent names host paths and digests, and nothing else.** This whole
+        path exists because argv-smuggled payloads leak their contents into
+        ``outcome_summary``, ``provenance.inputs``, ``journal.jsonl`` and
+        ``state.json`` (issues #13/#14). Recording a digest instead of content is
+        what makes those surfaces clean structurally: everything this method
+        holds is an :class:`~headspace.core.inputs.InputEntry`, and an
+        ``InputEntry`` has no content field. The digest is measured on the host
+        by :func:`~headspace.core.inputs.expand_input`, handed to the provider as
+        ``expected_sha256``, and re-verified engine-side against what actually
+        landed — so a file swapped underneath us between the hash and the copy is
+        caught by the engine rather than by trust.
+
+        **A partial copy is reported as a partial copy.** A directory expands to
+        many files and the engine takes them one at a time, so a failure at file
+        three of five is a real state: three files are in the workspace. The
+        ledger is written with exactly those three before the intent is abandoned
+        and the error re-raised — a ledger that claimed nothing landed would be a
+        lie about a workspace the caller is about to reuse.
+
+        ``overwrite`` is passed through, not decided here: refusing to replace a
+        destination is the seam's boundary contract (a job's output must not be
+        silently clobbered by a copy-in), and the backend is where the
+        destination's existence can actually be checked.
+        """
+        attention = self._take_attention()
+
+        # Lock first, and never wait for it. Everything below reads state, and
+        # state read outside the lock is state that may have changed by the time
+        # the engine is asked about it.
+        stack = contextlib.ExitStack()
+        try:
+            stack.enter_context(self._store.lock(workspace_id, blocking=False))
+        except CliError as err:
+            raise self._busy_refusal(workspace_id, err) from err
+
+        with stack:
+            record = self._read(workspace_id)
+            state = _state_of(record)
+            if state is State.RUNNING:
+                # The lock was free, so the job's invocation is gone — but the
+                # engine still reports the job in flight (reconciliation would
+                # have released the workspace otherwise). Same situation as a
+                # held lock, so the caller gets the same sentence.
+                raise self._inflight_refusal(workspace_id)
+            if state is not State.READY:
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=(
+                        f"refusing to copy into workspace {workspace_id}: it is "
+                        f"'{state.value}', and nothing was copied"
+                    ),
+                    remediation=(
+                        "a copy-in feeds a job that has not run yet, and only a 'ready' "
+                        "workspace can host one — create a fresh workspace and copy into that"
+                    ),
+                )
+
+            effective = self._effective_policy(record)
+            manifest = expand_input(host_path, destination)
+            if not manifest.entries:
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=f"host input '{os.fspath(host_path)}' holds no regular files",
+                    remediation=(
+                        "point the copy-in at a file, or at a directory that contains one; "
+                        "a copy that moves nothing is a mistake, not an empty success"
+                    ),
+                )
+            # Budget before journal, and before the engine: an over-budget
+            # payload costs nothing and leaves nothing. See _storage_remaining
+            # for why the number it is checked against is the one it is.
+            precheck_storage_budget(
+                manifest, storage_bytes_remaining=_storage_remaining(record, effective)
+            )
+            entries = _bounded_entries(manifest)
+            landed = self._copy_in(workspace_id, record, entries, overwrite=overwrite)
+
+        return ResultPackage(
+            outcome_summary=_copy_in_summary(workspace_id, host_path, landed),
+            status=STATUS_SUCCESS,
+            key_findings=_copied_findings(landed),
+            artifacts=_artifact_section(record),
+            warnings=_measured_warnings(effective),
+            resource_usage=ResourceUsage(storage_bytes=_landed_bytes(landed)),
+            provenance=self._provenance(record, effective, None, inputs=_input_provenance(landed)),
+            attention=attention + _pending_artifact_attention(record),
+        )
+
+    def _copy_in(
+        self,
+        workspace_id: str,
+        record: dict[str, Any],
+        entries: Sequence[InputEntry],
+        *,
+        overwrite: bool,
+    ) -> list[dict[str, Any]]:
+        """Journal, stream, record — the copy-in proper, under a lock the caller holds.
+
+        Factored out of :meth:`put` because it is the *single implementation
+        site* for getting host bytes into a workspace: ``run``'s input flag
+        drives this same method rather than a second, subtly different copy of
+        the ordering rules. Callers must already hold the workspace lock; this
+        method takes none, which is what lets it be called from inside a verb
+        that is already holding one.
+
+        Returns the ledger rows for what actually landed. On failure it writes
+        those same rows first, *then* abandons the intent, then re-raises: state
+        before journal on the way out, for the same reason the journal comes
+        before the engine on the way in — the settling entry must never be the
+        thing that survives a crash the state write did not.
+        """
+        intent_id = self._intend(
+            workspace_id,
+            INTENT_PUT,
+            {
+                "inputs": [entry.to_dict() for entry in entries],
+                "total_bytes": sum(entry.size_bytes for entry in entries),
+                "overwrite": overwrite,
+            },
+        )
+        landed: list[dict[str, Any]] = []
+        try:
+            for entry in entries:
+                with _open_input(entry) as source:
+                    self._provider.write(
+                        workspace_id,
+                        entry.destination,
+                        source,
+                        expected_sha256=entry.sha256,
+                        overwrite=overwrite,
+                    )
+                landed.append(_ledger_row(entry))
+        except CliError as err:
+            self._record_inputs(workspace_id, record, landed)
+            self._close(
+                workspace_id,
+                INTENT_PUT,
+                intent_id,
+                PHASE_ABANDONED,
+                err,
+                {"landed": len(landed), "of": len(entries)},
+            )
+            raise
+
+        self._record_inputs(workspace_id, record, landed)
+        self._close(
+            workspace_id,
+            INTENT_PUT,
+            intent_id,
+            PHASE_SETTLED,
+            None,
+            {"landed": len(landed), "total_bytes": _landed_bytes(landed)},
+        )
+        return landed
+
+    def _record_inputs(
+        self, workspace_id: str, record: dict[str, Any], landed: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Merge landed rows into the ledger and persist it, keyed by destination.
+
+        One destination is one row however often it is written: the ledger
+        answers "what does this workspace hold, and from where", not "how many
+        times was it copied". Appending instead would double-count a re-put
+        against the storage budget, which is the one number the ledger is read
+        back for.
+        """
+        if not landed:
+            return
+        record[_INPUTS_KEY] = _merged_ledger(record, landed)
+        self._store.write_state(workspace_id, record)
+
+    def _busy_refusal(self, workspace_id: str, err: CliError) -> CliError:
+        """Turn "the lock is held" into a sentence naming what holds it.
+
+        The store's own refusal is accurate but generic. Whether the holder is a
+        job matters enormously to the caller — a job has a ``stop`` verb and a
+        finish time, another verb has neither — so the journal is read (lock-free,
+        which is safe: the store's writes are atomic and its readers take no
+        lock) to see whether a run intent is open. The exit codes differ for the
+        same reason: an in-flight job is the caller's decision to make (exit 1,
+        as a destroy during a run already reports), while another verb holding
+        the lock is transient contention and keeps the store's own exit 2.
+        """
+        job_id = self._inflight_job(workspace_id)
+        if job_id:
+            return self._inflight_refusal(workspace_id, job_id)
+        return CliError(
+            code=err.code,
+            message=f"{err.message}; nothing was copied",
+            remediation=(
+                "another headspace invocation is working on this workspace — wait for it to "
+                "finish and retry; a copy-in never interrupts work in progress"
+            ),
+        )
+
+    def _inflight_refusal(self, workspace_id: str, job_id: str = "") -> CliError:
+        """The refusal for a job in flight, naming it by id and never by command.
+
+        The command line is exactly the surface this feature exists to keep
+        payloads out of (issues #13/#14), and an error message is a surface like
+        any other — so the job is identified by the id headspace minted, which
+        carries no caller input at all.
+        """
+        job_id = job_id or self._inflight_job(workspace_id)
+        named = f"job {job_id}" if job_id else "a job"
+        return CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"refusing to copy into workspace {workspace_id}: {named} is in flight, "
+                "and nothing was copied"
+            ),
+            remediation=(
+                f"wait for {named} to finish and retry, or end it with `headspace stop "
+                f"{workspace_id}` first — a copy-in feeds a job that has not started, so it "
+                "never interrupts one that has"
+            ),
+        )
+
+    def _inflight_job(self, workspace_id: str) -> str:
+        """The id of the job the journal says is still running, or ``""``.
+
+        Read from the journal rather than from state because that is where the
+        fact lives: :meth:`run` journals its job id before the engine is called
+        and only records the outcome once the job is over, so an *open* run
+        intent is precisely the signature of a job that has not finished. Any
+        failure to read is answered with "no id" rather than an exception — this
+        is called while producing an error message, and an error message that
+        raises is worse than one that is vague.
+        """
+        try:
+            entries = self._store.read_journal(workspace_id)
+        except CliError:
+            return ""
+        runs = [entry for entry in _open_intents(entries) if entry.get("intent") == INTENT_RUN]
+        if not runs:
+            return ""
+        return str(dict(runs[-1].get("detail", {})).get("job_id", ""))
 
     def destroy(self, workspace_id: str, *, force: bool = False) -> ResultPackage:
         """Tear a workspace down, or refuse — and when it refuses, remove nothing.
@@ -976,6 +1317,9 @@ class Orchestrator:
         if intent == INTENT_EXPORT:
             return self._reconcile_export(workspace_id, latest, open_intents)
 
+        if intent == INTENT_PUT:
+            return self._reconcile_put(workspace_id, latest, open_intents)
+
         try:
             descriptor = self._provider.inspect(workspace_id)
         except ProviderError as err:
@@ -1034,6 +1378,109 @@ class Orchestrator:
             "interrupted; the destination holds either a complete artifact or nothing, and the "
             "inventory still lists it as unexported — verify it and re-export",
         )
+
+    def _reconcile_put(
+        self,
+        workspace_id: str,
+        latest: Mapping[str, Any],
+        open_intents: Sequence[Mapping[str, Any]],
+    ) -> Reconciliation:
+        """An interrupted copy-in made no lifecycle move; settle it and clear its residue.
+
+        It needs its own branch for the same reason an export does, and then one
+        more. Like an export, a copy-in never changes the workspace's lifecycle
+        state, so the generic path below would read an open put intent as an
+        interrupted *lifecycle* transition and rebuild the record from engine
+        truth — adopting a workspace that was never in doubt, or worse, reaping a
+        perfectly good one because the engine happens not to hold something the
+        put was never about.
+
+        The extra part is the residue. A backend that commits a copy-in by
+        staging inside the workspace and renaming can be killed between those two
+        steps, and the staged bytes then sit in the workspace spending its
+        storage budget with nothing pointing at them. Only the backend can find
+        them, so this asks (see :data:`STAGING_REAPER`) and reports what came
+        back — including "this backend has no reaper", which is a different fact
+        from "there was nothing to reap" and is reported as itself.
+
+        The reap happens under the workspace lock, taken non-blocking, and that
+        is not politeness: staging is reaped *by prefix*, so doing it while
+        another invocation is mid-copy would delete the bytes that invocation is
+        about to rename into place. A busy workspace is deferred with its intent
+        left open, exactly as the generic path defers.
+
+        Only put intents are settled here. A workspace that also carries an open
+        intent of another kind still has a real orphan, and that orphan is left
+        for the next verb's reconciliation to settle through the path built for
+        it, rather than being quietly closed by this one.
+        """
+        detail = dict(latest.get("detail", {}))
+        destinations = [
+            str(row.get("destination", "")) for row in list(detail.get("inputs", [])) if row
+        ]
+        named = ", ".join(destinations[:MAX_RENDERED_INPUTS]) or "an unnamed file"
+        if len(destinations) > MAX_RENDERED_INPUTS:
+            named += f" and {len(destinations) - MAX_RENDERED_INPUTS} more"
+
+        stack = contextlib.ExitStack()
+        try:
+            stack.enter_context(self._store.lock(workspace_id, blocking=False))
+        except CliError:
+            return Reconciliation(
+                workspace_id,
+                INTENT_PUT,
+                DISPOSITION_REPORTED,
+                f"an interrupted copy-in of {named} is unsettled, but the workspace is busy in "
+                "another headspace invocation, so nothing was reaped under it and "
+                "reconciliation was deferred rather than made to wait",
+            )
+        with stack:
+            reaped, residue = self._reap_staging(workspace_id)
+            with contextlib.suppress(CliError):
+                for entry in open_intents:
+                    if str(entry.get("intent", "")) != INTENT_PUT:
+                        continue
+                    self._close(
+                        workspace_id,
+                        INTENT_PUT,
+                        str(entry.get("intent_id", "")),
+                        PHASE_RECONCILED,
+                        None,
+                        {"reaped": reaped},
+                    )
+        return Reconciliation(
+            workspace_id,
+            INTENT_PUT,
+            DISPOSITION_RESOLVED if reaped else DISPOSITION_REPORTED,
+            f"a copy-in of {named} was interrupted; each destination holds either the complete "
+            f"file or nothing, and the inputs ledger lists only what actually landed — "
+            f"{residue}; verify the workspace and re-run the copy-in",
+        )
+
+    def _reap_staging(self, workspace_id: str) -> tuple[int, str]:
+        """Ask the backend to clear its staging area, and say plainly what happened.
+
+        Three outcomes, three sentences, and the distinction between them is the
+        point: residue reaped, no residue to reap, and *no way to tell* — a
+        backend without the hook is reported as leaving its residue in place,
+        never as being clean, because this module has no way to know which it is.
+        A reaper that fails is reported too, and never raised: reconciliation
+        runs inside somebody else's verb, and failing that verb over a stale
+        staging file trades a small mess for a large one.
+        """
+        reaper = getattr(self._provider, STAGING_REAPER, None)
+        if not callable(reaper):
+            return 0, (
+                f"backend '{self._provider.name}' exposes no {STAGING_REAPER} hook, so any "
+                "staging residue it holds was left in place rather than assumed absent"
+            )
+        try:
+            reaped = list(reaper(workspace_id) or ())
+        except CliError as err:
+            return 0, f"its staging residue could not be reaped: {err.message}"
+        if not reaped:
+            return 0, "it left no staging residue behind"
+        return len(reaped), f"{len(reaped)} staged file(s) it left behind were reaped"
 
     def _settle_orphan(
         self,
@@ -1258,7 +1705,15 @@ class Orchestrator:
         *,
         outcome: JobOutcome | None = None,
         command: Sequence[str] = (),
+        inputs: Sequence[str] = (),
     ) -> Provenance:
+        """Identity and lineage for one result package.
+
+        ``inputs`` is the copy-in's contribution to ``provenance.inputs``:
+        already-rendered ``path (sha256:...)`` descriptors, appended after the
+        command rather than replacing it, so a verb that both copies files in and
+        runs a command reports both without either hiding the other.
+        """
         stored = descriptor or _stored_descriptor(record)
         return Provenance(
             workspace_id=str(record.get("workspace_id", "")),
@@ -1268,7 +1723,7 @@ class Orchestrator:
             started_at=outcome.started_at if outcome is not None else str(record.get("created_at")),
             finished_at=outcome.finished_at if outcome is not None else utc_now(),
             policy_summary=_policy_summary(effective) if effective is not None else "",
-            inputs=list(command),
+            inputs=[*command, *inputs],
             trace_id=str(record.get("workspace_id", "")),
         )
 
@@ -1345,6 +1800,11 @@ def _record_from_intent(
         "descriptor": descriptor.to_dict(),
         "artifacts": [],
         "artifact_references": {},
+        # Empty for the same reason ``artifacts`` is: a record rebuilt from the
+        # journalled create intent knows what the workspace *was asked to be*,
+        # not what later verbs put in it. Claiming a ledger we cannot
+        # reconstruct would be worse than admitting we lost one.
+        _INPUTS_KEY: [],
         "jobs": [],
         "jobs_dropped": 0,
     }
@@ -1380,6 +1840,175 @@ def _artifact_section(record: Mapping[str, Any]) -> list[Artifact]:
         result_artifact(entry, reference=str(references.get(entry.name, "")))
         for entry in _inventory(record)
         if entry.retention == RETENTION_EXPORTED
+    ]
+
+
+def _ledger(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The copy-in ledger, defaulted rather than required.
+
+    A record written before this key existed is a perfectly good record of a
+    workspace that has had nothing copied into it, and reading it as one is what
+    keeps an older store usable by a newer binary (plan risk r2). The reverse
+    direction holds too, and for free: every verb reads the whole state record
+    and writes the whole record back, so an older binary carries a ledger it does
+    not understand rather than dropping it.
+    """
+    return [dict(row) for row in record.get(_INPUTS_KEY, [])]
+
+
+def _ledger_total(record: Mapping[str, Any]) -> int:
+    """Bytes this workspace has been handed from the host, by the ledger's count."""
+    return sum(int(row.get("size_bytes", 0)) for row in _ledger(record))
+
+
+def _ledger_row(entry: InputEntry) -> dict[str, Any]:
+    """One ledger row: where it came from, where it went, how big, and its digest.
+
+    ``InputEntry.to_dict`` is the whole payload — there is no content field to
+    accidentally include — plus the time headspace recorded it, which is what
+    lets a reader tell a ledger row from before a job's last measurement from one
+    written after it.
+    """
+    return {**entry.to_dict(), "recorded_at": utc_now()}
+
+
+def _merged_ledger(
+    record: Mapping[str, Any], landed: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """The ledger with ``landed`` merged in, one row per destination, sorted.
+
+    Sorted by destination for the same reason
+    :func:`~headspace.core.inputs.expand_input` sorts its manifest: two runs over
+    the same payload should produce identical records, so a diff between two
+    state files is a diff of the workspace rather than of iteration order.
+    """
+    rows = {str(row.get("destination", "")): dict(row) for row in _ledger(record)}
+    for row in landed:
+        rows[str(row.get("destination", ""))] = dict(row)
+    return [rows[destination] for destination in sorted(rows)]
+
+
+def _storage_remaining(record: Mapping[str, Any], policy: EffectivePolicy) -> int:
+    """Storage budget left for a copy-in, from the two numbers that are honest.
+
+    The engine's measurement is the truth about the volume, but it is only
+    refreshed when a job runs — so a workspace that has never run one measures
+    zero however much has been copied into it. The ledger is headspace's own
+    record of what it pushed in, but says nothing about what jobs wrote. Neither
+    alone is the consumption; the larger of the two is the best lower bound
+    available without asking the engine, and asking the engine here would mean an
+    engine call before the journal, which is the one ordering this module does
+    not allow itself.
+
+    That makes this a fail-fast guard, not the enforcement boundary — storage is
+    the canonical *measured* limit (see :mod:`headspace.core.policy`), and a
+    result package says so in its warnings. What it does buy is the case that
+    actually happens: two large copy-ins into a fresh workspace, where the second
+    is refused on the host instead of half-filling a volume no one is capping.
+    """
+    budget = int(requested_limit(policy, "storage"))
+    descriptor = _stored_descriptor(record)
+    measured = descriptor.storage_bytes if descriptor is not None else 0
+    return max(0, budget - max(measured, _ledger_total(record)))
+
+
+def _bounded_entries(manifest: InputManifest) -> list[InputEntry]:
+    """Re-express every destination in the seam's own path grammar, before the journal.
+
+    :func:`~headspace.core.inputs.expand_input` already refuses an absolute or
+    escaping destination, but :func:`~headspace.providers.base.require_workspace_path`
+    is the boundary every backend is held to, and normalising here means the
+    path written into the journal and the ledger is the same string the engine is
+    asked for — not one that a backend silently canonicalised on the way in.
+    """
+    return [
+        dataclasses.replace(entry, destination=require_workspace_path(entry.destination))
+        for entry in manifest
+    ]
+
+
+def _open_input(entry: InputEntry) -> BinaryIO:
+    """Open one input's bytes, turning a host I/O failure into a named error.
+
+    The file was read once already, to measure it. If it cannot be read now, the
+    host changed underneath the copy — an environment fact, exit 2 — and it has
+    to arrive as a :class:`CliError` so the copy-in's caller closes its intent on
+    the way out rather than unwinding as an unhandled ``OSError``.
+    """
+    try:
+        return entry.source.open("rb")
+    except OSError as err:
+        raise CliError(
+            code=EXIT_ENV_ERROR,
+            message=f"cannot read host input '{entry.source}': {err.strerror or err}",
+            remediation=(
+                "the file was readable when it was measured and is not now — check it still "
+                "exists and is readable, then re-run the copy-in"
+            ),
+        ) from err
+
+
+def _landed_bytes(landed: Sequence[Mapping[str, Any]]) -> int:
+    return sum(int(row.get("size_bytes", 0)) for row in landed)
+
+
+def _copy_in_summary(
+    workspace_id: str, host_path: str | os.PathLike[str], landed: Sequence[Mapping[str, Any]]
+) -> str:
+    """What a copy-in reports it did, in paths and digests.
+
+    A single file names its digest here, because a one-file copy-in is the common
+    case and the digest is the fact a caller checks. A multi-file copy-in names
+    the count and total instead and leaves the per-file digests to the key
+    findings — a summary that listed a thousand digests would be a transcript,
+    which is the thing this whole package exists not to be.
+    """
+    if len(landed) == 1:
+        row = landed[0]
+        return (
+            f"copied {row['source']} into workspace {workspace_id} as '{row['destination']}' "
+            f"({row['size_bytes']} bytes, sha256:{row['sha256']})"
+        )
+    return (
+        f"copied {len(landed)} file(s) totalling {_landed_bytes(landed)} bytes from "
+        f"{os.fspath(host_path)} into workspace {workspace_id}; every destination and digest "
+        "is recorded in the workspace's inputs ledger"
+    )
+
+
+def _copied_findings(landed: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One line per copied file, bounded, with the remainder named as a remainder."""
+    findings = [
+        f"{row['destination']} <- {row['source']} ({row['size_bytes']} bytes, "
+        f"sha256:{row['sha256']})"
+        for row in landed[:MAX_RENDERED_INPUTS]
+    ]
+    if len(landed) > MAX_RENDERED_INPUTS:
+        findings.append(
+            f"and {len(landed) - MAX_RENDERED_INPUTS} more file(s), each recorded in the "
+            "inputs ledger with its own path and digest"
+        )
+    findings.append("copied-in files are inputs, not artifacts: they do not gate a destroy")
+    return findings
+
+
+def _input_provenance(landed: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The copy-in's lineage line per file: destination, digest, size, host source."""
+    return [
+        f"{row['destination']} (sha256:{row['sha256']}, {row['size_bytes']} bytes, "
+        f"from {row['source']})"
+        for row in landed
+    ]
+
+
+def _ledger_findings(record: Mapping[str, Any]) -> list[str]:
+    """The one-line ledger summary a read-only verb reports, distinct from artifacts."""
+    ledger = _ledger(record)
+    if not ledger:
+        return []
+    return [
+        f"{len(ledger)} copied-in input file(s) recorded, {_ledger_total(record)} bytes — "
+        "inputs are not artifacts and do not gate a destroy"
     ]
 
 
