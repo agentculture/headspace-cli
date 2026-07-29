@@ -49,7 +49,10 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import hashlib
+
 from headspace.cli._errors import EXIT_USER_ERROR, CliError
+from headspace.core.artifacts import ByteSource
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import (
     STATUS_FAILURE,
@@ -180,6 +183,11 @@ class JobPlan:
     command_refused: bool = False
     during: Callable[[], None] | None = None
     writes: Mapping[str, bytes] = field(default_factory=dict)
+    #: When True, the job is considered stoppable: ``stop()`` can end it.
+    #: The flag exists so a test can script a job that is in flight and
+    #: therefore stoppable, without having to rely on a real engine's
+    #: asynchronous lifecycle.
+    stoppable: bool = False
 
     @classmethod
     def succeeding(cls, output: str = "", **overrides: Any) -> JobPlan:
@@ -263,6 +271,13 @@ class _Workspace:
     storage_bytes: int = 0
     active_jobs: int = 0
     files: dict[str, bytes] = field(default_factory=dict)
+    #: The env mapping the last job ran with. Recorded so a test can assert
+    #: what the job would have seen, without the fake leaking env into any
+    #: other recorded field.
+    last_job_env: Mapping[str, str] = field(default_factory=dict)
+    #: Whether a stoppable job is currently in flight for this workspace.
+    #: Set by ``run()`` when the plan is stoppable, cleared by ``stop()``.
+    _job_in_flight: bool = False
 
 
 class FakeProvider:
@@ -372,6 +387,7 @@ class FakeProvider:
         policy: EffectivePolicy,
         *,
         job_id: str,
+        env: Mapping[str, str] = (),
     ) -> JobOutcome:
         record = self._require(require_workspace_id(workspace_id))
         argv = require_command(command)
@@ -380,11 +396,17 @@ class FakeProvider:
         if plan.infrastructure_failure:
             raise ProviderError(plan.infrastructure_failure)
 
+        # Record the env the job observed. This is the only place env touches
+        # the workspace record: it must not leak into any other field.
+        record.last_job_env = env
+
         wall_budget = float(requested_limit(policy, "wall_clock"))
         output_budget = int(requested_limit(policy, "output_bytes"))
         started_at = utc_now()
 
         record.active_jobs += 1
+        if plan.stoppable:
+            record._job_in_flight = True
         try:
             if plan.during is not None:
                 plan.during()
@@ -460,6 +482,93 @@ class FakeProvider:
 
         del self._workspaces[workspace_id]
         return RemovalDisposition(workspace_id=workspace_id, removed=REMOVABLE_RESOURCES)
+
+    def write(
+        self,
+        workspace_id: str,
+        path: str,
+        source: ByteSource,
+        *,
+        expected_sha256: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Stream inbound bytes into the workspace's storage.
+
+        The copy-in verb: a caller pushes bytes into a workspace so they can
+        be read back through :meth:`read`. The digest is verified *while*
+        consuming the source, so a mismatch is caught before any bytes are
+        stored — corruption in transit, or a wrong digest, must not pollute
+        the workspace.
+
+        The destination path is normalised by :func:`require_workspace_path`
+        at the seam, so the fake and a live engine refuse the identical set.
+        An already-present destination is refused unless ``overwrite`` is
+        explicitly True: a caller that meant to write a different file should
+        not silently clobber what a job produced.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        relative = require_workspace_path(path)
+        record = self._require(workspace_id)
+
+        # Consume the source while computing the digest, so we catch a
+        # mismatch before storing anything. Handle both the ``.read()`` and
+        # iterable branches of :data:`ByteSource`. A bare ``bytes`` object
+        # is iterable but yields ints, so it needs its own branch.
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        if isinstance(source, bytes):
+            digest.update(source)
+            chunks.append(source)
+        else:
+            read = getattr(source, "read", None)
+            if callable(read):
+                while True:
+                    chunk = read(8192)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    chunks.append(chunk)
+            else:
+                for chunk in source:
+                    digest.update(chunk)
+                    chunks.append(chunk)
+        actual = "sha256:" + digest.hexdigest()
+        if actual != expected_sha256:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"digest mismatch: expected {expected_sha256}, got {actual}",
+                remediation="check the source bytes and the digest you supplied",
+            )
+
+        # Refuse an already-present destination unless overwrite is True.
+        if not overwrite and relative in record.files:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"destination {relative!r} already exists",
+                remediation="pass overwrite=True to replace the existing file",
+            )
+
+        record.files[relative] = b"".join(chunks)
+
+    def stop(self, workspace_id: str) -> None:
+        """End an in-flight job on ``workspace_id``.
+
+        A stop is an action, not a no-op: it requires a job to be running.
+        If nothing is running, the caller should know — a stop that silently
+        succeeds would hide the fact that the caller stopped the wrong thing.
+
+        The fake tracks in-flight jobs through :attr:`_Workspace._job_in_flight`,
+        which is set by :meth:`run` when the plan is stoppable.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        record = self._require(workspace_id)
+        if not record._job_in_flight:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"no running job on workspace {workspace_id}",
+                remediation="stop is only valid while a job is in flight",
+            )
+        record._job_in_flight = False
 
     # --- internals --------------------------------------------------------
 
