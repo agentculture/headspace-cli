@@ -444,6 +444,20 @@ def test_the_reason_is_read_past_the_command_the_caller_typed() -> None:
     assert not_executable_exit_status(explanation) == EXIT_COMMAND_NOT_EXECUTABLE
 
 
+def test_the_reason_is_read_past_a_command_name_that_contains_a_quote() -> None:
+    """The split is up to the *first* separator, which a quote in argv0 must not break.
+
+    The sibling test above passes even if the command is narrowed to "anything
+    but a quote", because its path has none — so this is the one that holds the
+    line. Narrowing it looks equivalent and is not: the detail then fails to
+    split at all, falls back to scanning the whole string, and reads the
+    not-found phrase out of the caller's own path, reporting a command the
+    engine said was right there as missing.
+    """
+    explanation = _INIT_PREFIX + '"/tmp/we"ird/no such file or directory": permission denied'
+    assert not_executable_exit_status(explanation) == EXIT_COMMAND_NOT_EXECUTABLE
+
+
 def test_an_unrecognised_exec_wording_defaults_to_the_conservative_status() -> None:
     """126 says "it was there"; that never sends an agent off to re-spell a name."""
     explanation = _INIT_PREFIX + '"/bin/thing": some wording nobody has seen yet'

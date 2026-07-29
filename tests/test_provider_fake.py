@@ -373,8 +373,12 @@ def test_the_conformance_suite_fails_a_provider_that_blames_the_engine(
         )
 
     suite = ProviderConformance()
+    # Resolved before the block so the only thing that can raise inside it is
+    # the conformance method itself — a mistyped parametrize id is then its own
+    # plain AttributeError, not a miss the raises block has to be read past.
+    scripted_case = getattr(suite, suite_test)
     with pytest.raises(pytest.fail.Exception, match="reported as an infrastructure failure"):
-        getattr(suite, suite_test)(provider, case, make)
+        scripted_case(provider, case, make)
 
 
 def test_key_words_splits_the_naming_styles_a_backend_might_use() -> None:

@@ -401,11 +401,14 @@ NOT_FOUND_WORDINGS: tuple[str, ...] = (
     "no such file or directory",
 )
 
-#: What the exec step's detail looks like: the caller's own ``argv[0]``, quoted,
-#: then the engine's reason. Split so the reason is read *past* the command —
-#: a caller who runs ``/tmp/no such file or directory`` must not be told their
-#: command was missing when the engine said it was there and unrunnable.
-_EXEC_INIT_DETAIL = re.compile(r'\s*"(?P<argv0>.*?)":\s*(?P<reason>.+)\Z', re.DOTALL)
+#: What closes the caller's own ``argv[0]`` in the exec step's detail, which is
+#: quoted and followed by the engine's reason. Split on the *first* occurrence so
+#: the reason is read *past* the command — a caller who runs ``/tmp/no such file
+#: or directory`` must not be told their command was missing when the engine said
+#: it was there and unrunnable. A partition rather than a regex: "up to the first
+#: ``":``" is precisely what partition means, and saying it as a lazy quantifier
+#: only invited a backtracking question the string method never raises.
+_EXEC_INIT_SEPARATOR = '":'
 
 #: What replaces an engine handle or endpoint that must not reach a caller.
 REDACTED = "[redacted]"
@@ -425,6 +428,24 @@ _ENGINE_URL_RE = re.compile(r"\b[A-Za-z][\w.+-]*://\S*")
 _SHORT_HANDLE_CHARS = 12
 
 
+def _exec_init_reason(detail: str) -> str | None:
+    """The engine's reason with the caller's quoted ``argv[0]`` read off the front.
+
+    ``None`` when the detail is not shaped that way at all, which is the signal
+    to fall back to the whole string rather than to a half-parsed piece of it.
+    The trailing ``or rest[-1]`` covers a reason that is nothing but whitespace:
+    the separator was still found, so the detail *was* shaped correctly, and
+    reporting no reason at all would lose that.
+    """
+    stripped = detail.lstrip()
+    if not stripped.startswith('"'):
+        return None
+    _argv0, separator, rest = stripped[1:].partition(_EXEC_INIT_SEPARATOR)
+    if not separator or not rest:
+        return None
+    return rest.lstrip() or rest[-1]
+
+
 def not_executable_exit_status(message: str) -> int | None:
     """``126``/``127`` if this engine message means the image cannot run the command.
 
@@ -436,8 +457,8 @@ def not_executable_exit_status(message: str) -> int | None:
     if EXEC_INIT_MARKER not in message:
         return None
     detail = message.partition(EXEC_INIT_MARKER)[2]
-    found = _EXEC_INIT_DETAIL.match(detail)
-    reason = found.group("reason") if found else detail
+    found = _exec_init_reason(detail)
+    reason = found if found is not None else detail
     if any(wording in reason for wording in NOT_FOUND_WORDINGS):
         return EXIT_COMMAND_NOT_FOUND
     return EXIT_COMMAND_NOT_EXECUTABLE
@@ -1338,6 +1359,17 @@ class DockerProvider:
             return refused
         return None
 
+    @staticmethod
+    def _container_is_live(container: Container) -> bool:
+        """Whether the engine still considers this container to be running.
+
+        The ``or ""`` is what lets a missing or null status read as "not live"
+        rather than raise: both callers are deciding whether a job has settled,
+        and a state the engine declined to name is not evidence it is still
+        going.
+        """
+        return str(container.attrs["State"].get("Status") or "") in LIVE_STATUSES
+
     def _await_exit(self, container: Container, wall_budget: float, usage: _Usage) -> bool:
         """Block until the job settles or outruns its budget; kill it if it does.
 
@@ -1351,7 +1383,7 @@ class DockerProvider:
         killed = False
         while True:
             container.reload()
-            if str(container.attrs["State"].get("Status") or "") not in LIVE_STATUSES:
+            if not self._container_is_live(container):
                 return killed
             usage.sample(container)
             if time.monotonic() >= deadline:
@@ -1371,7 +1403,7 @@ class DockerProvider:
                     # guess — only a container the engine now agrees is gone
                     # earns the benign reading.
                     container.reload()
-                    if str(container.attrs["State"].get("Status") or "") not in LIVE_STATUSES:
+                    if not self._container_is_live(container):
                         return False
                     raise ProviderError(
                         "the engine refused to stop a job that outran its wall-clock "
