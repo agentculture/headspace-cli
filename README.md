@@ -238,7 +238,7 @@ The MVP Docker provider also supports no host-path mounts at all, so
 | `2` | environment_error | a local setup/tooling problem. |
 | `3` | policy_denied | the declared policy could not be satisfied — refused before anything ran. |
 | `4` | timeout | a wall-clock or budget ceiling was hit. |
-| `5` | cancelled | the caller asked for it to stop. |
+| `5` | cancelled | the caller asked for it to stop — `headspace stop <workspace> --apply` ended a job in flight, and the job's own status reads `cancelled`. |
 | `6` | computation_failed | the job ran correctly and produced a failing result. |
 | `7` | infrastructure_failure | the engine or environment broke — not a computational failure. |
 | `8` | resource_exhausted | the job was killed for exceeding its declared memory ceiling. |
