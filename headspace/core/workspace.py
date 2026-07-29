@@ -109,6 +109,40 @@ own environment writes the value into its captured output, and captured output i
 kept. That is the job's doing, not headspace's, and no recording discipline on
 this side can unsee it — so ``run --help`` says so where the flags are.
 
+**6. ``stop`` previews by default, and even when it acts it writes nothing.**
+:meth:`Orchestrator.stop` is the verb the refusal above points at, and it is
+shaped by the same fact that forced ``put`` to refuse rather than wait: ``run``
+holds the workspace lock for a job's entire duration and is, for that duration,
+the single writer of the workspace's state. A ``stop`` that took the lock would
+not interrupt that run — it would queue behind it and arrive after the job it
+was meant to end. A ``stop`` that wrote state would race the run's own
+transition back to ``ready``. So this verb does neither: it reaches the engine
+directly through :meth:`~headspace.providers.base.Provider.stop`, and the run
+invocation still in flight observes the ending through the wait it was already
+doing and journals the outcome itself. One verb ends the job, the other narrates
+it, and the store keeps exactly one writer while both act on the same workspace.
+
+Two consequences are worth stating rather than discovering. First, ``stop`` is
+the **single exception to rule 2 above**: it does not reconcile, because
+reconciliation takes locks and writes state, which is the pair of things this
+verb exists not to do. What it gives up is the ability to release a workspace
+stranded in ``running`` by a dead CLI — so when the engine reports nothing
+running under a ``running`` record, ``stop`` says exactly that and names
+reconciliation as what will fix it, rather than quietly fixing it under a lock
+it should not be holding. Second, a preview answers from headspace's own
+records and an ``--apply`` answers from the engine. Those two disagree in
+exactly one situation — a job whose CLI died — and that disagreement is
+information, not a bug to paper over.
+
+Preview is the default because ending someone's computation is not recoverable
+either: the partial work inside the workspace survives, but the run does not,
+and a caller who typed the wrong workspace id cannot un-kill it. ``destroy``
+takes the opposite default (act unless the guard refuses) because its guard can
+*see* what would be lost; nothing here can see how far a job had got. So the
+safe default is inverted: ``stop`` refuses to act until ``--apply`` says so, and
+a preview touches nothing at all — not the store, not the lock, and not the
+engine, which is not asked so much as a question.
+
 Three deviations from the plan are implemented here
 ---------------------------------------------------
 **d4 — ``running`` is a state workspaces genuinely occupy.** The lifecycle
@@ -196,6 +230,7 @@ import os
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, BinaryIO
 
@@ -256,6 +291,7 @@ from headspace.providers.base import (
     Provider,
     ProviderError,
     RemovalDisposition,
+    StopOutcome,
     WorkspaceDescriptor,
     guard_removable,
     removal_path,
@@ -632,6 +668,55 @@ class Reconciliation:
 
     def to_dict(self) -> dict[str, str]:
         return dataclasses.asdict(self)
+
+
+@dataclass(frozen=True)
+class _InFlightJob:
+    """The job a workspace's journal says has not finished yet, as ``stop`` sees it.
+
+    Private on purpose: nothing public returns one. It is a reading of the
+    journal that :meth:`Orchestrator.stop` renders into a result package, and
+    the package is the surface.
+
+    Assembled from the journal rather than from the state record, because the
+    journal is where the fact lives: :meth:`Orchestrator.run` writes its run
+    intent — argv, job id — before the engine is called and only records an
+    outcome once the job is over, so an *open* run intent is precisely the
+    signature of a job still going. The envelope's own ``recorded_at`` is
+    therefore the closest thing to a start time that exists outside the engine,
+    and :attr:`elapsed_seconds` is measured from it.
+
+    ``elapsed_seconds`` is ``None``, never ``0.0``, when the timestamp cannot be
+    read. An operator deciding whether to kill a job decides largely on how long
+    it has been going; rendering an unreadable clock as zero would hand them a
+    number headspace invented, and a job that has been burning CPU for an hour
+    is exactly the one that would look freshly started.
+
+    ``command`` is the caller's own argv, journalled verbatim by ``run``. It is
+    carried here because a preview whose entire purpose is "should I end this?"
+    is unanswerable without it — an id names a job but does not say what it is —
+    and because this repeats a fact ``run`` already wrote to ``journal.jsonl``,
+    ``state.json`` and its own outcome summary rather than exposing a new one.
+    That is the opposite call from :meth:`Orchestrator._inflight_refusal`, which
+    names a job by id only, and deliberately so: that refusal is handed to a
+    caller who asked about something else entirely and never asked to see a
+    command line.
+    """
+
+    job_id: str
+    command: tuple[str, ...]
+    started_at: str
+    elapsed_seconds: float | None
+
+    def named(self) -> str:
+        """The job, named the way every message about it names it."""
+        return f"job {self.job_id}" if self.job_id else "an unnamed job"
+
+    def elapsed(self) -> str:
+        """The wall clock it has spent, or an admission that it is unknown."""
+        if self.elapsed_seconds is None:
+            return "an unknown duration (its journal timestamp is unreadable)"
+        return f"{self.elapsed_seconds:.1f}s"
 
 
 # --- the orchestrator -------------------------------------------------------
@@ -1392,6 +1477,113 @@ class Orchestrator:
             return ""
         return str(dict(runs[-1].get("detail", {})).get("job_id", ""))
 
+    def stop(self, workspace_id: str, *, apply: bool = False) -> ResultPackage:
+        """End the job a workspace is running — or, by default, only say which one.
+
+        The verb the copy-in refusal above points at, and the only one that acts
+        on a workspace another invocation is holding. Five decisions make it what
+        it is, and each is load-bearing.
+
+        **It takes no lock and writes no state.** :meth:`run` holds the workspace
+        lock for a job's entire duration, which is what makes it the single
+        writer of that workspace's stored state for as long as the job lasts. A
+        ``stop`` that took the lock would not interrupt that run — it would queue
+        behind it and arrive after the job it was sent to end; a ``stop`` that
+        wrote state would race the run's own transition back to ``ready``. So
+        this reaches :meth:`~headspace.providers.base.Provider.stop` directly and
+        touches nothing under the store, and the run invocation still blocked in
+        the provider discovers the ending through the wait it was already doing
+        and journals the outcome itself. The store keeps one writer throughout.
+
+        **It does not reconcile**, which makes it the single exception to this
+        module's own rule that every verb reconciles at entry. Reconciliation
+        takes locks and writes state; those are the two things above. The cost is
+        stated rather than hidden: a workspace stranded in ``running`` by a dead
+        CLI is *reported* as such — the engine holds no job, the record says one
+        is in flight, and the next verb's reconciliation is what releases it.
+
+        **The default previews, and a preview is inert.** Without ``apply`` this
+        reads the state record and the journal, renders what it *would* end, and
+        returns — no engine call, not even a graceful signal, and nothing
+        written. That is the opposite default from :meth:`destroy`, which acts
+        unless its guard refuses, and the asymmetry is the point: destroy's guard
+        can see what would be lost, while nothing here can see how far a job had
+        got. A caller who typed the wrong workspace id can re-export an artifact
+        they nearly discarded; they cannot un-kill a computation.
+
+        **Nothing running is a fact, not a failure.** An operator racing a job
+        that finished a moment earlier made no mistake, so
+        :class:`~headspace.providers.base.StopOutcome` reports it (``job_id`` is
+        ``None``, ``stopped`` is ``False``) and this reports it onward as a
+        successful statement about the workspace. Raising there would turn the
+        ordinary case into an error every caller has to special-case.
+
+        **Exit 5 means a job really ended.** A stop that signalled a live job
+        returns :data:`~headspace.core.result.STATUS_CANCELLED`, which
+        :func:`exit_code_for_status` maps to the taxonomy's long-defined
+        ``cancelled`` slot — the caller asked for it to stop, and it stopped. A
+        preview and a stop that found nothing return ``success``, because
+        nothing was cancelled and a process exit that said otherwise would be
+        reporting an act that did not happen.
+
+        An unknown workspace is refused (exit 1) before the engine is asked, as
+        every other id-keyed verb here refuses one. An engine object the *store*
+        has no record of is reconciliation's business, not this verb's.
+        """
+        record = self._read(workspace_id)
+        state = _state_of(record)
+        job = self._inflight_job_view(workspace_id)
+
+        if not apply:
+            status = STATUS_SUCCESS
+            summary = _preview_summary(workspace_id, state, job)
+            findings = _inflight_findings(state, job) + list(_PREVIEW_FINDINGS)
+            attention: list[str] = []
+        else:
+            outcome = self._provider.stop(workspace_id)
+            status = STATUS_CANCELLED if outcome.stopped else STATUS_SUCCESS
+            summary = _stop_summary(workspace_id, job, outcome)
+            findings = _inflight_findings(state, job) + _stopped_findings(outcome)
+            attention = _stranded_attention(state, outcome)
+
+        return ResultPackage(
+            outcome_summary=summary,
+            status=status,
+            key_findings=findings,
+            artifacts=_artifact_section(record),
+            # The job's wall clock, not this verb's, and measured from the
+            # journal rather than the engine — the findings say so, which is what
+            # keeps a floor from reading as a measurement.
+            resource_usage=ResourceUsage(wall_time_seconds=_elapsed_or_zero(job)),
+            provenance=self._provenance(record, self._effective_policy(record), None),
+            attention=attention + _pending_artifact_attention(record),
+        )
+
+    def _inflight_job_view(self, workspace_id: str) -> _InFlightJob | None:
+        """What the journal says is still running, or ``None`` — never an exception.
+
+        A journal this cannot read is answered with "no job", for the same reason
+        :meth:`_inflight_job` answers that way: ``stop`` is the verb an operator
+        reaches for when something has already gone wrong, and a corrupt journal
+        must not be the thing standing between them and a runaway job. What is
+        lost is the *description*, never the act — ``apply`` still asks the
+        engine, and the engine is the authority on what is running.
+        """
+        try:
+            entries = self._store.read_journal(workspace_id)
+        except CliError:
+            return None
+        journalled = _open_run_entry(entries)
+        if journalled is None:
+            return None
+        detail = dict(journalled.entry.get("detail", {}))
+        return _InFlightJob(
+            job_id=str(detail.get("job_id", "")),
+            command=tuple(str(part) for part in detail.get("command", [])),
+            started_at=str(journalled.recorded_at),
+            elapsed_seconds=_elapsed_since(journalled.recorded_at),
+        )
+
     def destroy(self, workspace_id: str, *, force: bool = False) -> ResultPackage:
         """Tear a workspace down, or refuse — and when it refuses, remove nothing.
 
@@ -2025,6 +2217,157 @@ def _open_intents(entries: Sequence[JournalEntry]) -> list[dict[str, Any]]:
         else:
             closed.add(str(entry.get("intent_id", "")))
     return [entry for entry in intended if str(entry.get("intent_id", "")) not in closed]
+
+
+def _open_run_entry(entries: Sequence[JournalEntry]) -> JournalEntry | None:
+    """The journal envelope of the newest unsettled ``run`` intent, or ``None``.
+
+    Layered on :func:`_open_intents` rather than written beside it: that function
+    owns the crash signature, and a second walk of the same rule would eventually
+    disagree with it about what "open" means. What this adds is the *envelope* —
+    :attr:`~headspace.core.store.JournalEntry.recorded_at` lives there rather
+    than in the entry, and it is the only start time a job has outside the
+    engine.
+    """
+    open_ids = {
+        str(entry.get("intent_id", ""))
+        for entry in _open_intents(entries)
+        if entry.get("intent") == INTENT_RUN
+    }
+    if not open_ids:
+        return None
+    for journalled in reversed(entries):
+        entry = journalled.entry
+        if entry.get("phase") != PHASE_INTENDED:
+            continue
+        if str(entry.get("intent_id", "")) in open_ids:
+            return journalled
+    return None
+
+
+def _elapsed_since(timestamp: str) -> float | None:
+    """Seconds from an ISO-8601 journal timestamp until now, or ``None``.
+
+    ``None`` rather than ``0.0`` for anything unparseable. This number is the
+    main input to "should I kill this?", and a clock headspace could not read but
+    rendered as zero would make a job that has been running for an hour look as
+    though it had just started — the one error that would change the operator's
+    answer. A naive timestamp is read as UTC, matching
+    :func:`~headspace.providers.base.utc_now`, which is what wrote it.
+    """
+    try:
+        started = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
+
+
+def _elapsed_or_zero(job: _InFlightJob | None) -> float:
+    """The job's wall clock for :class:`~headspace.core.result.ResourceUsage`.
+
+    Zero covers both "no job" and "a clock that could not be read", because the
+    usage block is a set of numbers and has nowhere to say "unknown". The prose
+    does say it, which is why the distinction is kept there and collapsed here.
+    """
+    return 0.0 if job is None or job.elapsed_seconds is None else job.elapsed_seconds
+
+
+#: What a preview says about itself, on every preview. Written once, as a
+#: constant, because "nothing happened" is the claim the whole default mode
+#: rests on: a caller who is told a job would be ended must be told, in the same
+#: breath and in the same words every time, that it was not.
+_PREVIEW_FINDINGS: tuple[str, ...] = (
+    "preview only: the engine was not contacted, no signal was sent, and nothing was written",
+    f"pass --apply to end the job — its own outcome then reads '{STATUS_CANCELLED}', and this "
+    f"verb exits {EXIT_CANCELLED}",
+)
+
+
+def _preview_summary(workspace_id: str, state: State, job: _InFlightJob | None) -> str:
+    """One sentence for a preview: what is running, and that nothing was done."""
+    if job is None:
+        return (
+            f"workspace {workspace_id} is '{state.value}' and holds no job in flight, so there "
+            "is nothing for stop to end; nothing was changed"
+        )
+    return (
+        f"workspace {workspace_id} is running {job.named()}, {job.elapsed()} into its wall "
+        "clock; nothing was stopped, because this was a preview"
+    )
+
+
+def _stop_summary(workspace_id: str, job: _InFlightJob | None, outcome: StopOutcome) -> str:
+    """One sentence for a stop that acted, whether or not it found anything."""
+    if not outcome.stopped:
+        return (
+            f"workspace {workspace_id} holds no job the engine is running, so nothing was "
+            "stopped"
+        )
+    named = f"job {outcome.job_id}" if outcome.job_id else "the job"
+    spent = f" after {job.elapsed()}" if job is not None else ""
+    return f"{named} was stopped in workspace {workspace_id}{spent}"
+
+
+def _inflight_findings(state: State, job: _InFlightJob | None) -> list[str]:
+    """What headspace's own records say is running — the half no engine supplied.
+
+    Rendered identically for a preview and for a stop that acted, because it is
+    the same reading of the same two files; only what follows it differs.
+    """
+    findings = [f"lifecycle state: {state.value}"]
+    if job is None:
+        findings.append(
+            "no run intent is open in this workspace's journal, so headspace knows of no job "
+            "to end"
+        )
+        if state is State.RUNNING:
+            findings.append(
+                "the stored state still reads 'running', which an interrupted job leaves "
+                "behind; the next verb's reconciliation is what releases it"
+            )
+        return findings
+    findings.append(f"{job.named()} has been running for {job.elapsed()}")
+    if job.command:
+        findings.append("command: " + " ".join(job.command))
+    findings.append(
+        f"started at {job.started_at}, measured from the journal rather than the engine"
+    )
+    return findings
+
+
+def _stopped_findings(outcome: StopOutcome) -> list[str]:
+    """What the engine did when it was asked, including when the answer was nothing."""
+    if not outcome.stopped:
+        return [
+            "the engine holds no live job for this workspace, so nothing was signalled",
+            "a job that finished in the moment before this call is the ordinary case, not a "
+            "mistake — so it is reported rather than raised",
+        ]
+    return [
+        f"the engine was asked to end job {outcome.job_id}: signalled first, and killed only "
+        "if it ignored that",
+        "the run invocation that started the job observes the ending itself and records the "
+        "outcome; this verb took no lock and wrote no state",
+    ]
+
+
+def _stranded_attention(state: State, outcome: StopOutcome) -> list[str]:
+    """The one case where a stop leaves a decision behind: a record the engine outlived.
+
+    A ``running`` record the engine holds no job for is a workspace whose job's
+    CLI died. Releasing it needs the workspace lock and a state write, which is
+    exactly the pair this verb does not take — so it is named for the caller
+    instead, along with what will actually fix it.
+    """
+    if outcome.stopped or state is not State.RUNNING:
+        return []
+    return [
+        "the stored state says a job is in flight but the engine is running none, so the job's "
+        "invocation died; stop writes no state, and the next headspace verb's reconciliation is "
+        "what releases this workspace back to 'ready'"
+    ]
 
 
 def _record_from_intent(
