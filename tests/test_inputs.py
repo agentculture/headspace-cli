@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from headspace.cli._errors import EXIT_ENV_ERROR, EXIT_POLICY_DENIED, EXIT_USER_ERROR, CliError
+from headspace.cli._errors import EXIT_POLICY_DENIED, EXIT_USER_ERROR, CliError
 from headspace.core import inputs
 from headspace.core.inputs import InputEntry, InputManifest, expand_input, precheck_storage_budget
 
@@ -72,7 +72,9 @@ def test_expanding_the_same_directory_twice_yields_equal_manifests(tmp_path: Pat
     assert first == second
 
 
-def test_each_file_is_opened_exactly_once_while_hashing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_each_file_is_opened_exactly_once_while_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Streaming proof: the implementation opens each file's content exactly
     once (never re-reads it to separately measure size), and never buffers a
     whole file -- exercised here with a chunk size much smaller than either
@@ -88,7 +90,8 @@ def test_each_file_is_opened_exactly_once_while_hashing(tmp_path: Path, monkeypa
     real_open = os.open
 
     def counting_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
-        key = os.fspath(path) if hasattr(path, "__fspath__") or isinstance(path, (str, bytes)) else str(path)
+        addressable = hasattr(path, "__fspath__") or isinstance(path, (str, bytes))
+        key = os.fspath(path) if addressable else str(path)
         open_counts[key] = open_counts.get(key, 0) + 1
         return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -98,9 +101,9 @@ def test_each_file_is_opened_exactly_once_while_hashing(tmp_path: Path, monkeypa
 
     assert len(manifest) == 2
     for entry in manifest:
-        assert open_counts.get(str(entry.source), 0) == 1, (
-            f"{entry.source} opened {open_counts.get(str(entry.source), 0)} times, expected 1"
-        )
+        assert (
+            open_counts.get(str(entry.source), 0) == 1
+        ), f"{entry.source} opened {open_counts.get(str(entry.source), 0)} times, expected 1"
     # And the streaming read still produced correct results.
     by_dest = {entry.destination: entry for entry in manifest}
     assert by_dest["harness/a.bin"].sha256 == _sha256(data_a)
