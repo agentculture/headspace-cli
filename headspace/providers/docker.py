@@ -1362,11 +1362,21 @@ class DockerProvider:
                     )
                 try:
                     container.kill()
-                except APIError:
-                    # It exited between the poll and the signal: the job
-                    # finished on its own, and calling that a timeout would
-                    # discard a real exit status.
-                    return False
+                except APIError as err:
+                    # Two very different situations raise here, and assuming
+                    # the benign one turns a broken daemon into a reported
+                    # success: the container may have exited between the poll
+                    # and the signal (a real exit status we must not discard),
+                    # or the engine may simply have failed. Re-read rather than
+                    # guess — only a container the engine now agrees is gone
+                    # earns the benign reading.
+                    container.reload()
+                    if str(container.attrs["State"].get("Status") or "") not in LIVE_STATUSES:
+                        return False
+                    raise ProviderError(
+                        "the engine refused to stop a job that outran its wall-clock "
+                        f"budget, and the job is still running: {err}"
+                    ) from err
                 killed = True
                 deadline = time.monotonic() + KILL_GRACE_SECONDS
             time.sleep(POLL_INTERVAL_SECONDS)

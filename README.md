@@ -134,7 +134,9 @@ job job-9324b5e5a3cd ran python -c ... in workspace demo and reported success
 success
 ## Evidence
 - label: captured output
-  - source: headspace inspect job-9324b5e5a3cd --logs
+  - kind: excerpt
+  - source: job-9324b5e5a3cd
+  - truncated: false
   - excerpt:
     pi=3.1415926536 check_passed=True
 ## Suggested attention

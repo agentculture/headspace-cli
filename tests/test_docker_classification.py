@@ -197,6 +197,7 @@ class StubContainer:
         exit_code: int = 0,
         frames: Sequence[bytes] = (),
         oom_killed: bool = False,
+        kill_error: Exception | None = None,
     ) -> None:
         self.id = container_id
         self.labels = dict(labels)
@@ -215,6 +216,10 @@ class StubContainer:
         #: can land on a container the engine also marks OOMKilled, which is
         #: exactly the precedence case the OOM tests below pin.
         self._oom_killed = oom_killed
+        #: Raised by ``kill()``. A daemon that refuses the signal while the
+        #: container keeps running is an engine failure, not a job that
+        #: happened to exit first — the two must not read alike.
+        self._kill_error = kill_error
 
     @property
     def status(self) -> str:
@@ -245,6 +250,8 @@ class StubContainer:
         return {}
 
     def kill(self) -> None:
+        if self._kill_error is not None:
+            raise self._kill_error
         # The wall-clock enforcer's own kill, which yields the same 137 a
         # kernel OOM kill does — and, on a host under real memory pressure,
         # can land on a container the engine also marks OOMKilled.
@@ -283,6 +290,10 @@ class StubEngine:
         #: until something calls ``kill()``, which is how a wall-clock timeout
         #: is driven without a real clock.
         self.job_settles_to = "exited"
+        #: Raised by the next job container's ``kill()``. Models a daemon
+        #: that refuses the signal, which must not read as "the job exited
+        #: on its own" — see the false-success test below.
+        self.job_kill_error: BaseException | None = None
         self.closed = 0
 
     def version(self) -> dict[str, Any]:
@@ -343,6 +354,7 @@ class _StubContainers:
             exit_code=self._engine.job_exit_code if job else 0,
             frames=self._engine.job_frames if job else (),
             oom_killed=self._engine.job_oom_killed if job else False,
+            kill_error=self._engine.job_kill_error if job else None,
         )
         self._engine.registry.append(container)
         return container
@@ -623,6 +635,32 @@ def test_a_wall_clock_kill_reports_timeout_even_when_oomkilled_is_true(
     assert outcome.status == STATUS_TIMEOUT
     assert outcome.exit_status is None
     assert exit_code_for_status(outcome.status) == EXIT_TIMEOUT
+
+
+def test_a_kill_the_daemon_refuses_is_an_engine_failure_not_a_success(
+    engine: StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """A refused kill must never be read as "the job exited on its own".
+
+    ``_await_exit`` catches ``APIError`` from its own ``kill()`` because the
+    container may genuinely have exited between the poll and the signal. But a
+    daemon that fails for any other reason raises the same exception, and the
+    container keeps running — at which point the old code returned as though a
+    real exit status were waiting, and ``run`` coerced the absent ``ExitCode``
+    to 0 and reported **success** for a job that never finished. A false
+    success is the one report this taxonomy must never produce.
+    """
+    engine.job_settles_to = "running"  # never exits, so the kill is not a race
+    engine.job_kill_error = APIError("daemon refused the signal")
+    tight_policy = resolve_policy(
+        Policy(budget=ResourceBudget(wall_clock_seconds=0)), provider.capabilities()
+    )
+
+    with pytest.raises(ProviderError) as exc:
+        provider.run(workspace, ("sleep", "infinity"), tight_policy, job_id="job-killfail")
+
+    assert "still running" in str(exc.value)
+    assert exc.value.code == EXIT_INFRASTRUCTURE_FAILURE
 
 
 # --- through the orchestrator, to the rendered package -----------------------
