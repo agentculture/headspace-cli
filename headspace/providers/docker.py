@@ -717,6 +717,16 @@ WRITE_STAGED_FILE_MISSING = 17
 #: whose bytes the job can still rewrite after the copy-in reported success.
 #: The digest is what makes this fatal rather than untidy: it would be a true
 #: statement about bytes nobody can rely on afterwards.
+#:
+#: Tested twice, and the second test is the honest part. The first, before the
+#: hash, defeats the reliable attack: swap the file, let the digest certify the
+#: link's target, walk away. The second, immediately before the rename, narrows
+#: what is left — a job would have to land the swap inside the gap between that
+#: test and ``mv``, with no way to observe when the gap opens. **It is narrowed,
+#: not closed**: POSIX offers no "rename only if this is not a symlink", the
+#: same shape of admission :data:`FINALIZE_WRITE_SCRIPT` already makes about
+#: resolving the destination's parent. What stays guaranteed is that a link
+#: sitting there at either checkpoint is refused and nothing is renamed.
 WRITE_STAGED_PATH_IS_A_LINK = 18
 
 #: How large a bite is taken out of the caller's source at a time.
@@ -846,6 +856,7 @@ fi
 if [ -e "$dest" ] || [ -L "$dest" ]; then
     [ "$overwrite" = 1 ] || { echo "headspace-write: $dest"; exit 15; }
 fi
+[ ! -L "$staged" ] || { echo "headspace-write: $staged"; exit 18; }
 mv -f "$staged" "$dest"
 """
 
