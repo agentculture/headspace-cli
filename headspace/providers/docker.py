@@ -1084,6 +1084,28 @@ def _landed_digest_disagrees(
     )
 
 
+def _staged_file_vanished(workspace_id: str, relative: str) -> ProviderError:
+    """The transfer reported success and the staged file was not there.
+
+    Named rather than left to the unexplained-failure fallback, because the
+    fallback's message would send a reader looking for a broken engine when the
+    engine did its job: ``put_archive`` returned, so the bytes were accepted,
+    and something inside the workspace removed them before they could be
+    verified. That is the same neighbour the digest mismatch and the symlink
+    swap have — a job sharing the volume — and a caller who sees all three
+    worded as one family can act on them as one.
+    """
+    return ProviderError(
+        f"the file staged in workspace {workspace_id} for '{relative}' was gone before it "
+        "could be verified — nothing was renamed into place",
+        remediation=(
+            "nothing was written: the transfer succeeded and something sharing the workspace "
+            "volume then removed the staged file. Stop any job running in the workspace, "
+            "then retry the copy-in"
+        ),
+    )
+
+
 def _staged_path_is_a_link(workspace_id: str, relative: str) -> ProviderError:
     """The staged file became a symlink between the transfer and the check.
 
@@ -2132,11 +2154,19 @@ class DockerProvider:
         with the script's own line kept as evidence — the fail-safe direction,
         because a status invented later cannot silently become a successful
         write, only a loud unexplained one.
+
+        :data:`FINALIZE_WRITE_SCRIPT` can exit with exactly 18, 17, 13, 14, 15
+        and 16, and every one of them is named below. The list is written out so
+        a status added to the script and forgotten here is visible by reading
+        the two side by side, rather than only when a caller meets an
+        unexplained failure.
         """
         if status == 0:
             return
         if status == WRITE_STAGED_PATH_IS_A_LINK:
             raise _staged_path_is_a_link(landing.workspace_id, landing.relative)
+        if status == WRITE_STAGED_FILE_MISSING:
+            raise _staged_file_vanished(landing.workspace_id, landing.relative)
         if status == WRITE_DIGEST_MISMATCH:
             raise _landed_digest_disagrees(
                 landing.workspace_id, landing.relative, landing.expected_sha256, detail
@@ -2308,9 +2338,18 @@ class DockerProvider:
 
             job_id = job.labels.get(LABEL_JOB_ID)
             job.stop(timeout=STOP_GRACE_SECONDS)
-            job.reload()
-            if self._container_is_live(job):
-                job.kill()
+            # The container can disappear between the signal and the follow-up:
+            # `run` removes its own job container the moment the job settles, so
+            # a graceful stop that works is *expected* to race that removal. A
+            # `NotFound` here therefore means the stop succeeded so completely
+            # that the object is already reaped — reporting it as an engine
+            # failure would tell the caller their stop failed at the exact moment
+            # it worked best. The escalation is what needs the object; its
+            # absence is the outcome the escalation was for.
+            with contextlib.suppress(NotFound):
+                job.reload()
+                if self._container_is_live(job):
+                    job.kill()
 
         return StopOutcome(workspace_id=workspace_id, job_id=job_id, stopped=True)
 
