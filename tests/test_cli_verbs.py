@@ -574,6 +574,43 @@ def test_the_fake_path_never_imports_the_docker_sdk(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+# --- put --------------------------------------------------------------------
+
+
+def test_put_is_registered_and_reachable() -> None:
+    """The put verb is discoverable and its handler comes from its own module."""
+    registered = subparsers()
+    assert "put" in registered
+    handler = registered["put"].get_default("func")
+    assert handler is not None
+    assert handler.__module__ == "headspace.cli._commands.put"
+
+
+def test_put_forwards_positionals_and_overwrite(
+    capsys: pytest.CaptureFixture[str], fake: FakeProvider, tmp_path: Path
+) -> None:
+    """put forwards its three positionals and the overwrite flag to the orchestrator."""
+    workspace = make_workspace(capsys)
+    capsys.readouterr()
+
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"hello")
+
+    assert run_cli("put", workspace, str(source), "in.txt") == EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "in.txt" in out
+
+
+def test_put_refuses_malformed_invocation(capsys: pytest.CaptureFixture[str]) -> None:
+    """A missing positional is refused by argparse with a usage hint."""
+    with pytest.raises(SystemExit) as exc:
+        run_cli("put", "ws")
+    assert exc.value.code == EXIT_USER_ERROR
+    err = capsys.readouterr().err
+    assert err.startswith("error:")
+    assert "hint:" in err
+
+
 # --- the explain catalog ----------------------------------------------------
 
 
