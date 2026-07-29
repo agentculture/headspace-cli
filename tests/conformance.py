@@ -1140,13 +1140,14 @@ class ProviderConformance:
         """
         descriptor = workspaces()
         content = b"a bare bytes object is not a byte source\n"
+        digest = hashlib.sha256(content).hexdigest()
 
         with pytest.raises(CliError):
             provider.write(
                 descriptor.workspace_id,
                 "bare.bin",
                 content,
-                expected_sha256=hashlib.sha256(content).hexdigest(),
+                expected_sha256=digest,
             )
 
     def test_write_refuses_a_digest_that_does_not_describe_the_source(
@@ -1164,12 +1165,13 @@ class ProviderConformance:
         descriptor = workspaces()
         content = b"headspace copy-in conformance payload\n"
         wrong_digest = hashlib.sha256(b"not " + content).hexdigest()
+        source = io.BytesIO(content)
 
         with pytest.raises(CliError) as caught:
             provider.write(
                 descriptor.workspace_id,
                 "rejected.bin",
-                io.BytesIO(content),
+                source,
                 expected_sha256=wrong_digest,
             )
         assert caught.value.code == EXIT_USER_ERROR
@@ -1197,12 +1199,13 @@ class ProviderConformance:
         )
         content = b"a caller's replacement payload\n"
         digest = hashlib.sha256(content).hexdigest()
+        source = io.BytesIO(content)
 
         with pytest.raises(CliError) as caught:
             provider.write(
                 workspace_id,
                 provider_case.artifact_path,
-                io.BytesIO(content),
+                source,
                 expected_sha256=digest,
             )
         assert caught.value.code == EXIT_USER_ERROR
@@ -1254,12 +1257,14 @@ class ProviderConformance:
     ) -> None:
         """The same boundary ``read`` is refused at, refused here on the way in."""
         descriptor = workspaces()
+        source = io.BytesIO(b"payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
         with pytest.raises(CliError) as caught:
             provider.write(
                 descriptor.workspace_id,
                 escape,
-                io.BytesIO(b"payload"),
-                expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+                source,
+                expected_sha256=digest,
             )
         assert caught.value.code == EXIT_USER_ERROR
         assert not isinstance(caught.value, ProviderError)
@@ -1268,12 +1273,14 @@ class ProviderConformance:
         self, provider: Provider, provider_case: ProviderCase
     ) -> None:
         unknown_workspace_id = provider_case.workspace_id()
+        source = io.BytesIO(b"payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
         with pytest.raises(CliError) as caught:
             provider.write(
                 unknown_workspace_id,
                 "out.bin",
-                io.BytesIO(b"payload"),
-                expected_sha256=hashlib.sha256(b"payload").hexdigest(),
+                source,
+                expected_sha256=digest,
             )
         assert caught.value.code == EXIT_USER_ERROR
 

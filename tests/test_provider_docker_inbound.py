@@ -618,8 +618,9 @@ class TestTheEngineSideRehashIsLoadBearing:
         lets the in-container refusal mean the narrower, sharper thing it
         means: the bytes changed after they left.
         """
+        source = io.BytesIO(PAYLOAD)
         with pytest.raises(CliError) as caught:
-            provider.write(WORKSPACE, "out.bin", io.BytesIO(PAYLOAD), expected_sha256="0" * 64)
+            provider.write(WORKSPACE, "out.bin", source, expected_sha256="0" * 64)
 
         assert caught.value.code == EXIT_USER_ERROR
         assert not isinstance(caught.value, ProviderError)
@@ -749,8 +750,9 @@ class TestTheDestinationBoundary:
         failure, retried forever — when the truth is that the caller passed the
         wrong shape. Refusing the shape up front keeps the mismatch honest.
         """
+        source = io.BytesIO(PAYLOAD)
         with pytest.raises(CliError) as caught:
-            provider.write(WORKSPACE, "out.bin", io.BytesIO(PAYLOAD), expected_sha256=digest)
+            provider.write(WORKSPACE, "out.bin", source, expected_sha256=digest)
 
         assert caught.value.code == EXIT_USER_ERROR
         assert anchor.calls == []
@@ -858,8 +860,9 @@ class TestHonestRefusals:
     def test_an_unknown_workspace_is_the_callers_error(
         self, provider: DockerProvider, anchor: HostBackedAnchor
     ) -> None:
+        source = io.BytesIO(PAYLOAD)
         with pytest.raises(CliError) as caught:
-            provider.write("no-such-ws", "out.bin", io.BytesIO(PAYLOAD), expected_sha256=DIGEST)
+            provider.write("no-such-ws", "out.bin", source, expected_sha256=DIGEST)
 
         assert caught.value.code == EXIT_USER_ERROR
         assert anchor.calls == []
@@ -871,10 +874,10 @@ class TestHonestRefusals:
         monkeypatch.delenv("DOCKER_TLS_VERIFY", raising=False)
         monkeypatch.delenv("DOCKER_CERT_PATH", raising=False)
 
+        unreachable_provider = DockerProvider()
+        source = io.BytesIO(PAYLOAD)
         with pytest.raises(ProviderError) as caught:
-            DockerProvider().write(
-                WORKSPACE, "out.bin", io.BytesIO(PAYLOAD), expected_sha256=DIGEST
-            )
+            unreachable_provider.write(WORKSPACE, "out.bin", source, expected_sha256=DIGEST)
 
         assert caught.value.code == EXIT_INFRASTRUCTURE_FAILURE
         assert caught.value.remediation
@@ -963,9 +966,11 @@ class TestStagingResidue:
             yield PAYLOAD[:10]
             raise OSError("the source went away")
 
-        with pytest.raises(Exception):  # noqa: B017 - any failure must still tidy up
-            provider.write(WORKSPACE, "out.bin", failing_source(), expected_sha256=DIGEST)
+        source = failing_source()
+        with pytest.raises(ProviderError) as caught:
+            provider.write(WORKSPACE, "out.bin", source, expected_sha256=DIGEST)
 
+        assert caught.value.code == EXIT_INFRASTRUCTURE_FAILURE
         assert self._staged_names(anchor) == []
         assert "discard" in anchor.calls
 

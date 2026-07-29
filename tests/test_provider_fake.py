@@ -929,11 +929,12 @@ def test_write_refuses_a_digest_mismatch() -> None:
     policy = effective_policy(provider)
     provider.create("ws-baddigest", "env", policy)
 
+    source = io.BytesIO(b"payload")
     with pytest.raises(CliError) as caught:
         provider.write(
             "ws-baddigest",
             "data.bin",
-            io.BytesIO(b"payload"),
+            source,
             # Well-formed (64 lowercase hex chars) but not the digest of
             # b"payload" — a wrong digest, not a malformed one.
             expected_sha256="0" * 64,
@@ -957,8 +958,9 @@ def test_write_refuses_existing_destination_without_overwrite() -> None:
 
     content = b"replacement"
     sha = hashlib.sha256(content).hexdigest()
+    source = io.BytesIO(content)
     with pytest.raises(CliError) as caught:
-        provider.write("ws-exists", "data.bin", io.BytesIO(content), expected_sha256=sha)
+        provider.write("ws-exists", "data.bin", source, expected_sha256=sha)
     assert caught.value.code == EXIT_USER_ERROR
     # The fact ("already exists") lives in the message; the action to take
     # ("pass overwrite=True") lives in the remediation, same split every

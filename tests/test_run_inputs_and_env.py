@@ -265,11 +265,12 @@ def test_env_file_forwards_every_assignment_it_holds(fake: FakeProvider, tmp_pat
 def test_env_file_refuses_a_malformed_line_without_quoting_it(tmp_path: Path) -> None:
     """A line with no ``=`` is refused by path and line number, never by content."""
     path = env_file(tmp_path, f"GOOD=fine\nthis-line-holds-{SECRET}\n")
+    path_str = str(path)
 
     with pytest.raises(CliError) as refused:
-        parse_environment(None, [str(path)])
+        parse_environment(None, [path_str])
     assert refused.value.code == EXIT_USER_ERROR
-    assert str(path) in refused.value.message
+    assert path_str in refused.value.message
     assert "line 2" in refused.value.message
     assert SECRET not in refused.value.message
     assert SECRET not in refused.value.remediation
@@ -278,24 +279,27 @@ def test_env_file_refuses_a_malformed_line_without_quoting_it(tmp_path: Path) ->
 @pytest.mark.parametrize("body", ["9LIVES=x\n", " SPACED =x\n", "=x\n", "export A=x\n"])
 def test_env_file_refuses_a_line_whose_name_is_not_a_name(tmp_path: Path, body: str) -> None:
     """No shell grammar is guessed: no quote stripping, no ``export`` prefix."""
+    path_str = str(env_file(tmp_path, body))
     with pytest.raises(CliError) as refused:
-        parse_environment(None, [str(env_file(tmp_path, body))])
+        parse_environment(None, [path_str])
     assert refused.value.code == EXIT_USER_ERROR
 
 
 def test_env_file_refuses_a_path_that_does_not_exist(tmp_path: Path) -> None:
     missing = tmp_path / "nope.env"
+    missing_str = str(missing)
     with pytest.raises(CliError) as refused:
-        parse_environment(None, [str(missing)])
+        parse_environment(None, [missing_str])
     assert refused.value.code == EXIT_USER_ERROR
-    assert str(missing) in refused.value.message
+    assert missing_str in refused.value.message
 
 
 def test_a_name_given_twice_is_refused_rather_than_resolved(tmp_path: Path) -> None:
     """Two definitions may hold different secrets; headspace picks neither."""
     path = env_file(tmp_path, f"{SECRET_NAME}=from-the-file\n")
+    path_str = str(path)
     with pytest.raises(CliError) as refused:
-        parse_environment([SECRET_NAME], [str(path)])
+        parse_environment([SECRET_NAME], [path_str])
     assert refused.value.code == EXIT_USER_ERROR
     assert SECRET_NAME in refused.value.message
     assert "from-the-file" not in refused.value.message
@@ -308,12 +312,13 @@ def test_input_destination_is_bounded_at_construction(payload: Path) -> None:
     ``__post_init__``, so a CLI that parses flags before it constructs a provider
     has satisfied "validated before any engine contact" structurally.
     """
+    host_path = str(payload)
     with pytest.raises(CliError) as refused:
-        InputRequest(host_path=str(payload), destination="../escape.env")
+        InputRequest(host_path=host_path, destination="../escape.env")
     assert refused.value.code == EXIT_USER_ERROR
     assert "leave the workspace" in refused.value.message
 
-    normalised = InputRequest(host_path=str(payload), destination="./data//config.env")
+    normalised = InputRequest(host_path=host_path, destination="./data//config.env")
     assert normalised.destination == "data/config.env"
 
 
@@ -346,10 +351,9 @@ def test_run_refuses_an_over_budget_input_before_the_job_runs(
         workspace_id=WS, policy=Policy(budget=ResourceBudget(storage_bytes=len(PAYLOAD) - 1))
     )
 
+    input_request = InputRequest(host_path=str(payload), destination="config.env")
     with pytest.raises(CliError) as refused:
-        orchestrator.run(
-            WS, ECHO, inputs=[InputRequest(host_path=str(payload), destination="config.env")]
-        )
+        orchestrator.run(WS, ECHO, inputs=[input_request])
     assert refused.value.code == EXIT_POLICY_DENIED
     assert state_record(store)["jobs"] == []
     assert ledger(store) == []
@@ -629,15 +633,10 @@ def test_two_inputs_landing_at_one_destination_are_refused(
     other.write_bytes(b"different\n")
     orchestrator = ready(fake, store)
 
+    first_input = InputRequest(host_path=str(payload), destination="config.env")
+    second_input = InputRequest(host_path=str(other), destination="config.env")
     with pytest.raises(CliError) as refused:
-        orchestrator.run(
-            WS,
-            ECHO,
-            inputs=[
-                InputRequest(host_path=str(payload), destination="config.env"),
-                InputRequest(host_path=str(other), destination="config.env"),
-            ],
-        )
+        orchestrator.run(WS, ECHO, inputs=[first_input, second_input])
     assert refused.value.code == EXIT_USER_ERROR
     assert "config.env" in refused.value.message
     assert ledger(store) == []

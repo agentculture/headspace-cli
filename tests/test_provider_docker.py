@@ -1510,8 +1510,9 @@ class TestAllowHostPathStillFailsClosed:
 
         assert requested_limit(resolve_policy(Policy(), snapshot), "filesystem") == ()
         for scope in (("/",), ("/etc",), ("/home/agent", "/srv")):
+            policy = Policy(filesystem=FilesystemScope(host_paths=scope))
             with pytest.raises(PolicyError):
-                resolve_policy(Policy(filesystem=FilesystemScope(host_paths=scope)), snapshot)
+                resolve_policy(policy, snapshot)
 
     @pytest.mark.parametrize("network_enabled", [False, True])
     def test_the_sealed_container_configuration_carries_no_bind_of_any_kind(

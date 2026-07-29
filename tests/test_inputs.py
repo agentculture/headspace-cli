@@ -343,20 +343,25 @@ def test_a_non_positive_chunk_size_is_refused(tmp_path: Path) -> None:
 
 
 def test_input_entry_rejects_a_negative_size() -> None:
+    source = Path("x")
+    digest = _sha256(b"x")
     with pytest.raises(CliError) as exc:
-        InputEntry(source=Path("x"), destination="x", size_bytes=-1, sha256=_sha256(b"x"))
+        InputEntry(source=source, destination="x", size_bytes=-1, sha256=digest)
     assert exc.value.code == EXIT_USER_ERROR
 
 
 def test_input_entry_rejects_a_malformed_digest() -> None:
+    source = Path("x")
     with pytest.raises(CliError) as exc:
-        InputEntry(source=Path("x"), destination="x", size_bytes=1, sha256="not-hex")
+        InputEntry(source=source, destination="x", size_bytes=1, sha256="not-hex")
     assert exc.value.code == EXIT_USER_ERROR
 
 
 def test_input_entry_rejects_an_empty_destination() -> None:
+    source = Path("x")
+    digest = _sha256(b"x")
     with pytest.raises(CliError) as exc:
-        InputEntry(source=Path("x"), destination=" ", size_bytes=1, sha256=_sha256(b"x"))
+        InputEntry(source=source, destination=" ", size_bytes=1, sha256=digest)
     assert exc.value.code == EXIT_USER_ERROR
 
 

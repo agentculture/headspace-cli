@@ -707,9 +707,10 @@ def test_a_multi_file_copy_in_that_fails_part_way_records_only_what_landed(
 ) -> None:
     """A partial copy is a fact about the workspace; the ledger must state it."""
     orch, provider = prepared(store, CopyInProvider(root=store.root, refuse={"harness/run.sh"}))
+    source_tree = tree(tmp_path)
 
     with pytest.raises(CliError):
-        orch.put(WS, tree(tmp_path), "harness")
+        orch.put(WS, source_tree, "harness")
 
     assert [row["destination"] for row in ledger(store)] == ["harness/lib/helper.py"]
     settled = put_intents(store)[-1]

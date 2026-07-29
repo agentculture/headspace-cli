@@ -374,8 +374,9 @@ def test_nothing_running_is_reported_rather_than_raised(
 
 def test_an_unknown_workspace_is_refused_before_the_engine() -> None:
     """A workspace the store has never heard of is the caller's mistake, exit 1."""
+    stopper = watcher(UntouchableProvider())
     with pytest.raises(CliError) as caught:
-        watcher(UntouchableProvider()).stop("ws-never-existed", apply=True)
+        stopper.stop("ws-never-existed", apply=True)
     assert caught.value.code == EXIT_USER_ERROR
 
 
