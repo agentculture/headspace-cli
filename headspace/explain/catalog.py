@@ -21,12 +21,15 @@ kit under `.claude/skills/`.
 
 ## Lifecycle verbs
 
-The five verbs that make and use a workspace. Each returns the same nine-section
+The seven verbs that make and use a workspace. Each returns the same nine-section
 result package — markdown by default (for agents and humans), `--json` for
 scripts and non-AI bots — and takes its exit code from the package's status.
 
 - `headspace-cli create` — provision an ephemeral workspace.
+- `headspace-cli put <workspace> <host-path> <destination>` — copy host bytes
+  into it.
 - `headspace-cli run <workspace> <command> ...` — run one command in it.
+- `headspace-cli stop <workspace>` — end its in-flight job (previews by default).
 - `headspace-cli inspect <handle>` — report its state, cost and captured output.
 - `headspace-cli export <workspace> <name> --to <path>` — publish an artifact.
 - `headspace-cli destroy <workspace>` — remove it, or refuse and remove nothing.
@@ -47,11 +50,13 @@ scripts and non-AI bots — and takes its exit code from the package's status.
 - `2` environment / setup error
 - `3` policy denied
 - `4` timeout
-- `5` cancelled
+- `5` cancelled — `headspace-cli stop <workspace> --apply` ended a job in flight
 - `6` computation failed — the job ran correctly and produced a failing result
 - `7` infrastructure failure — the engine or environment broke
+- `8` resource exhausted — the job was killed for exceeding its declared
+  memory ceiling
 
-Codes 3–7 mirror the result package's status vocabulary one to one, so a caller
+Codes 3–8 mirror the result package's status vocabulary one to one, so a caller
 learns *why* a job failed from the exit code alone.
 
 ## Choosing a backend
@@ -64,7 +69,9 @@ other's way.
 ## See also
 
 - `headspace-cli explain create`
+- `headspace-cli explain put`
 - `headspace-cli explain run`
+- `headspace-cli explain stop`
 - `headspace-cli explain whoami`
 - `headspace-cli explain doctor`
 """
@@ -182,6 +189,7 @@ package under `provenance.workspace_id`.
 
 ## See also
 
+- `headspace-cli explain put`
 - `headspace-cli explain run`
 - `headspace-cli explain destroy`
 """
@@ -203,12 +211,31 @@ argparse claims none of it — so `run ws-1 echo hi --json` passes `--json` to
     headspace-cli run ws-1 python -c "print(6 * 7)"
     headspace-cli run --json ws-1 pytest -q
     headspace-cli run --declare report.json="the findings" ws-1 ./analyse.sh
+    headspace-cli run --input harness=./harness.py --env API_KEY ws-1 ./harness.py
 
 ## Flags
 
 - `--declare NAME=PURPOSE` — register an output this job promises, repeatable.
   The purpose is required: it is what a refused `destroy` quotes back when it
   names the work it is protecting.
+- `--input NAME=HOST_PATH` — copy a host file or directory into the workspace
+  before the job starts, repeatable (issue #14). `NAME` is the
+  workspace-relative destination; `HOST_PATH` may be a file or a whole
+  directory. Drives the same copy-in `put` does — headspace records each
+  file's destination, size and sha256, never its contents.
+- `--env NAME` — forward the variable `NAME` from the caller's own
+  environment into the job, repeatable (issue #13). The value is read here,
+  by name, and never enters argv, so headspace records the name and never
+  the value; an unset name is refused rather than forwarded empty, and
+  `--env NAME=VALUE` is refused outright. Edge worth knowing: a job that
+  prints its own environment (`env`, `printenv`, a traceback) writes the
+  value into its own captured output, and captured output is kept — that is
+  the job's doing, not headspace's.
+- `--env-file PATH` — read `NAME=VALUE` lines from a host file and forward
+  all of them, repeatable. The value is taken verbatim to the end of the
+  line; a malformed line is refused by file and line number, never quoted
+  back. headspace records the file's path and the names it defined, never
+  the values.
 - `--job-id ID` — use this job id instead of a minted one. It is the handle
   truncated output is retrieved by.
 - `--provider docker|fake`, `--json`, `--max-result-bytes N`.
@@ -217,12 +244,93 @@ argparse claims none of it — so `run ws-1 echo hi --json` passes `--json` to
 
 The exit code is the job's status, not merely zero or non-zero: `6` for a
 command that ran correctly and failed, `4` for one the budget stopped, `7` for
-an engine that broke. A failed job leaves a perfectly good workspace behind.
+an engine that broke, `8` for one killed over its memory ceiling. A failed job
+leaves a perfectly good workspace behind. On the `docker` provider, a job
+ended by `headspace-cli stop --apply` is today also reported through this
+`6` path rather than the `cancelled`/`5` outcome `stop`'s own invocation
+reports — a known gap, tracked as issue #16.
 
 ## See also
 
+- `headspace-cli explain put`
+- `headspace-cli explain stop`
 - `headspace-cli explain inspect`
 - `headspace-cli explain export`
+"""
+
+_PUT = """\
+# headspace-cli put
+
+Copies a host file or directory into a workspace (issue #14) and records
+where it landed — the host path, the workspace destination, the size and the
+sha256 — never the bytes. Refuses an existing destination unless
+`--overwrite`: an inbound overwrite can destroy workspace-side work a job may
+never have exported, and `put` writes into a volume other jobs may read, so
+replacing a destination silently is a mistake this product will not make by
+default.
+
+This is the identical copy-in `run --input NAME=HOST_PATH` drives before a
+job starts — there is one implementation of getting bytes into a workspace,
+not two that agree until they don't. `put` is the standalone form, for
+staging files ahead of a run or replacing them between runs; `--input` is the
+inline form for the common case of "copy this in, then run."
+
+## Usage
+
+    headspace-cli put ws-1 ./payload.tar dataset.tar
+    headspace-cli put ws-1 ./src ./workspace-src --overwrite
+
+## Flags
+
+- `--overwrite` — permit replacing an existing destination. Refused by
+  default.
+- `--provider docker|fake`, `--json`, `--max-result-bytes N`.
+
+## See also
+
+- `headspace-cli explain run`
+- `headspace-cli explain destroy`
+"""
+
+_STOP = """\
+# headspace-cli stop
+
+Ends the job a workspace is running, and **previews by default**: without
+`--apply` it reports what is running and changes nothing — no signal is sent,
+no engine is contacted, nothing under `~/.headspace` is opened for writing.
+The default is the inert one because nothing on this path can see how far a
+running computation had got: a caller who nearly discards an artifact can
+export it and try again, but a caller who kills the wrong job cannot un-kill
+it.
+
+`--apply` actually ends the job. The `stop` invocation itself then reports
+the result status `cancelled`, which maps to exit `5` — "the caller asked
+for it to stop" — on every backend. A preview, and a `stop` that finds
+nothing running, exits `0`: nothing was cancelled, so nothing claims to have
+been.
+
+`stop` itself is provably inert without `--apply`, on every backend: it takes
+no workspace lock and writes no state, which is what keeps it from
+deadlocking against the very `run` it interrupts. What it does not yet
+guarantee everywhere is the *other* half of the story — the *job's own*
+recorded outcome, which the interrupted `run` invocation writes separately.
+See `headspace-cli explain run`'s Exit codes section for the Docker-specific
+gap there (issue #16).
+
+## Usage
+
+    headspace-cli stop ws-1
+    headspace-cli stop ws-1 --apply
+
+## Flags
+
+- `--apply` — actually end the job. Without it, nothing is signalled and
+  nothing is written.
+- `--provider docker|fake`, `--json`, `--max-result-bytes N`.
+
+## See also
+
+- `headspace-cli explain run`
 """
 
 _INSPECT = """\
@@ -331,7 +439,9 @@ ENTRIES: dict[tuple[str, ...], str] = {
     ("cli",): _CLI,
     ("cli", "overview"): _CLI,
     ("create",): _CREATE,
+    ("put",): _PUT,
     ("run",): _RUN,
+    ("stop",): _STOP,
     ("inspect",): _INSPECT,
     ("export",): _EXPORT,
     ("destroy",): _DESTROY,
