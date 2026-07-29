@@ -243,6 +243,26 @@ def test_env_refuses_a_value_typed_on_the_command_line(fake: FakeProvider, capsy
     assert SECRET not in captured.out
 
 
+def test_env_refuses_a_nameless_assignment_without_echoing_it(
+    fake: FakeProvider, capsys: Any
+) -> None:
+    """``--env =SECRET`` has no name to quote, and the value stays unquoted anyway.
+
+    The regression this pins: the refusal used to fall back to the raw token
+    when the part before the ``=`` was empty, which put the value into the very
+    message whose remediation promises the value is not repeated. There is no
+    name to show here, so the message describes the token instead of quoting it.
+    """
+    assert run_cli("create", "--workspace-id", WS, "--json") == EXIT_SUCCESS
+    capsys.readouterr()
+
+    assert run_cli("run", "--env", f"={SECRET}", WS, *ECHO) == EXIT_USER_ERROR
+    captured = capsys.readouterr()
+    assert SECRET not in captured.err
+    assert SECRET not in captured.out
+    assert "no name" in captured.err
+
+
 def test_env_refuses_a_name_that_is_not_a_name() -> None:
     with pytest.raises(CliError) as refused:
         parse_environment(["9lives"], None)

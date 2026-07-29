@@ -377,6 +377,14 @@ STAGING_REAPER = "reap_staging"
 #: renderer that would silently drop the tail.
 MAX_RENDERED_INPUTS = 10
 
+#: ``O_NOFOLLOW`` where the platform has it, and 0 where it does not — the same
+#: spelling :func:`headspace.core.inputs.expand_input` uses to measure a file,
+#: so the measuring open and the streaming open ask the kernel for the same
+#: thing. Degrading to 0 rather than failing is deliberate: on a platform
+#: without the flag this is defense in depth that is simply unavailable, and the
+#: digest re-verification downstream is the guarantee that never went away.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
 #: How many job outcomes a workspace keeps. Each is already bounded by the
 #: policy's output budget, but a long-lived session is otherwise unbounded in
 #: count. Dropped outcomes are counted and surfaced as a warning: compression
@@ -2652,9 +2660,20 @@ def _open_input(entry: InputEntry) -> BinaryIO:
     host changed underneath the copy — an environment fact, exit 2 — and it has
     to arrive as a :class:`CliError` so the copy-in's caller closes its intent on
     the way out rather than unwinding as an unhandled ``OSError``.
+
+    Opened ``O_NOFOLLOW``, matching how
+    :func:`headspace.core.inputs.expand_input` measured it. The two opens have to
+    agree: measuring with no-follow and then streaming through a plain open would
+    leave a window where the path becomes a symlink between the digest and the
+    read, and the bytes that travel would not be the bytes that were hashed. The
+    digest is re-verified downstream, so a swap is *caught* rather than
+    published — but "caught" is the wrong place to rely on when refusing to
+    follow the link costs one flag, and a refusal names the real problem instead
+    of surfacing as a digest mismatch that blames the transfer.
     """
     try:
-        return entry.source.open("rb")
+        # Not `Path.open()`: it has no way to ask for O_NOFOLLOW.
+        return os.fdopen(os.open(entry.source, os.O_RDONLY | _O_NOFOLLOW), "rb")
     except OSError as err:
         raise CliError(
             code=EXIT_ENV_ERROR,

@@ -58,6 +58,7 @@ from headspace.cli._errors import (
     CliError,
 )
 from headspace.core.artifacts import ByteSource
+from headspace.core.inputs import expand_input
 from headspace.core.policy import Policy, ResourceBudget
 from headspace.core.states import State
 from headspace.core.store import HOME_ENV_VAR, Store
@@ -74,6 +75,7 @@ from headspace.core.workspace import (
     STAGING_REAPER,
     ArtifactDeclaration,
     Orchestrator,
+    _open_input,
 )
 from headspace.providers.base import ProviderError
 from headspace.providers.fake import FakeProvider, JobPlan
@@ -948,3 +950,29 @@ def test_a_recovered_copy_in_is_reported_once_not_on_every_call(
 
     assert any(WS in item for item in first.attention)
     assert not second.attention
+
+
+def test_a_source_swapped_for_a_symlink_after_measurement_is_refused(tmp_path: Path) -> None:
+    """The streaming open refuses to follow a link the measuring open would not have.
+
+    ``expand_input`` measures with ``O_NOFOLLOW``; ``_copy_in`` streams the same
+    file a moment later. If those two opens disagree, a path swapped to a symlink
+    in between would be hashed as one file and read as another. The digest check
+    downstream would catch the mismatch, but it would blame the transfer for
+    something the host did — so the read refuses at the source instead.
+    """
+    payload = tmp_path / "payload.txt"
+    payload.write_bytes(b"the bytes that were measured\n")
+    elsewhere = tmp_path / "elsewhere.txt"
+    elsewhere.write_bytes(b"not the bytes that were measured\n")
+
+    manifest = expand_input(payload, "payload.txt")
+    entry = manifest.entries[0]
+
+    # The swap: same path, now a link to a different file.
+    payload.unlink()
+    payload.symlink_to(elsewhere)
+
+    with pytest.raises(CliError) as caught:
+        _open_input(entry)
+    assert caught.value.code == EXIT_ENV_ERROR

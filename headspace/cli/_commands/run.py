@@ -224,11 +224,18 @@ def _require_env_name(raw: str) -> str:
     """Refuse anything that is not a bare variable name — a value most of all."""
     name = raw.strip()
     if ASSIGNMENT_SEPARATOR in name:
+        # Only ever the part before the '=', and never the raw token as a
+        # fallback. `--env =SECRET` has an empty name, and echoing `raw` to say
+        # something useful about it would put the value into the very message
+        # whose remediation promises the value is not repeated — the flag's own
+        # purpose, defeated by its error path. An unnamable token is described,
+        # not quoted.
         named = name.partition(ASSIGNMENT_SEPARATOR)[0].strip()
+        subject = repr(named) if named else "a token with no name before the '='"
         raise CliError(
             code=EXIT_USER_ERROR,
             message=(
-                f"--env takes the name of a variable, and {named or raw!r} was given a value "
+                f"--env takes the name of a variable, and {subject} was given a value "
                 "on the command line"
             ),
             remediation=(
