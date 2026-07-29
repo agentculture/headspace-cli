@@ -264,6 +264,59 @@ first: when headspace stopped the job deliberately, that outranks the kernel's
 budget, so a container that is *both* timed out and ``OOMKilled`` is still
 reported ``timeout`` — a case a test pins directly rather than leaving to
 branch order.
+
+A secret channel that is not ``argv`` and not a label (issue #13)
+-------------------------------------------------------------------
+``run``'s ``env`` keyword exists because the two channels a job already had
+were both confessions. ``argv`` is recorded verbatim in every surface that
+renders a command and is readable off a live process's own
+``/proc/<pid>/cmdline`` — a job's command line was never a private place. A
+label is worse: this module's own identity scheme depends on labels being
+readable by anyone who can run ``docker inspect`` (see "Why labels, and never
+handles" above), so a value put there is deliberately public, the opposite of
+what a caller reaching for ``env`` wants.
+
+So ``env`` crosses exactly one boundary: the job container's own
+``environment=`` creation kwarg, built in :meth:`run` and nowhere else in this
+module. It is not folded into :meth:`_sealed_kwargs`, the one builder shared by
+every container this provider makes (see "Closed by default, and closed at the
+engine" above), because that sharing is precisely what must *not* happen here —
+:meth:`create`'s anchor container is long-lived and outlives every job a
+workspace ever runs, and an env value baked into it would leak a secret handed
+to one job into every job that workspace runs afterward, forever, with no
+caller having asked for that. Threading ``env`` through ``run`` alone, instead,
+makes the job container — already the shortest-lived object this provider
+creates (see "Jobs get their own containers" above) — the only place the
+secret is ever readable, for exactly as long as that job runs.
+
+Ending a job without becoming a second state writer (issue #13)
+-------------------------------------------------------------------
+:meth:`run` is synchronous, blocking, and holds the workspace's flock for a
+job's entire duration — which is what makes it the store's single writer for
+that workspace, for as long as the job runs. An operator ending a runaway job
+cannot go through ``run`` to do it, because that call is already in progress
+and will not return until the job it is watching does. ``stop`` is therefore a
+second, narrower verb, engine-side only: it looks the job container up by
+label (the same :data:`LABEL_WORKSPACE_ID` / :data:`LABEL_ROLE` pair every
+other verb here uses), signals it, and returns. It never opens
+``headspace.core.store``, never takes the workspace lock, and never writes a
+byte under the store root — a ``stop`` that did any of those would be racing
+the ``run`` call it exists to interrupt, which is exactly the corruption the
+store's per-workspace lock exists to prevent. The still-blocked ``run`` call
+discovers the ending on its own — :meth:`_await_exit` is already polling the
+same engine object with ``reload()`` — and journals the outcome itself, so the
+store keeps exactly one writer even while two verbs act on the same workspace
+at once.
+
+Graceful before forceful, and only if it has to be: :meth:`stop` sends
+``SIGTERM`` (``container.stop(timeout=...)``) and gives the job
+:data:`STOP_GRACE_SECONDS` to end itself before escalating to ``SIGKILL``
+(``container.kill()``) — the same "ask nicely, then force it" shape
+:meth:`_await_exit` already gives a job that outran its wall-clock budget. A
+workspace with nothing running is not an error: a caller racing a job that
+happened to finish on its own between its decision and this call landing is
+the ordinary case, not a mistake, so it is reported as a fact — no job id,
+nothing stopped — rather than raised.
 """
 
 from __future__ import annotations
@@ -278,9 +331,10 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
+from types import MappingProxyType
 from typing import IO, Any
 
 import docker
@@ -389,6 +443,17 @@ IDLE_COMMAND: tuple[str, ...] = ("/bin/sh", "-c", "while :; do sleep 86400; done
 #: reports as ``failed`` rather than papering over as ``ready``.
 LIVE_STATUSES: frozenset[str] = frozenset({"created", "running", "restarting", "paused"})
 
+#: The default for ``run(..., env=...)``: a real empty mapping, never a bare
+#: ``{}`` default value. Created once at import time and made immutable
+#: (:class:`~types.MappingProxyType`), so a caller that never mentions ``env``
+#: can never be made to share a mutable default with every other such caller —
+#: the same mutable-default hazard every keyword default in this codebase is
+#: built to avoid structurally rather than by convention. See
+#: :meth:`DockerProvider.run` for where it lands and where it deliberately
+#: never does; ``headspace.providers.fake.EMPTY_ENV`` closes the identical gap
+#: on the other backend, the same way, for the same reason.
+EMPTY_ENV: Mapping[str, str] = MappingProxyType({})
+
 # --- capture bounds ---------------------------------------------------------
 
 #: The log file is the engine's spill buffer while headspace reads the live
@@ -419,6 +484,13 @@ STATS_INTERVAL_SECONDS = 0.5
 KILL_GRACE_SECONDS = 30.0
 #: How long the capture reader is given to drain after the job settles.
 CAPTURE_GRACE_SECONDS = 10.0
+#: How long :meth:`DockerProvider.stop` gives a job to end itself after
+#: ``SIGTERM`` before escalating to ``SIGKILL``. Ten seconds is the engine's
+#: own ``docker stop`` default, chosen deliberately rather than reused by
+#: accident: a job's cleanup handlers get the grace period every other tool
+#: already trained an operator to expect, not a headspace-specific surprise
+#: in either direction.
+STOP_GRACE_SECONDS = 10
 
 #: Characters an engine object name may carry. Everything else is folded to
 #: ``-`` so a job id chosen upstream can never make a name the engine rejects.
@@ -1580,8 +1652,46 @@ class DockerProvider:
         policy: EffectivePolicy,
         *,
         job_id: str,
+        env: Mapping[str, str] = EMPTY_ENV,
     ) -> JobOutcome:
-        """Execute one command in its own container, bounded at capture."""
+        """Execute one command in its own container, bounded at capture.
+
+        ``env`` (issue #13) is the job process's declared environment, and it
+        crosses this seam into exactly one place: the ``environment=`` keyword
+        of *this* container's own creation call, passed separately from
+        :meth:`_sealed_kwargs` rather than folded into it. That separation is
+        deliberate, not incidental — ``_sealed_kwargs`` is the one builder
+        shared by every container this provider makes, including the anchor
+        :meth:`create` starts and leaves running for the workspace's whole
+        life, and a value threaded through it would land on that anchor too. A
+        secret handed to one job has no business outliving that job, let alone
+        becoming visible to every later job the same workspace happens to run
+        — so ``env`` is accepted here, in the one verb whose container is
+        already the shortest-lived object this provider creates, and nowhere
+        else in this module accepts it at all.
+
+        Two surfaces ``env`` must never reach, because this module already
+        treats both as public: the container's ``labels`` — readable by
+        anyone who can run ``docker inspect``, and already the channel this
+        provider uses for everything it means to be discoverable (see the
+        module docstring, "Why labels, and never handles") — and ``command``,
+        which is recorded verbatim wherever a job's argv is rendered and is
+        readable off a live process's own ``/proc/<pid>/cmdline``. Neither the
+        label dict nor ``argv`` below is built from ``env`` or with knowledge
+        that it exists; a value placed in ``env`` cannot leak into either
+        without this method's own code changing to put it there.
+
+        Defaults to :data:`EMPTY_ENV`, a real empty mapping created once at
+        import time, rather than an unset keyword — so a caller that never
+        mentions ``env`` and a caller that explicitly passes ``{}`` reach the
+        engine identically: the job's own image environment and nothing
+        headspace added. That is what "closed by default" has to mean for a
+        channel whose entire purpose is controlling what a job process can
+        read, the same way
+        :attr:`~headspace.providers.base.WorkspaceDescriptor.network_enabled`
+        defaults closed rather than trusting every caller to ask for isolation
+        explicitly.
+        """
         workspace_id = require_workspace_id(workspace_id)
         argv = require_command(command)
         wall_budget = float(requested_limit(policy, "wall_clock"))
@@ -1601,6 +1711,10 @@ class DockerProvider:
                     LABEL_JOB_ID: job_id,
                     LABEL_CREATED_AT: utc_now(),
                 },
+                # The job's own environment, and only the job's — see the
+                # docstring above for why this is not part of
+                # `_sealed_kwargs` and never reaches the anchor container.
+                environment=dict(env),
                 **self._sealed_kwargs(
                     policy,
                     # A job may never open a door the workspace kept shut: the
@@ -2059,6 +2173,99 @@ class DockerProvider:
             anchor.exec_run(
                 [WRITE_SHELL, "-c", DISCARD_STAGING_SCRIPT, SCRIPT_ARGV0, landing.staging]
             )
+
+    # --- stopping a job -----------------------------------------------------
+
+    def stop(self, workspace_id: str) -> dict[str, Any]:
+        """End whatever job is running in a workspace, right now — and nothing else.
+
+        Boundary contract, and the one that matters most: this method never
+        opens ``headspace.core.store``. :meth:`run` is synchronous and
+        blocking, and holds the workspace's flock for a job's *entire*
+        duration — which is what makes it the single writer of that
+        workspace's stored state for as long as the job runs. An operator
+        ending a runaway job cannot go through ``run`` to do it, because that
+        call is already in progress and will not return until the job it is
+        watching does. So ``stop`` reaches the engine directly, on its own
+        connection (:meth:`_engine`), and touches nothing under
+        ``~/.headspace``: no store is constructed, no lock is taken, no record
+        is written — a ``stop`` that did any of those would be racing the
+        ``run`` call it exists to interrupt, exactly the corruption the
+        store's per-workspace lock exists to prevent. The still-blocked
+        ``run`` call discovers the ending on its own next poll of the very
+        engine object this method just signalled (:meth:`_await_exit` already
+        calls ``reload()`` on it every iteration) and journals the outcome
+        itself: one verb ends the job, the other narrates it, and the store
+        keeps exactly one writer even while both act on the same workspace at
+        once.
+
+        Found by label, like everything else this provider looks up
+        (:data:`LABEL_ROLE` = :data:`ROLE_JOB`, scoped by
+        :data:`LABEL_WORKSPACE_ID`), never by a handle this call was given —
+        there is no handle to be given. The process calling ``stop`` is not
+        the process that called ``run``, and a daemonless CLI keeps no
+        in-memory table connecting the two; the label is the only thing that
+        survives between them. :meth:`_find` returns the first match, which in
+        the steady state is the only one there is: a workspace holds at most
+        one live job container at a time, because ``run`` blocks for that
+        container's whole life and reaps it in a ``finally`` the moment it
+        settles (see :meth:`run`). A job container this call finds but that is
+        not in :data:`LIVE_STATUSES` is therefore stale reap residue, not a
+        live job, and is treated exactly like there being none at all.
+
+        Graceful first, forceful only if that fails: ``container.stop()``
+        sends ``SIGTERM`` and waits :data:`STOP_GRACE_SECONDS` for the job to
+        end itself; only a job still alive after that grace period is
+        escalated to ``container.kill()`` (``SIGKILL``). A job that catches
+        the polite signal and exits inside its own window is never killed at
+        all — the same "ask nicely before you force it" shape
+        :meth:`_await_exit` already gives a job that outran its wall-clock
+        budget instead of jumping straight to a kill.
+
+        Reports honestly rather than raising for the ordinary race: a
+        workspace with no live job container — because nothing was ever
+        started, because the last job already finished, or because it
+        finished in the instant between an operator's decision and this call
+        landing — is not a mistake, so it comes back as
+        ``{"job_id": None, "stopped": False}`` instead of a
+        :class:`~headspace.providers.base.CliError`. That is deliberately the
+        same fact/failure split the seam-level ``StopOutcome`` draws on
+        ``fi/t1`` (not yet merged onto this branch's ``base.py`` — see below):
+        a caller racing a job that just finished on its own gets a true
+        statement back, not an error it has to parse to learn the race was
+        harmless.
+
+        Returns a plain mapping shaped exactly like that dataclass's
+        ``to_dict()`` — ``workspace_id``, ``job_id``, ``stopped`` — rather
+        than the dataclass itself, because this branch's
+        ``headspace.providers.base`` does not define ``StopOutcome`` yet. The
+        shape is pinned to match it anyway, so wiring this into the real type
+        once it lands is a mechanical ``StopOutcome(**result)``, not a
+        redesign.
+
+        Raises :class:`~headspace.providers.base.CliError` (exit 1) for a
+        workspace id this backend holds no anchor container for at all — the
+        same "unknown workspace" refusal every other verb here raises via
+        :func:`~headspace.providers.base.unknown_workspace`. Raises
+        :class:`ProviderError` (exit 7) when the engine breaks while reaching
+        or signalling the job, exactly as every other verb in this module
+        does.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        with self._engine(f"stopping the job running in workspace {workspace_id}") as client:
+            self._require(client, workspace_id)
+
+            job = self._find(client, workspace_id, ROLE_JOB)
+            if job is None or not self._container_is_live(job):
+                return {"workspace_id": workspace_id, "job_id": None, "stopped": False}
+
+            job_id = job.labels.get(LABEL_JOB_ID)
+            job.stop(timeout=STOP_GRACE_SECONDS)
+            job.reload()
+            if self._container_is_live(job):
+                job.kill()
+
+        return {"workspace_id": workspace_id, "job_id": job_id, "stopped": True}
 
     def remove(self, workspace_id: str) -> RemovalDisposition:
         """Tear the workspace down and report what actually went away.
