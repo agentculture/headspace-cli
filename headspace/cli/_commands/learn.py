@@ -40,8 +40,18 @@ Lifecycle commands
 ------------------
   headspace create [--profile NAME] [--workspace-id ID] [--network POSTURE]
                                    Create a workspace under a declared policy.
+  headspace put <workspace> <host-path> <destination> [--overwrite]
+                                   Copy a host file or directory in. Refuses an
+                                   existing destination without --overwrite.
   headspace run <workspace> <cmd>...
                                    Run a job; flags go BEFORE the workspace id.
+                                   --input NAME=HOST_PATH copies a payload in
+                                   first; --env NAME and --env-file PATH hand
+                                   the job values that never enter argv. Only
+                                   names, paths and digests are recorded.
+  headspace stop <workspace> [--apply]
+                                   End an in-flight job. Previews by default —
+                                   without --apply nothing is signalled.
   headspace inspect <handle> [--logs]
                                    Status, or the full captured output.
   headspace export <workspace> <name> --to PATH

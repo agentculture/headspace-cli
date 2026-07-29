@@ -71,7 +71,9 @@ def _build_parser() -> argparse.ArgumentParser:
     from headspace.cli._commands import inspect as _inspect_cmd
     from headspace.cli._commands import learn as _learn_cmd
     from headspace.cli._commands import overview as _overview_cmd
+    from headspace.cli._commands import put as _put_cmd
     from headspace.cli._commands import run as _run_cmd
+    from headspace.cli._commands import stop as _stop_cmd
     from headspace.cli._commands import whoami as _whoami_cmd
 
     parser = _CliArgumentParser(
@@ -99,8 +101,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _cli_group.register(sub)
     _create_cmd.register(sub)
     _run_cmd.register(sub)
+    _stop_cmd.register(sub)
     _inspect_cmd.register(sub)
     _export_cmd.register(sub)
+    _put_cmd.register(sub)
     _destroy_cmd.register(sub)
     # Register your own noun groups here:
     #   from headspace.cli._commands import my_noun as _my_noun_group

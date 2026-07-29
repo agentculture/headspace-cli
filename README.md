@@ -30,7 +30,7 @@ deserves to re-enter the model's context.
 
 ## What's in this repository
 
-- **The CLI** (`headspace` on `PATH` once installed) — five lifecycle verbs
+- **The CLI** (`headspace` on `PATH` once installed) — seven lifecycle verbs
   that create and use a workspace, plus six introspection verbs that
   describe this agent and its CLI surface. Every verb supports `--json`; every lifecycle verb
   supports `--provider {docker,fake}`. See [CLI](#cli) below.
@@ -39,15 +39,17 @@ deserves to re-enter the model's context.
   effective view (`policy.py`), CLI-owned state under `~/.headspace` with
   fail-closed schema versioning and per-workspace locking (`store.py`),
   digest-pinned runtime profiles (`profiles.py`), atomic digest-verified
-  artifact export (`artifacts.py`), the compact context-return result package
-  (`result.py`), and orchestration with an intent journal and crash
-  reconciliation (`workspace.py`).
-- **`headspace/providers/`** — a six-verb `Provider` protocol
-  (`capabilities`, `create`, `run`, `inspect`, `read`, `remove`), and two
-  implementations that both pass the same conformance suite: an in-memory
-  `fake` (no engine required — what makes the whole test suite runnable with
-  nothing installed) and a real `docker` provider. `docker>=7.1,<8` is the
-  package's one runtime dependency.
+  artifact export (`artifacts.py`), the mirror-image host-to-workspace
+  copy-in that measures a digest before any provider is touched
+  (`inputs.py`), the compact context-return result package (`result.py`),
+  and orchestration with an intent journal and crash reconciliation
+  (`workspace.py`).
+- **`headspace/providers/`** — an eight-verb `Provider` protocol
+  (`capabilities`, `create`, `run`, `inspect`, `read`, `write`, `stop`,
+  `remove`), and two implementations that both pass the same conformance
+  suite: an in-memory `fake` (no engine required — what makes the whole test
+  suite runnable with nothing installed) and a real `docker` provider.
+  `docker>=7.1,<8` is the package's one runtime dependency.
 - **A mesh identity** — `culture.yaml` (`suffix` + `backend`) and the
   matching resident prompt file (`AGENTS.colleague.md`, since this agent runs
   `backend: colleague`).
@@ -71,17 +73,75 @@ uv run teken cli doctor . --strict    # the agent-first rubric gate CI runs
 
 ### Lifecycle verbs
 
-The five verbs that create and use a workspace. Each returns the same
+The seven verbs that create and use a workspace. Each returns the same
 nine-section result package and takes its process exit code from that
 package's status (see [Exit codes](#exit-codes)).
 
 | Verb | What it does |
 |------|--------------|
 | `create` | Provision an ephemeral workspace under a declared policy; the only verb that mints a workspace id. |
-| `run <workspace> <command> ...` | Execute one command in an existing workspace. Flags for `run` go *before* the workspace id — everything after it belongs to the command. |
+| `put <workspace> <host-path> <destination>` | Copy a host file or directory into a workspace, recording its destination, size and sha256 — never its bytes. Refuses an existing destination unless `--overwrite`. |
+| `run <workspace> <command> ...` | Execute one command in an existing workspace. Flags for `run` go *before* the workspace id — everything after it belongs to the command. `--input`, `--env` and `--env-file` get files and secrets into the job without argv (see [below](#getting-files-and-secrets-into-a-job)). |
+| `stop <workspace>` | End a workspace's in-flight job. **Previews by default** — reports what is running and changes nothing; `--apply` ends it, and the `stop` invocation's own result reads `cancelled`. |
 | `inspect <handle>` | Report a workspace's lifecycle state, the engine's view of it, and what the session has cost. `--logs` returns captured output in full and unbounded. |
 | `export <workspace> <name> --to <path>` | Publish a *declared* artifact to a durable host path, digest-verified, by atomic rename. |
 | `destroy <workspace>` | Remove a workspace — or refuse, and remove nothing, when declared artifacts were never exported (`--force` to discard them deliberately). |
+
+### Getting files and secrets into a job
+
+Two consumer-filed gaps, closed the same way: a way to get something *in*
+without smuggling it through argv, which is recorded verbatim in four
+places — `outcome_summary`, `provenance.inputs`, `journal.jsonl` and
+`state.json`.
+
+**Files** ([#14](https://github.com/agentculture/headspace-cli/issues/14)).
+`headspace put <workspace> <host-path> <destination> [--overwrite]` copies a
+host file or directory into a workspace, recording the destination, size and
+sha256 — never the bytes. `run --input NAME=HOST_PATH` (repeatable; `NAME` is
+the workspace-relative destination, `HOST_PATH` may be a file or a whole
+directory) drives the identical copy-in before the job starts — there is one
+implementation of getting bytes into a workspace, not two that agree until
+they don't. `--input` deliberately has no overwrite affordance: replacing an
+existing destination is a deliberate act that belongs to `put`, not something
+a job launch does implicitly.
+
+**Secrets** ([#13](https://github.com/agentculture/headspace-cli/issues/13)).
+`run --env NAME` (repeatable) reads the named variable out of the caller's
+own environment — the value never enters argv, so it never reaches any of the
+four recording surfaces above — and refuses an unset name rather than
+forwarding an empty string, and `--env NAME=VALUE` outright (a value typed
+into the flag is exactly the leak it exists to close). `run --env-file PATH`
+(repeatable) reads `NAME=VALUE` lines from a host file: blank lines and `#`
+comments are skipped, every other line must be an assignment with no quote
+stripping and no `export` prefix, and a malformed line is refused by naming
+the file and the 1-based line number — never by quoting the line back, since
+that line is exactly the kind that might hold a secret.
+
+**The recording guarantee, stated with its edge.** Across `put` and both
+`run` flags: names, paths and digests are recorded; values and file contents
+never are. That guarantee covers what headspace itself *composes* into the
+result package, the journal and `state.json` — it does not cover a *job*
+that prints its own environment. A job that runs `env`, `printenv`, or hits a
+traceback that dumps `os.environ` writes the value into its own captured
+output, and captured output is kept, in the job's record in `state.json` and
+rendered as evidence. That is the job's doing, not headspace's, and no
+recording discipline on this side can unsee it — `run --help` says so where
+the flags live, and it is worth repeating here: a guarantee that overclaims
+is worse than one that states its edge.
+
+There is a second edge, in the engine rather than in headspace. A forwarded
+value reaches the job the only way a process environment can be set, so while
+the job container exists the value is readable from the container's own
+configuration — `docker inspect` on that container shows it under
+`Config.Env`. Measured, not assumed. Two bounds hold and are tested: the value
+reaches neither the container's command nor its labels, and the job container
+is removed as soon as the job settles, so the exposure lasts the job and not
+the workspace. But the honest statement is that **`--env` keeps a secret out
+of headspace's durable records, not out of the reach of whoever can already
+talk to your Docker daemon** — and anyone who can do that could read the
+value out of a running process anyway. Choose `--env` because it beats argv,
+which is recorded forever in four places; not because it hides a value from
+the machine the job runs on.
 
 ### Introspection verbs
 
@@ -238,7 +298,7 @@ The MVP Docker provider also supports no host-path mounts at all, so
 | `2` | environment_error | a local setup/tooling problem. |
 | `3` | policy_denied | the declared policy could not be satisfied — refused before anything ran. |
 | `4` | timeout | a wall-clock or budget ceiling was hit. |
-| `5` | cancelled | the caller asked for it to stop. |
+| `5` | cancelled | the caller asked for it to stop — `headspace stop <workspace> --apply` ended a job in flight, and the `stop` invocation's own result reads `cancelled`. On the `docker` provider the *job's* separately recorded outcome doesn't yet follow: it still reads `failure`/`6`, a known gap tracked as [#16](https://github.com/agentculture/headspace-cli/issues/16). |
 | `6` | computation_failed | the job ran correctly and produced a failing result. |
 | `7` | infrastructure_failure | the engine or environment broke — not a computational failure. |
 | `8` | resource_exhausted | the job was killed for exceeding its declared memory ceiling. |

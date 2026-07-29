@@ -27,7 +27,11 @@ _ARTIFACTS = [
 
 _LIFECYCLE_VERBS = [
     "create — create a workspace under a declared policy",
-    "run <workspace> <command> — run a job inside a workspace",
+    "put <workspace> <host-path> <destination> [--overwrite] — copy a file or "
+    "directory in; refuses an existing destination without --overwrite",
+    "run <workspace> <command> — run a job inside a workspace; --input NAME=PATH "
+    "copies in first, --env NAME / --env-file PATH pass values argv never sees",
+    "stop <workspace> [--apply] — end an in-flight job; previews by default",
     "inspect <handle> [--logs] — status, or the full captured output",
     "export <workspace> <name> --to PATH — publish an artifact, digest-verified",
     "destroy <workspace> [--force] — tear down; refuses unexported artifacts",

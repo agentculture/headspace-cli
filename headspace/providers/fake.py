@@ -44,12 +44,15 @@ test asserts that mechanically by inspecting this module's imports.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from headspace.cli._errors import EXIT_USER_ERROR, CliError
+from headspace.core.artifacts import ByteSource
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import (
     STATUS_FAILURE,
@@ -67,6 +70,7 @@ from headspace.providers.base import (
     OpaqueRef,
     ProviderError,
     RemovalDisposition,
+    StopOutcome,
     WorkspaceDescriptor,
     environment_digest,
     guard_removable,
@@ -132,6 +136,17 @@ DEFAULT_CAPABILITIES = CapabilitySnapshot(
     storage_enforceable=False,
 )
 
+#: The default for ``run(..., env=...)``: an empty mapping, never a mutable
+#: ``{}`` literal. A dataclass or keyword default is created exactly once, at
+#: import time, and shared by every call that omits the argument — a mutable
+#: default would let one caller's incidental mutation of "no env" leak into
+#: every other caller's "no env" for the rest of the process. Wrapping the
+#: empty dict in :class:`~types.MappingProxyType` makes that structurally
+#: impossible rather than merely a convention nobody violates yet, which is
+#: the same closed-by-default posture the rest of this seam takes with
+#: network and filesystem access.
+EMPTY_ENV: Mapping[str, str] = MappingProxyType({})
+
 
 @dataclass(frozen=True)
 class JobPlan:
@@ -180,6 +195,11 @@ class JobPlan:
     command_refused: bool = False
     during: Callable[[], None] | None = None
     writes: Mapping[str, bytes] = field(default_factory=dict)
+    #: When True, the job is considered stoppable: ``stop()`` can end it.
+    #: The flag exists so a test can script a job that is in flight and
+    #: therefore stoppable, without having to rely on a real engine's
+    #: asynchronous lifecycle.
+    stoppable: bool = False
 
     @classmethod
     def succeeding(cls, output: str = "", **overrides: Any) -> JobPlan:
@@ -263,6 +283,22 @@ class _Workspace:
     storage_bytes: int = 0
     active_jobs: int = 0
     files: dict[str, bytes] = field(default_factory=dict)
+    #: The env mapping the last job ran with. Recorded so a test can assert
+    #: what the job would have seen, without the fake leaking env into any
+    #: other recorded field.
+    last_job_env: Mapping[str, str] = field(default_factory=dict)
+    #: Whether a stoppable job is currently in flight for this workspace.
+    #: Set by ``run()`` when the plan is stoppable, cleared by ``stop()``.
+    #: Deliberately *not* leading-underscore: a dataclass field name becomes
+    #: the matching ``__init__`` keyword, and an underscore-prefixed keyword
+    #: is an awkward, easy-to-typo constructor argument for no real payoff —
+    #: ``_Workspace`` is already private at the class level, so the fields
+    #: inside it do not need to re-assert that individually.
+    job_in_flight: bool = False
+    #: The id of the job ``run()`` last started. ``stop()`` echoes it back so a
+    #: caller stopping several workspaces can tell which outcome belongs to
+    #: which job — the same fact the Docker backend reads off a container label.
+    last_job_id: str | None = None
 
 
 class FakeProvider:
@@ -372,7 +408,24 @@ class FakeProvider:
         policy: EffectivePolicy,
         *,
         job_id: str,
+        env: Mapping[str, str] = EMPTY_ENV,
     ) -> JobOutcome:
+        """Run one scripted command, and record the ``env`` it observed.
+
+        ``env`` defaults to :data:`EMPTY_ENV` rather than an unset default:
+        a caller that never sets an environment variable and a caller that
+        explicitly passes ``{}`` must be indistinguishable to the provider,
+        because that is what "no env" means at the seam. What the job
+        actually saw is recorded onto ``record.last_job_env`` — nowhere
+        else — so a test can assert on it without the env leaking into any
+        field that a real backend could not populate the same way (output,
+        usage, and so on are not places an environment variable belongs).
+
+        A plan whose :attr:`JobPlan.stoppable` is set marks the workspace
+        as having a job in flight for the duration of the call, which is
+        what makes :meth:`stop` meaningful to call from inside
+        :attr:`JobPlan.during`.
+        """
         record = self._require(require_workspace_id(workspace_id))
         argv = require_command(command)
         self._fail_if_broken("run")
@@ -380,11 +433,18 @@ class FakeProvider:
         if plan.infrastructure_failure:
             raise ProviderError(plan.infrastructure_failure)
 
+        # Record the env the job observed. This is the only place env touches
+        # the workspace record: it must not leak into any other field.
+        record.last_job_env = env
+
         wall_budget = float(requested_limit(policy, "wall_clock"))
         output_budget = int(requested_limit(policy, "output_bytes"))
         started_at = utc_now()
 
         record.active_jobs += 1
+        record.last_job_id = job_id
+        if plan.stoppable:
+            record.job_in_flight = True
         try:
             if plan.during is not None:
                 plan.during()
@@ -461,6 +521,111 @@ class FakeProvider:
         del self._workspaces[workspace_id]
         return RemovalDisposition(workspace_id=workspace_id, removed=REMOVABLE_RESOURCES)
 
+    def write(
+        self,
+        workspace_id: str,
+        path: str,
+        source: ByteSource,
+        *,
+        expected_sha256: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Copy inbound bytes into the workspace's storage — the inverse of :meth:`read`.
+
+        A caller pushes bytes in so a later ``read`` (or a later job) can find
+        them at ``path``. This is the real seam verb the conformance suite
+        holds every backend to; ``write_file`` is a same-module shortcut for
+        tests whose subject is something *other* than the write itself, and
+        this method does not delegate to it — the two must be able to fail in
+        different, independently-testable ways.
+
+        Refusal order is deliberate, and the two refusals check different
+        things for a reason. An occupied destination is checked *first*,
+        before a single byte of ``source`` is touched: it is a fact about the
+        workspace's own state that owes nothing to what the caller is trying
+        to send, and it is cheap — a dict membership test — where consuming
+        ``source`` is not. ``source`` may be a one-shot stream (a generator,
+        a socket) that cannot be replayed; draining it just to discover the
+        write was going to be refused anyway would be worse than refusing
+        first and never touching it. The digest, by contrast, genuinely
+        depends on the bytes, so it can only be checked once they have been
+        consumed — and it is checked before anything is stored, so a
+        mismatch (corruption in transit, or a caller's stale digest) never
+        pollutes the workspace with the bad bytes.
+
+        The digest follows this codebase's one convention for a sha256 value:
+        a bare 64-character lowercase hex digest, with no algorithm prefix —
+        see ``headspace.core.artifacts._normalise_digest`` and
+        :attr:`~headspace.core.artifacts.ArtifactRecord.sha256`. That is a
+        different value than :func:`~headspace.providers.base.environment_digest`'s
+        ``sha256:``-prefixed form: that one is a content-addressed image
+        reference, this one is a plain content digest, and the two must not
+        be confused by sharing a format.
+
+        Every chunk pulled from ``source`` is buffered into a list and joined
+        once the source is exhausted. That is an honest simplification for a
+        backend whose storage is a Python dict living entirely in this
+        process's memory — it is not a claim to bounded-memory streaming the
+        way :func:`headspace.core.artifacts.export_artifact` genuinely is,
+        where a multi-gigabyte artifact must never sit whole in memory. The
+        source is still consumed in ``source``-sized (or ``.read()``-sized)
+        pieces rather than all at once, because that is the part of the
+        contract that matters for conformance: a backend must not require the
+        whole payload to already exist as one object before it can begin.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        relative = require_workspace_path(path)
+        record = self._require(workspace_id)
+
+        # Cheap and content-independent: refused before touching `source`.
+        if not overwrite and relative in record.files:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"destination {relative!r} already exists",
+                remediation="pass overwrite=True to replace the existing file",
+            )
+
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        for chunk in _iter_source(source):
+            digest.update(chunk)
+            chunks.append(chunk)
+        actual = digest.hexdigest()
+        if actual != expected_sha256:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=f"digest mismatch: expected {expected_sha256}, got {actual}",
+                remediation="check the source bytes and the digest you supplied",
+            )
+
+        record.files[relative] = b"".join(chunks)
+
+    def stop(self, workspace_id: str) -> StopOutcome:
+        """End an in-flight job on ``workspace_id``, and state what was found.
+
+        A workspace holding no in-flight job is **not** an error here, and that
+        is a deliberate correction: an operator racing a job that finished on
+        its own a moment earlier made no mistake, and raising at them would
+        turn the ordinary case into a failure they have to handle. So the
+        empty case is reported as a fact — ``job_id`` is ``None``, ``stopped``
+        is ``False`` — exactly as :class:`~headspace.providers.base.StopOutcome`
+        describes, and exactly as the Docker backend reports it. An unknown
+        workspace is still refused: that one really is the caller naming
+        something that does not exist.
+
+        The fake tracks in-flight jobs through :attr:`_Workspace.job_in_flight`,
+        which is set by :meth:`run` when the plan is stoppable. There is
+        nothing here for a real process to signal, so ending the job is just
+        clearing that flag — the same event a live engine reports through a
+        very different mechanism (signalling, then killing, a container).
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        record = self._require(workspace_id)
+        if not record.job_in_flight:
+            return StopOutcome(workspace_id=workspace_id, job_id=None, stopped=False)
+        record.job_in_flight = False
+        return StopOutcome(workspace_id=workspace_id, job_id=record.last_job_id, stopped=True)
+
     # --- internals --------------------------------------------------------
 
     def _require(self, workspace_id: str) -> _Workspace:
@@ -505,6 +670,52 @@ def _chunked(content: bytes, chunk_size: int) -> Iterator[bytes]:
     """
     for start in range(0, len(content), chunk_size):
         yield content[start : start + chunk_size]
+
+
+def _iter_source(source: ByteSource) -> Iterator[bytes]:
+    """Yield ``source`` as a sequence of byte chunks, whichever shape it arrived in.
+
+    Two shapes are accepted, and a third is refused on purpose. Anything with a
+    callable ``.read()`` is read in bounded pieces, exactly as
+    :func:`headspace.core.artifacts._iter_chunks` reads a file object — the
+    ``.read()`` branch is checked before the plain-iterable branch for the
+    same reason it is there: iterating a binary file object yields *lines*,
+    which is not what a caller pushing bytes into a workspace means. Anything
+    else — a generator, a list of chunks — is iterated directly.
+
+    A bare ``bytes`` (or ``bytearray``) is **refused**, and the refusal is the
+    whole point rather than a missing convenience. It satisfies ``Iterable``
+    structurally while iterating to ``int``, so it is not a ``ByteSource`` in
+    anything but shape — which is exactly why
+    :func:`headspace.core.artifacts._reject_non_bytes` refuses it on the
+    outbound path and why the Docker backend refuses it inbound. This fake
+    briefly accepted it, and a conformance test caught the divergence: a call
+    that worked here would have failed against a real engine, which is the one
+    failure mode a fake exists to prevent. Being *more permissive* than the
+    backend it stands in for is worse than being wrong in the same direction,
+    because it turns the test suite into a source of false confidence.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=(
+                f"a bare {type(source).__name__} is not a byte source: iterating it yields "
+                "int, one per byte"
+            ),
+            remediation=(
+                "wrap the payload in io.BytesIO(...), or pass a list of byte chunks — the "
+                "same shapes the Docker backend and export_artifact accept"
+            ),
+        )
+    read = getattr(source, "read", None)
+    if callable(read):
+        while True:
+            chunk = read(DEFAULT_READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            yield chunk
+    else:
+        yield from source
 
 
 def _capture(plan: JobPlan, budget: int) -> tuple[str, int, bool]:

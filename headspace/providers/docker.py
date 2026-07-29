@@ -133,6 +133,84 @@ user error, and the symlink refusal is load-bearing rather than fastidious: a
 job can plant a link to a path outside the workspace volume, and the archive
 endpoint resolves link targets within the container's filesystem quite happily.
 
+Getting a file back in
+----------------------
+The write verb is the inbound counterpart, and it is deliberately **not** the
+read verb run backwards. The difference is that the engine's archive endpoint
+offers no commit point in this direction: ``put_archive`` extracts a tar
+wherever it is pointed and answers ``True``, and there is no moment at which
+the daemon says "these bytes are now that file, and they are the bytes you
+sent". Everything below exists to build that moment out of pieces the engine
+does provide.
+
+So a write is three steps against the **workspace container**, and the bytes
+never touch the caller's own destination until the last one:
+
+1. **prepare** (:data:`PREPARE_STAGING_SCRIPT`) — an exec that checks the image
+   really carries the tools the verification needs
+   (:data:`REQUIRED_WRITE_TOOLS`) and creates a fresh, headspace-owned staging
+   directory under :data:`STAGING_DIR_NAME` inside the volume. The tool check
+   comes first because the alternative is worse than a refusal: a distroless
+   image would otherwise fail somewhere in the middle of a copy, and a caller
+   would be told the engine broke when the truth is that the profile it chose
+   has no ``sha256sum``. The reserved staging prefix is itself resolved and
+   bounded rather than trusted — reserving a name does not stop a job creating
+   it as a link out of the volume, and a prepare step that trusted its own
+   reservation would make streaming bytes *outside* the volume the very first
+   thing a copy-in did.
+2. **transfer** — one tar with exactly one member, streamed into that staging
+   directory and never at the caller's destination. Pointing the transfer at
+   the destination directly would publish unverified bytes under the name the
+   caller will read back, which is the failure this whole shape avoids. It is
+   also why the staging directory lives *inside the volume*: the final rename
+   is atomic only within one filesystem, and the container's own writable layer
+   is a different one.
+3. **finalize** (:data:`FINALIZE_WRITE_SCRIPT`) — an exec that re-hashes the
+   staged file with ``sha256sum``, resolves the destination's parent with
+   ``realpath`` and refuses anything landing outside the volume root, refuses
+   an existing destination unless the caller asked for a replacement, and only
+   then renames within the volume.
+
+The in-container re-hash is the load-bearing step, not a belt on top of the
+host's braces. The host already hashed what it *sent*; only the container can
+hash what is *there*. Between the archive landing and the rename, a job
+container shares the same volume and is not a headspace verb, so no lock
+excludes it from rewriting the staged file — and a host-side digest would then
+certify bytes that were swapped after they were hashed. The parent resolution
+is the write-path twin of the read verb's symlink refusal, and it exists for
+the same reason stated the other way round: engine-side path resolution follows
+links, so a job that plants ``results -> /etc`` turns a copy-in into a write
+through it. ``realpath`` inside the container is what notices; nothing in the
+archive endpoint would.
+
+The one failure a copy-in cannot tidy up after is the one where it does not
+survive: a process killed between the transfer and the rename leaves a staging
+directory whose nonce died with it, and ``write``'s signature hands no staging
+token to an orchestrator that might have kept one. That is what makes the
+staging prefix *reserved* rather than merely conventional —
+:meth:`DockerProvider.reap_staging` can clear the whole of it precisely because
+nothing but headspace is entitled to put anything there. Reconciliation cannot
+name the residue; it can only ask the backend to clear its own prefix, and get
+back the list of what actually went.
+
+Two things this verb needs that ``read`` does not, and one it refuses to want:
+
+* **A live runtime.** ``read`` must work on a workspace whose container has
+  exited, because that is the case it exists for. Copy-in has no equivalent
+  salvage case — it feeds a job that has not run yet — and it cannot verify
+  anything without an exec, so a stopped anchor is refused honestly rather than
+  worked around. Recorded live (Docker 29.1.3 / API 1.52, 2026-07-29): a
+  ``put_archive`` against a *stopped* container succeeds. The refusal is
+  therefore about verification, not about transport, and the message says so.
+* **A shell and five tools in the image.** Named in the refusal along with the
+  profile that lacks them, because "your engine broke" would send an agent to
+  restart a daemon over a choice of base image.
+* **No helper container.** A short-lived container mounting the same volume
+  would make staging trivial and would be a second engine object to reap on
+  every failure path — and copy-in has *more* failure paths than read, not
+  fewer. "Nothing was created" is a stronger guarantee than any reaper, and a
+  test asserts the engine's object count does not move.
+
 Measured, not assumed
 ---------------------
 :meth:`DockerProvider.capabilities` interrogates the engine — version, API
@@ -186,20 +264,77 @@ first: when headspace stopped the job deliberately, that outranks the kernel's
 budget, so a container that is *both* timed out and ``OOMKilled`` is still
 reported ``timeout`` — a case a test pins directly rather than leaving to
 branch order.
+
+A secret channel that is not ``argv`` and not a label (issue #13)
+-------------------------------------------------------------------
+``run``'s ``env`` keyword exists because the two channels a job already had
+were both confessions. ``argv`` is recorded verbatim in every surface that
+renders a command and is readable off a live process's own
+``/proc/<pid>/cmdline`` — a job's command line was never a private place. A
+label is worse: this module's own identity scheme depends on labels being
+readable by anyone who can run ``docker inspect`` (see "Why labels, and never
+handles" above), so a value put there is deliberately public, the opposite of
+what a caller reaching for ``env`` wants.
+
+So ``env`` crosses exactly one boundary: the job container's own
+``environment=`` creation kwarg, built in :meth:`run` and nowhere else in this
+module. It is not folded into :meth:`_sealed_kwargs`, the one builder shared by
+every container this provider makes (see "Closed by default, and closed at the
+engine" above), because that sharing is precisely what must *not* happen here —
+:meth:`create`'s anchor container is long-lived and outlives every job a
+workspace ever runs, and an env value baked into it would leak a secret handed
+to one job into every job that workspace runs afterward, forever, with no
+caller having asked for that. Threading ``env`` through ``run`` alone, instead,
+makes the job container — already the shortest-lived object this provider
+creates (see "Jobs get their own containers" above) — the only place the
+secret is ever readable, for exactly as long as that job runs.
+
+Ending a job without becoming a second state writer (issue #13)
+-------------------------------------------------------------------
+:meth:`run` is synchronous, blocking, and holds the workspace's flock for a
+job's entire duration — which is what makes it the store's single writer for
+that workspace, for as long as the job runs. An operator ending a runaway job
+cannot go through ``run`` to do it, because that call is already in progress
+and will not return until the job it is watching does. ``stop`` is therefore a
+second, narrower verb, engine-side only: it looks the job container up by
+label (the same :data:`LABEL_WORKSPACE_ID` / :data:`LABEL_ROLE` pair every
+other verb here uses), signals it, and returns. It never opens
+``headspace.core.store``, never takes the workspace lock, and never writes a
+byte under the store root — a ``stop`` that did any of those would be racing
+the ``run`` call it exists to interrupt, which is exactly the corruption the
+store's per-workspace lock exists to prevent. The still-blocked ``run`` call
+discovers the ending on its own — :meth:`_await_exit` is already polling the
+same engine object with ``reload()`` — and journals the outcome itself, so the
+store keeps exactly one writer even while two verbs act on the same workspace
+at once.
+
+Graceful before forceful, and only if it has to be: :meth:`stop` sends
+``SIGTERM`` (``container.stop(timeout=...)``) and gives the job
+:data:`STOP_GRACE_SECONDS` to end itself before escalating to ``SIGKILL``
+(``container.kill()``) — the same "ask nicely, then force it" shape
+:meth:`_await_exit` already gives a job that outran its wall-clock budget. A
+workspace with nothing running is not an error: a caller racing a job that
+happened to finish on its own between its decision and this call landing is
+the ordinary case, not a mistake, so it is reported as a fact — no job id,
+nothing stopped — rather than raised.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
+import posixpath
 import re
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
+from types import MappingProxyType
 from typing import IO, Any
 
 import docker
@@ -207,7 +342,9 @@ from docker.errors import APIError, DockerException, ImageNotFound, NotFound
 from docker.models.containers import Container
 from docker.types import LogConfig, Mount
 
-from headspace.cli._errors import EXIT_USER_ERROR, CliError
+from headspace.cli._errors import EXIT_ENV_ERROR, EXIT_USER_ERROR, CliError
+from headspace.core import profiles
+from headspace.core.artifacts import ByteSource
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import (
     STATUS_FAILURE,
@@ -226,6 +363,7 @@ from headspace.providers.base import (
     OpaqueRef,
     ProviderError,
     RemovalDisposition,
+    StopOutcome,
     WorkspaceDescriptor,
     environment_digest,
     guard_removable,
@@ -306,6 +444,17 @@ IDLE_COMMAND: tuple[str, ...] = ("/bin/sh", "-c", "while :; do sleep 86400; done
 #: reports as ``failed`` rather than papering over as ``ready``.
 LIVE_STATUSES: frozenset[str] = frozenset({"created", "running", "restarting", "paused"})
 
+#: The default for ``run(..., env=...)``: a real empty mapping, never a bare
+#: ``{}`` default value. Created once at import time and made immutable
+#: (:class:`~types.MappingProxyType`), so a caller that never mentions ``env``
+#: can never be made to share a mutable default with every other such caller —
+#: the same mutable-default hazard every keyword default in this codebase is
+#: built to avoid structurally rather than by convention. See
+#: :meth:`DockerProvider.run` for where it lands and where it deliberately
+#: never does; ``headspace.providers.fake.EMPTY_ENV`` closes the identical gap
+#: on the other backend, the same way, for the same reason.
+EMPTY_ENV: Mapping[str, str] = MappingProxyType({})
+
 # --- capture bounds ---------------------------------------------------------
 
 #: The log file is the engine's spill buffer while headspace reads the live
@@ -336,6 +485,13 @@ STATS_INTERVAL_SECONDS = 0.5
 KILL_GRACE_SECONDS = 30.0
 #: How long the capture reader is given to drain after the job settles.
 CAPTURE_GRACE_SECONDS = 10.0
+#: How long :meth:`DockerProvider.stop` gives a job to end itself after
+#: ``SIGTERM`` before escalating to ``SIGKILL``. Ten seconds is the engine's
+#: own ``docker stop`` default, chosen deliberately rather than reused by
+#: accident: a job's cleanup handlers get the grace period every other tool
+#: already trained an operator to expect, not a headspace-specific surprise
+#: in either direction.
+STOP_GRACE_SECONDS = 10
 
 #: Characters an engine object name may carry. Everything else is folded to
 #: ``-`` so a job id chosen upstream can never make a name the engine rejects.
@@ -479,6 +635,734 @@ def redact_engine_text(text: str, handle: str = "") -> str:
         for token in (handle, handle[:_SHORT_HANDLE_CHARS]):
             cleaned = cleaned.replace(token, REDACTED)
     return cleaned.strip()
+
+
+# --- copying a file in: stage, verify, then rename --------------------------
+#
+# The whole shape, and why it is this shape rather than the obvious one, is in
+# the module docstring under "Getting a file back in". What lives here is the
+# vocabulary the two scripts and the provider have to agree on, in one place so
+# they cannot drift apart: the paths, the tools, and the exit statuses that
+# carry a refusal back out of the container.
+
+#: The reserved directory every copy-in stages through, relative to
+#: :data:`WORKSPACE_MOUNT_PATH`. Dot-prefixed and namespaced so a human reading
+#: the volume can tell headspace's scratch space from a job's, and *inside the
+#: volume* rather than in the container's own ``/tmp`` — which is what makes
+#: the final rename atomic, since a rename is only atomic within one
+#: filesystem and the container's writable layer is a different one.
+STAGING_DIR_NAME = ".headspace-staging"
+
+#: The name the transfer archive's single member carries inside the staging
+#: directory. Fixed rather than derived from the caller's path, so nothing
+#: inspecting the staging area can mistake an unverified copy for the artifact
+#: it is about to become — the destination's name only ever exists once the
+#: bytes under it have been verified.
+STAGED_FILE_NAME = "payload"
+
+#: The mode the staged member carries. World-readable on purpose: the finalize
+#: exec runs as whatever user the image declares, and a mode only ``root``
+#: could read would make a non-root profile fail for a reason that has nothing
+#: to do with the bytes.
+STAGED_FILE_MODE = 0o644
+
+#: What :data:`FINALIZE_WRITE_SCRIPT` needs the image to provide. Passed *into*
+#: the prepare script as arguments rather than repeated inside it, so the
+#: preflight and the step it is protecting cannot drift apart. ``rm`` earns its
+#: place with the others: the cleanup path is the one that runs after something
+#: has already gone wrong, and a cleanup that fails then leaves residue in the
+#: caller's own volume.
+REQUIRED_WRITE_TOOLS: tuple[str, ...] = ("mkdir", "mv", "realpath", "rm", "sha256sum")
+
+#: The shell both scripts run under — the same interpreter :data:`IDLE_COMMAND`
+#: already requires of the image, so a workspace that could be created can
+#: always be written to.
+WRITE_SHELL = "/bin/sh"
+
+#: ``$0`` for both scripts. Every value the scripts touch — the caller's path,
+#: the digest, the staging paths — is passed as an *argument* rather than
+#: interpolated into the script text. That is not tidiness: ``require_workspace_path``
+#: bounds a path's shape but says nothing about quotes or ``$``, and a script
+#: built by interpolation would let a destination name spell a command.
+SCRIPT_ARGV0 = "headspace-write"
+
+#: How the scripts hand one piece of evidence back: a single line whose tail is
+#: the detail belonging to the exit status beside it — the missing tool, the
+#: digest that was actually found, the path something resolved to. Everything
+#: else the script prints is the shell's own noise and is treated as such.
+SCRIPT_DETAIL_MARKER = "headspace-write:"
+
+#: The statuses the scripts exit with to name a condition the provider must
+#: classify rather than report as a broken engine. Chosen above 10 and below
+#: 126 so they cannot collide with the shell's own conventions — ``1`` and ``2``
+#: for its usage errors, ``126``/``127`` for a command it could not run, and
+#: ``128+n`` for a signal. Anything the provider does not recognise here is an
+#: engine failure with the script's output kept as evidence, which is the
+#: fail-safe direction: a condition invented later cannot quietly become a
+#: successful write.
+WRITE_MISSING_TOOL = 11
+WRITE_STAGING_UNUSABLE = 12
+WRITE_DIGEST_MISMATCH = 13
+WRITE_ESCAPES_VOLUME = 14
+WRITE_DESTINATION_EXISTS = 15
+WRITE_DESTINATION_IS_DIRECTORY = 16
+WRITE_STAGED_FILE_MISSING = 17
+#: The staged path is a symlink rather than the regular file the transfer put
+#: there. Checked before anything reads it, because ``[ -f ]`` and ``sha256sum``
+#: both *follow* a link: a job sharing the volume can race the window between
+#: the transfer and this exec, replace the staged file with a link to a path it
+#: controls, and have the digest certify the link's target. Every later check
+#: would then pass and ``mv`` would rename the link itself into the caller's
+#: destination — a file inside the workspace resolving outside the volume,
+#: whose bytes the job can still rewrite after the copy-in reported success.
+#: The digest is what makes this fatal rather than untidy: it would be a true
+#: statement about bytes nobody can rely on afterwards.
+#:
+#: Tested twice, and the second test is the honest part. The first, before the
+#: hash, defeats the reliable attack: swap the file, let the digest certify the
+#: link's target, walk away. The second, immediately before the rename, narrows
+#: what is left — a job would have to land the swap inside the gap between that
+#: test and ``mv``, with no way to observe when the gap opens. **It is narrowed,
+#: not closed**: POSIX offers no "rename only if this is not a symlink", the
+#: same shape of admission :data:`FINALIZE_WRITE_SCRIPT` already makes about
+#: resolving the destination's parent. What stays guaranteed is that a link
+#: sitting there at either checkpoint is refused and nothing is renamed.
+WRITE_STAGED_PATH_IS_A_LINK = 18
+
+#: How large a bite is taken out of the caller's source at a time.
+WRITE_CHUNK_BYTES = 1 << 20
+
+#: The engine's own marker for "the exec's binary is not in this image".
+#: Probed against Docker 29.1.3 / API 1.52 (2026-07-29), and the probe recorded
+#: something worth stating plainly: an exec whose binary is missing does **not**
+#: raise. It comes back as a perfectly ordinary :class:`ExecResult` carrying
+#: exit 127 and the OCI diagnostic as its *output*. A provider that only caught
+#: :class:`APIError` would therefore read a distroless image's answer as the
+#: script failing on its own account and report a broken engine — so the output
+#: is inspected for this marker, and only alongside 126/127, which keeps the
+#: match narrow enough that a script printing the phrase itself cannot trip it.
+EXEC_START_MARKER = "unable to start container process: exec:"
+
+#: The engine's own wording for an exec against a container that has stopped,
+#: recorded from the same probe: a 409 whose explanation reads ``container
+#: <64 hex> is not running``. Matched so the liveness race — the anchor stopping
+#: between the check and the exec — reaches the caller as the same honest
+#: condition the check itself produces, rather than as a raw engine error
+#: carrying a container id.
+NOT_RUNNING_MARKER = "is not running"
+
+#: What a refusal says when the shell could not resolve the path it was asked
+#: about. ``realpath`` failing is not the same as resolving somewhere outside
+#: the volume, but both end the same way — nothing is renamed — and the caller
+#: is owed a phrase that does not pretend to know more than the script did.
+UNRESOLVABLE_PATH = "somewhere unresolvable"
+
+#: The one container status a copy-in accepts. Deliberately narrower than
+#: :data:`LIVE_STATUSES`: ``created`` and ``paused`` both mean the runtime
+#: object exists, and neither can execute the verification this verb depends
+#: on. A status that cannot run an exec is a stopped anchor as far as this verb
+#: is concerned, whatever the lifecycle view makes of it.
+RUNNING_STATUS = "running"
+
+#: Create the staging directory, having first proved the image can finish the
+#: job. ``$1`` volume root, ``$2`` staging root, ``$3`` this write's staging
+#: directory, ``$4...`` the tools :data:`REQUIRED_WRITE_TOOLS` names.
+#:
+#: The staging root is resolved before it is used rather than after: a job
+#: sharing the volume can create ``.headspace-staging`` as a link out of it, and
+#: ``mkdir -p`` through such a link would put headspace's scratch space —
+#: and then the caller's bytes — outside the volume before anything checked.
+#: The per-write directory below it is a plain ``mkdir`` on a fresh nonce, so a
+#: name that somehow already exists is an error rather than a directory shared
+#: with something else.
+PREPARE_STAGING_SCRIPT = """
+set -eu
+root=$1
+staging_root=$2
+staging=$3
+shift 3
+for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "headspace-write: $tool"; exit 11; }
+done
+if [ -e "$staging_root" ] || [ -L "$staging_root" ]; then
+    resolved=$(realpath "$staging_root" 2>/dev/null || true)
+    case "$resolved" in
+        "$root"/*) ;;
+        *) echo "headspace-write: ${resolved:-unresolvable}"; exit 12 ;;
+    esac
+    [ -d "$staging_root" ] || { echo "headspace-write: not a directory"; exit 12; }
+else
+    mkdir "$staging_root"
+fi
+mkdir "$staging"
+"""
+
+#: Verify the staged bytes, bound the destination, then commit with a rename.
+#: ``$1`` volume root, ``$2`` staging directory, ``$3`` staged file, ``$4``
+#: destination's parent, ``$5`` destination, ``$6`` expected digest, ``$7``
+#: ``1`` to replace an existing destination.
+#:
+#: Three parts, in the order that makes each one meaningful:
+#:
+#: * the re-hash, before anything is looked at, because bytes that are not the
+#:   caller's bytes make every later question moot;
+#: * the boundary. The *deepest existing* ancestor of the destination's parent
+#:   is resolved first, so a planted link is caught before ``mkdir -p`` can
+#:   create anything through it; the parent is resolved again afterwards, which
+#:   narrows the window in which a link could be planted between the two. It
+#:   does not close it — no POSIX shell can — and what stays guaranteed is the
+#:   part that matters: the rename below never runs unless the destination's
+#:   parent was inside the volume when it was last looked at, so a lost race
+#:   costs an empty directory and never a byte of the caller's payload;
+#: * the destination itself. A real directory is refused outright, because a
+#:   rename cannot atomically replace one with a file and ``mv`` would move the
+#:   payload *into* it instead — doing something adjacent to what was asked. A
+#:   link is not followed: ``mv`` renames over the link itself, so a job that
+#:   pointed one outside the volume cannot turn a copy-in into a write through
+#:   it.
+#:
+#: The trap is the cleanup, and it is an ``EXIT`` trap rather than a line at the
+#: end so that every refusal above tidies up as thoroughly as a success does.
+FINALIZE_WRITE_SCRIPT = """
+set -eu
+root=$1
+staging=$2
+staged=$3
+parent=$4
+dest=$5
+expected=$6
+overwrite=$7
+trap 'rm -rf "$staging" 2>/dev/null || true' EXIT
+[ ! -L "$staged" ] || { echo "headspace-write: $staged"; exit 18; }
+[ -f "$staged" ] || { echo "headspace-write: $staged"; exit 17; }
+actual=$(sha256sum "$staged")
+actual=${actual%% *}
+[ "$actual" = "$expected" ] || { echo "headspace-write: $actual"; exit 13; }
+probe=$parent
+while [ ! -d "$probe" ]; do
+    next=${probe%/*}
+    [ -n "$next" ] || next=/
+    [ "$next" != "$probe" ] || break
+    probe=$next
+done
+resolved=$(realpath "$probe" 2>/dev/null || true)
+case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *) echo "headspace-write: ${resolved:-unresolvable}"; exit 14 ;;
+esac
+mkdir -p "$parent"
+resolved=$(realpath "$parent" 2>/dev/null || true)
+case "$resolved" in
+    "$root"|"$root"/*) ;;
+    *) echo "headspace-write: ${resolved:-unresolvable}"; exit 14 ;;
+esac
+if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+    echo "headspace-write: $dest"; exit 16
+fi
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+    [ "$overwrite" = 1 ] || { echo "headspace-write: $dest"; exit 15; }
+fi
+[ ! -L "$staged" ] || { echo "headspace-write: $staged"; exit 18; }
+mv -f "$staged" "$dest"
+"""
+
+#: Remove one write's staging directory. Run only when the finalize step did
+#: not run to completion — when it did, its own ``EXIT`` trap has already done
+#: this — so the volume is left as it was found whether the write failed before
+#: the payload was framed, during the transfer, or in the exec itself.
+DISCARD_STAGING_SCRIPT = """
+set -eu
+rm -rf "$1"
+"""
+
+#: What :data:`REAP_STAGING_SCRIPT` needs the image to provide — a strict subset
+#: of :data:`REQUIRED_WRITE_TOOLS`, and deliberately its own tuple rather than a
+#: reuse of it. Reaping only has to resolve a path and delete one, so an image
+#: that has lost the ability to *write* (no ``sha256sum``, say) can still be
+#: cleaned up. Requiring the wider set here would refuse to reap exactly the
+#: workspaces most likely to be holding residue.
+REQUIRED_REAP_TOOLS: tuple[str, ...] = ("realpath", "rm")
+
+#: Clear everything under the reserved staging prefix, and name what actually
+#: went. ``$1`` volume root, ``$2`` staging root, ``$3...`` the tools
+#: :data:`REQUIRED_REAP_TOOLS` names.
+#:
+#: A copy-in killed between the transfer and the rename leaves a staging
+#: directory nobody holds a handle to any more: the nonce lived in the process
+#: that died, and :meth:`DockerProvider.write`'s signature carries no staging
+#: token an orchestrator could keep. So reconciliation cannot name the residue —
+#: it can only ask the backend to clear its own reserved prefix, which is what
+#: makes that prefix reserved in the first place.
+#:
+#: Two properties are worth stating because they are the ones a reconciler
+#: reports on. Each entry is removed and then *checked gone* before it is named,
+#: the same discipline :meth:`DockerProvider.remove` keeps for a teardown — a
+#: cleanup report whose claims were never verified is the one report nobody can
+#: afford to be optimistic in. And an empty prefix, or no prefix at all, exits
+#: ``0`` having said nothing: there being no residue is the ordinary case, not a
+#: failure, and it must not read as one.
+REAP_STAGING_SCRIPT = """
+set -eu
+root=$1
+staging_root=$2
+shift 2
+for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "headspace-write: $tool"; exit 11; }
+done
+[ -d "$staging_root" ] || exit 0
+resolved=$(realpath "$staging_root" 2>/dev/null || true)
+case "$resolved" in
+    "$root"/*) ;;
+    *) echo "headspace-write: ${resolved:-unresolvable}"; exit 12 ;;
+esac
+for entry in "$staging_root"/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    rm -rf "$entry" 2>/dev/null || true
+    [ -e "$entry" ] || [ -L "$entry" ] || echo "headspace-write: $entry"
+done
+"""
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+_DIGEST_LENGTH = 64
+
+
+def _script_details(output: str) -> tuple[str, ...]:
+    """Every evidence line a staging script emitted, in the order it emitted them.
+
+    Read out of the output rather than off a second channel because an exec has
+    one: ``demux=False`` interleaves stdout and stderr exactly as ``run`` does
+    for a job. The marker is what separates the script's deliberate sentences
+    from the shell's own noise around them, and requiring it at the *start* of a
+    line is what stops a path that happens to contain the marker from inventing
+    an extra one.
+
+    A tuple rather than a single line because the two shapes of script genuinely
+    differ: prepare and finalize name one condition, while the reaper names
+    every piece of residue it removed. Collapsing that to "the first one" would
+    have made a reconciler's count quietly wrong rather than loudly broken.
+    """
+    details = []
+    for line in output.splitlines():
+        marker, separator, detail = line.partition(SCRIPT_DETAIL_MARKER)
+        if separator and not marker.strip():
+            details.append(detail.strip())
+    return tuple(details)
+
+
+def _first_detail(details: Sequence[str]) -> str:
+    """The one condition a single-answer script reported, or ``""``."""
+    return details[0] if details else ""
+
+
+def _exec_binary_missing(status: int, output: str) -> str | None:
+    """The binary an exec could not start, or ``None`` for anything else.
+
+    Narrow in both directions on purpose (see :data:`EXEC_START_MARKER`): the
+    status has to be one of the shell's two "cannot run that" numbers *and* the
+    output has to carry the engine's own marker, so a script that merely prints
+    the phrase cannot be mistaken for one that never started. ``None`` means
+    "not ours", and the caller then treats the status as the script's own —
+    which is the fail-safe direction, since it can only ever move cases *into*
+    the ordinary classification and never quietly out of it.
+    """
+    if status not in (EXIT_COMMAND_NOT_FOUND, EXIT_COMMAND_NOT_EXECUTABLE):
+        return None
+    if EXEC_START_MARKER not in output:
+        return None
+    detail = output.partition(EXEC_START_MARKER)[2].lstrip()
+    if not detail.startswith('"'):
+        return WRITE_SHELL
+    return detail[1:].partition('"')[0] or WRITE_SHELL
+
+
+def _describe_environment(environment: str) -> str:
+    """Name the environment the way a caller chose it, when it can.
+
+    A workspace records the digest-pinned reference it was built from, not the
+    profile name the caller typed — but a refusal that says only
+    ``python:3.12-slim@sha256:57cd…`` asks a reader to work out which of their
+    own choices produced it. The registry is a plain dict and the lookup is
+    pure, so naming the profile costs nothing and the reference is kept beside
+    it: the profile is what the caller can change, the reference is what was
+    actually run.
+    """
+    for profile in profiles.REGISTRY.values():
+        if profile.image == environment:
+            return f"profile {profile.name} ({environment})"
+    return f"environment {environment}"
+
+
+def _require_expected_digest(value: str, relative: str) -> str:
+    """Refuse a digest that is not the shape ``sha256sum`` will be compared to.
+
+    Bare 64-character lowercase hex — the shape
+    :mod:`headspace.core.inputs` produces and the shape ``sha256sum`` prints.
+    Checked here rather than left to the comparison because the failure modes
+    are not equally honest: an ``sha256:``-prefixed or upper-cased digest would
+    compare unequal to what the container computed and be reported as a
+    *mismatch*, which is an infrastructure failure a caller is told to retry.
+    It would never succeed. Naming the shape up front keeps the mismatch
+    meaning only what it should mean — that the bytes changed.
+    """
+    digest = value.strip() if isinstance(value, str) else ""
+    if len(digest) != _DIGEST_LENGTH or not set(digest) <= _HEX_DIGITS:
+        raise CliError(
+            code=EXIT_USER_ERROR,
+            message=f"malformed sha256 for '{relative}': {value!r}",
+            remediation=(
+                f"pass the digest as {_DIGEST_LENGTH} lowercase hex characters with no "
+                "'sha256:' prefix — the form headspace.core.inputs computes and the form "
+                "the workspace re-computes it in"
+            ),
+        )
+    return digest
+
+
+def _anchor_not_running(workspace_id: str, status: str) -> ProviderError:
+    """A workspace container that exists but is not running: honest, and named.
+
+    Neither a caller mistake nor a generic crash, so neither exit 1 nor a
+    traceback. The remediation carries the asymmetry with ``read`` because a
+    caller that concludes "this workspace is finished" would throw away work it
+    can still have: a stopped workspace still hands its artifacts back, it just
+    cannot verify anything new arriving.
+    """
+    return ProviderError(
+        f"the workspace container for {workspace_id} is not running "
+        f"({status or 'the engine did not name its state'}), and a verified copy-in has to "
+        "hash and rename the bytes inside it",
+        remediation=(
+            f"run 'headspace inspect {workspace_id}' to see the runtime's state; a copy-in "
+            "needs the workspace container up, so create a fresh workspace and copy in "
+            "again — reading artifacts back out still works on a workspace whose runtime "
+            "has exited"
+        ),
+    )
+
+
+def _missing_write_tool(workspace_id: str, environment: str, tool: str) -> CliError:
+    """The image cannot finish a verified copy-in: a setup fact, stated once.
+
+    Exit 2 rather than 7 because the exit-code policy already has a slot that
+    says exactly this — "environment / setup error (tool not installed)" — and
+    because the two differ in what they tell an autonomous caller to do next.
+    Exit 7 says retry; retrying is precisely what will not help, since the image
+    will lack ``sha256sum`` just as thoroughly the second time.
+    """
+    return CliError(
+        code=EXIT_ENV_ERROR,
+        message=(
+            f"workspace {workspace_id} runs {_describe_environment(environment)}, which "
+            f"provides no '{tool}' — a copy-in cannot verify bytes it cannot hash, resolve "
+            "or rename"
+        ),
+        remediation=(
+            "a verified copy-in needs a POSIX shell and "
+            f"{', '.join(REQUIRED_WRITE_TOOLS)} inside the workspace image; create the "
+            "workspace from a profile whose image provides them, or have a job produce the "
+            "file instead of copying it in"
+        ),
+    )
+
+
+def _landed_digest_disagrees(
+    workspace_id: str, relative: str, expected: str, actual: str
+) -> ProviderError:
+    """The bytes in the volume are not the bytes the caller sent.
+
+    Reported as an infrastructure failure rather than a caller error, and the
+    reason is what was already ruled out: the host checked its own stream
+    against ``expected`` before anything was transferred, so a stale digest
+    cannot reach here. What is left is the transfer being corrupted or the
+    staged file being rewritten after it landed — neither of which the caller
+    did, and both of which a retry can genuinely resolve.
+    """
+    return ProviderError(
+        f"the bytes staged in workspace {workspace_id} for '{relative}' hash to "
+        f"{actual or 'nothing the image could compute'}, not the {expected} the caller "
+        "declared — nothing was renamed into place",
+        remediation=(
+            "nothing was written: either the transfer was corrupted, or something sharing "
+            "the workspace volume rewrote the staged bytes before they were verified — "
+            "retry the copy-in, and if it repeats, stop any job writing to the workspace "
+            "first"
+        ),
+    )
+
+
+def _staged_file_vanished(workspace_id: str, relative: str) -> ProviderError:
+    """The transfer reported success and the staged file was not there.
+
+    Named rather than left to the unexplained-failure fallback, because the
+    fallback's message would send a reader looking for a broken engine when the
+    engine did its job: ``put_archive`` returned, so the bytes were accepted,
+    and something inside the workspace removed them before they could be
+    verified. That is the same neighbour the digest mismatch and the symlink
+    swap have — a job sharing the volume — and a caller who sees all three
+    worded as one family can act on them as one.
+    """
+    return ProviderError(
+        f"the file staged in workspace {workspace_id} for '{relative}' was gone before it "
+        "could be verified — nothing was renamed into place",
+        remediation=(
+            "nothing was written: the transfer succeeded and something sharing the workspace "
+            "volume then removed the staged file. Stop any job running in the workspace, "
+            "then retry the copy-in"
+        ),
+    )
+
+
+def _staged_path_is_a_link(workspace_id: str, relative: str) -> ProviderError:
+    """The staged file became a symlink between the transfer and the check.
+
+    Nothing legitimate produces this. The transfer writes one regular file into
+    a directory this exec created a moment earlier under a name no caller
+    chooses, so a link standing there means something else sharing the volume
+    put it there — and the only thing it buys is the one thing the verification
+    exists to prevent. ``[ -f ]`` and ``sha256sum`` both follow a link, so a
+    link pointing at a job-controlled copy of the payload hashes to exactly the
+    digest the caller declared; every later check passes, and the rename moves
+    *the link* into the destination. The caller is then told a path holds bytes
+    with a verified digest, when it holds a pointer to bytes the job can
+    rewrite at will.
+
+    Infrastructure rather than caller error, for the same reason a digest
+    mismatch is: the caller's own stream was already checked host-side, so
+    nothing they passed can cause this. Something raced them inside their
+    workspace.
+    """
+    return ProviderError(
+        f"the file staged in workspace {workspace_id} for '{relative}' was replaced by a "
+        "symlink before it could be verified — nothing was renamed into place",
+        remediation=(
+            "nothing was written: something sharing the workspace volume swapped the staged "
+            "file for a link while the copy-in was in flight. Stop any job running in the "
+            "workspace, then retry the copy-in"
+        ),
+    )
+
+
+def _escapes_workspace_volume(workspace_id: str, relative: str, resolved: str) -> CliError:
+    """A destination whose parent is not in the volume, whatever it is named.
+
+    The same refusal class the read verb applies to a symlinked artifact, and
+    the same reason read gives for it: engine-side path resolution follows
+    links quite happily, so the only thing standing between a planted
+    ``results -> /etc`` and a copy-in writing through it is a check that looks
+    at where the path actually goes. A caller error rather than an engine one
+    because it is answerable — the destination can be renamed, or the link
+    removed by a job — while "the engine broke" is not.
+    """
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f"workspace {workspace_id} cannot receive '{relative}': its parent directory "
+            f"resolves to {resolved}, outside the workspace volume"
+        ),
+        remediation=(
+            "a copy-in never writes outside the workspace volume, and never follows a link "
+            "out of it — choose a destination whose directories are inside the workspace, "
+            "or have a job remove the link that leads out of it"
+        ),
+    )
+
+
+def _destination_exists(workspace_id: str, relative: str) -> CliError:
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=f"workspace {workspace_id} already holds something at '{relative}'",
+        remediation=(
+            "pass overwrite=True to replace it deliberately, or choose a destination the "
+            "workspace does not already hold — a copy-in never silently replaces work a "
+            "job produced but nothing has exported yet"
+        ),
+    )
+
+
+def _destination_is_a_directory(workspace_id: str, relative: str) -> CliError:
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=f"workspace {workspace_id} holds a directory at '{relative}', not a file",
+        remediation=(
+            "name the file itself; a copy-in commits with a rename, which cannot replace a "
+            "directory with a file — not even with overwrite"
+        ),
+    )
+
+
+def _staging_unusable(workspace_id: str, resolved: str) -> CliError:
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f"workspace {workspace_id} holds something at "
+            f"'{STAGING_DIR_NAME}' that resolves to {resolved}, so a copy-in has nowhere "
+            "inside the volume to stage through"
+        ),
+        remediation=(
+            f"'{STAGING_DIR_NAME}' at the workspace root is reserved for headspace's own "
+            "staging — have a job remove or rename whatever is there, then copy in again"
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _Landing:
+    """Every path one copy-in touches, derived once from the caller's own.
+
+    A structure rather than six arguments threaded through four methods,
+    because the relationships between these paths *are* the design: the staged
+    file is under the staging directory, the staging directory is under the
+    reserved root, the reserved root is under the same volume root the finalize
+    step bounds the destination against. Deriving them in one place is what
+    makes "the transfer never targets the destination" checkable by reading
+    rather than by tracing.
+    """
+
+    workspace_id: str
+    relative: str
+    root: str
+    staging_root: str
+    staging: str
+    staged: str
+    parent: str
+    destination: str
+    expected_sha256: str
+    overwrite: bool
+
+    @classmethod
+    def of(
+        cls, workspace_id: str, relative: str, expected_sha256: str, overwrite: bool
+    ) -> _Landing:
+        root = WORKSPACE_MOUNT_PATH
+        staging_root = f"{root}/{STAGING_DIR_NAME}"
+        # A fresh nonce per write, so two copy-ins racing each other stage into
+        # different directories and neither can see — or clean up — the other's
+        # bytes. The verbs do not share a lock; this is what makes them safe
+        # without one.
+        staging = f"{staging_root}/{uuid.uuid4().hex}"
+        destination = f"{root}/{relative}"
+        return cls(
+            workspace_id=workspace_id,
+            relative=relative,
+            root=root,
+            staging_root=staging_root,
+            staging=staging,
+            staged=f"{staging}/{STAGED_FILE_NAME}",
+            parent=posixpath.dirname(destination),
+            destination=destination,
+            expected_sha256=_require_expected_digest(expected_sha256, relative),
+            overwrite=bool(overwrite),
+        )
+
+    @property
+    def prepare_args(self) -> tuple[str, ...]:
+        return (self.root, self.staging_root, self.staging, *REQUIRED_WRITE_TOOLS)
+
+    @property
+    def finalize_args(self) -> tuple[str, ...]:
+        return (
+            self.root,
+            self.staging,
+            self.staged,
+            self.parent,
+            self.destination,
+            self.expected_sha256,
+            "1" if self.overwrite else "0",
+        )
+
+
+def _source_chunks(source: ByteSource, chunk_size: int) -> Iterator[bytes]:
+    """Yield ``source`` in chunks, lazily — a reader reads, anything else iterates.
+
+    The same two-shaped contract, and the same ordering, that
+    :mod:`headspace.core.artifacts` uses on the way out: the ``.read()`` branch
+    comes first because iterating a binary file yields *lines*, which split on
+    newlines that mean nothing in a payload and buffer arbitrarily much when
+    there are none. Restated here rather than imported because that module's
+    version is private to it, and a copy-in reading its source differently from
+    the way an export reads one would be a difference nobody meant.
+    """
+    read = getattr(source, "read", None)
+    if callable(read):
+        while True:
+            chunk = read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+    else:
+        yield from source  # type: ignore[misc]
+
+
+@contextmanager
+def _framed_payload(source: ByteSource, landing: _Landing) -> Iterator[IO[bytes]]:
+    """One tar, one member, measured on the host and ready to stream at the engine.
+
+    The engine's archive endpoint takes a tar, and a tar states a member's size
+    in a header that precedes its first content byte — while a
+    :data:`~headspace.core.artifacts.ByteSource` declares no size at all. So the
+    payload has to be measured before it can be framed, and it is written into a
+    host temporary file to do it. The header block is *reserved* rather than
+    buffered: a USTAR header is exactly one block, so the content is written
+    from offset :data:`tarfile.BLOCKSIZE` and the header is filled in with a
+    seek once the size is known. The payload is therefore copied exactly once
+    and never held in memory, however large it is — the alternative, a second
+    temporary file to prepend a header to, would cost a whole extra copy of it.
+
+    The digest computed on the way past is checked against the caller's before
+    anything is transferred. That check is not the verification this verb rests
+    on — the container's re-hash is, and it is the only one that can see what
+    actually landed — but answering the host-side question on the host is what
+    lets the container-side refusal mean the narrower thing it means: not "your
+    digest was stale" but "these bytes changed after they left".
+    """
+    with tempfile.TemporaryFile() as transfer:
+        transfer.seek(tarfile.BLOCKSIZE)
+        digest = hashlib.sha256()
+        size = 0
+        for chunk in _source_chunks(source, WRITE_CHUNK_BYTES):
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise CliError(
+                    code=EXIT_USER_ERROR,
+                    message=(
+                        f"the source for '{landing.relative}' yielded "
+                        f"{type(chunk).__name__}, expected bytes"
+                    ),
+                    remediation="stream the payload as bytes (open the source in binary mode)",
+                )
+            digest.update(chunk)
+            size += len(chunk)
+            transfer.write(chunk)
+
+        actual = digest.hexdigest()
+        if actual != landing.expected_sha256:
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message=(
+                    f"the source for '{landing.relative}' hashes to {actual}, not the "
+                    f"{landing.expected_sha256} declared for it"
+                ),
+                remediation=(
+                    "nothing was transferred; re-measure the source and pass the digest of "
+                    "the bytes this call will actually read"
+                ),
+            )
+
+        # End of archive: the member's own padding to a block boundary, the two
+        # zero blocks that terminate a tar, then padding out to a whole record.
+        # The record padding is what a conventional writer emits, and matching
+        # it keeps the transfer in the shape the engine was probed against
+        # rather than in a technically-legal one it has never been handed.
+        transfer.write(b"\0" * (-size % tarfile.BLOCKSIZE + 2 * tarfile.BLOCKSIZE))
+        transfer.write(b"\0" * (-transfer.tell() % tarfile.RECORDSIZE))
+
+        info = tarfile.TarInfo(STAGED_FILE_NAME)
+        info.size = size
+        info.mode = STAGED_FILE_MODE
+        info.mtime = int(time.time())
+        transfer.seek(0)
+        transfer.write(info.tobuf(tarfile.USTAR_FORMAT))
+        transfer.seek(0)
+        yield transfer
 
 
 @dataclass(frozen=True)
@@ -850,8 +1734,46 @@ class DockerProvider:
         policy: EffectivePolicy,
         *,
         job_id: str,
+        env: Mapping[str, str] = EMPTY_ENV,
     ) -> JobOutcome:
-        """Execute one command in its own container, bounded at capture."""
+        """Execute one command in its own container, bounded at capture.
+
+        ``env`` (issue #13) is the job process's declared environment, and it
+        crosses this seam into exactly one place: the ``environment=`` keyword
+        of *this* container's own creation call, passed separately from
+        :meth:`_sealed_kwargs` rather than folded into it. That separation is
+        deliberate, not incidental — ``_sealed_kwargs`` is the one builder
+        shared by every container this provider makes, including the anchor
+        :meth:`create` starts and leaves running for the workspace's whole
+        life, and a value threaded through it would land on that anchor too. A
+        secret handed to one job has no business outliving that job, let alone
+        becoming visible to every later job the same workspace happens to run
+        — so ``env`` is accepted here, in the one verb whose container is
+        already the shortest-lived object this provider creates, and nowhere
+        else in this module accepts it at all.
+
+        Two surfaces ``env`` must never reach, because this module already
+        treats both as public: the container's ``labels`` — readable by
+        anyone who can run ``docker inspect``, and already the channel this
+        provider uses for everything it means to be discoverable (see the
+        module docstring, "Why labels, and never handles") — and ``command``,
+        which is recorded verbatim wherever a job's argv is rendered and is
+        readable off a live process's own ``/proc/<pid>/cmdline``. Neither the
+        label dict nor ``argv`` below is built from ``env`` or with knowledge
+        that it exists; a value placed in ``env`` cannot leak into either
+        without this method's own code changing to put it there.
+
+        Defaults to :data:`EMPTY_ENV`, a real empty mapping created once at
+        import time, rather than an unset keyword — so a caller that never
+        mentions ``env`` and a caller that explicitly passes ``{}`` reach the
+        engine identically: the job's own image environment and nothing
+        headspace added. That is what "closed by default" has to mean for a
+        channel whose entire purpose is controlling what a job process can
+        read, the same way
+        :attr:`~headspace.providers.base.WorkspaceDescriptor.network_enabled`
+        defaults closed rather than trusting every caller to ask for isolation
+        explicitly.
+        """
         workspace_id = require_workspace_id(workspace_id)
         argv = require_command(command)
         wall_budget = float(requested_limit(policy, "wall_clock"))
@@ -871,6 +1793,10 @@ class DockerProvider:
                     LABEL_JOB_ID: job_id,
                     LABEL_CREATED_AT: utc_now(),
                 },
+                # The job's own environment, and only the job's — see the
+                # docstring above for why this is not part of
+                # `_sealed_kwargs` and never reaches the anchor container.
+                environment=dict(env),
                 **self._sealed_kwargs(
                     policy,
                     # A job may never open a door the workspace kept shut: the
@@ -1047,6 +1973,389 @@ class DockerProvider:
         if member is None:
             raise unreadable_workspace_path(workspace_id, relative, "special file")
         return member
+
+    def write(
+        self,
+        workspace_id: str,
+        path: str,
+        source: ByteSource,
+        *,
+        expected_sha256: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Land one file's bytes in a workspace, verified inside the workspace.
+
+        The inbound counterpart to :meth:`read`, and the module docstring's
+        "Getting a file back in" says why it is not that verb reversed. In
+        short: the archive endpoint has no commit point, so one is built here
+        out of a staging directory this provider created, a re-hash performed
+        by the container, and a rename within the volume's own filesystem. The
+        caller's destination does not exist until every one of those has
+        succeeded, which is the property that makes a failed copy-in leave the
+        workspace exactly as it found it.
+
+        Everything refusable without a socket is refused before one is opened —
+        the workspace id, the path (bounded by
+        :func:`~headspace.providers.base.require_workspace_path`, since the
+        engine would resolve ``..`` quite happily), and the digest's shape.
+        Then, in order: the anchor is required to be *running*, because a
+        stopped one cannot run the verification even though ``put_archive``
+        against it would succeed; the staging directory is created and the
+        image's tools are proved present; the payload is framed and streamed
+        into that directory and nowhere else; and the finalize exec verifies,
+        bounds and commits.
+
+        Cleanup is a ``finally``, not a trailing call — the same discipline
+        :meth:`run` uses to reap a job container. The finalize script removes
+        its own staging directory through an ``EXIT`` trap, so the provider's
+        own removal runs exactly when that script did not complete: a source
+        that died mid-stream, a transfer the engine refused, an exec that never
+        returned. Between them, every failure this call *survives* leaves the
+        volume as it found it. The one it cannot survive is being killed, and
+        that residue is not lost so much as unaddressed until something asks —
+        see :meth:`reap_staging`, which exists precisely because a ``finally``
+        cannot run in a process that is no longer there.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        relative = require_workspace_path(path)
+        landing = _Landing.of(workspace_id, relative, expected_sha256, overwrite)
+        action = f"writing '{relative}' into workspace {workspace_id}"
+
+        with self._engine(action) as client:
+            anchor = self._require(client, workspace_id)
+            environment = anchor.labels.get(LABEL_ENVIRONMENT) or anchor.attrs["Config"]["Image"]
+            self._require_running(anchor, workspace_id)
+
+            finalized = False
+            try:
+                self._prepare_staging(anchor, landing, environment)
+                with _framed_payload(source, landing) as transfer:
+                    anchor.put_archive(landing.staging, transfer)
+                status, details = self._staging_script(
+                    anchor,
+                    workspace_id,
+                    environment,
+                    FINALIZE_WRITE_SCRIPT,
+                    landing.finalize_args,
+                )
+                # The script's own trap has run by now, whatever it decided, so
+                # the staging directory is gone even on the refusals below.
+                finalized = True
+                self._classify_finalize(landing, status, _first_detail(details))
+            finally:
+                if not finalized:
+                    self._discard_staging(anchor, landing)
+
+    def reap_staging(self, workspace_id: str) -> Sequence[str]:
+        """Clear this backend's reserved staging prefix; name what actually went.
+
+        The reconciliation half of :meth:`write`. A copy-in killed between the
+        transfer and the rename leaves a staging directory nobody holds a handle
+        to any more — the nonce lived in the process that died, and ``write``'s
+        signature carries no staging token an orchestrator could have kept. So
+        nothing above the seam can *name* the residue; it can only ask the
+        backend to clear the prefix it reserved, which is the whole reason that
+        prefix is reserved rather than merely conventional.
+
+        Returns the workspace-relative path of every entry that is verified gone
+        — removed, then re-checked, the same discipline :meth:`remove` keeps for
+        a teardown, because a cleanup report whose claims were never checked is
+        exactly the report a reconciler must not be optimistic in. An entry that
+        would not delete is left out rather than counted, so a caller's tally is
+        of residue actually cleared and never of residue merely attempted.
+
+        An empty result is the ordinary answer, not a failure: a workspace that
+        was never mid-copy-in has nothing under the prefix, and a workspace that
+        has never had one written to it has no prefix at all. Neither raises.
+
+        Liveness is ``write``'s, for ``write``'s reason: the reap runs as an exec
+        and there is no way to delete a path inside a volume through the archive
+        endpoint, so a stopped anchor is refused honestly here too. That refusal
+        is a :class:`~headspace.providers.base.ProviderError` a reconciler is
+        expected to catch and report as "residue left in place" — which is the
+        honest thing to say, and the reason this returns what it reaped rather
+        than a bare count: a caller that cannot distinguish "nothing was there"
+        from "nothing could be done" cannot report either one truthfully.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        staging_root = f"{WORKSPACE_MOUNT_PATH}/{STAGING_DIR_NAME}"
+
+        with self._engine(f"reaping staging residue in workspace {workspace_id}") as client:
+            anchor = self._require(client, workspace_id)
+            environment = anchor.labels.get(LABEL_ENVIRONMENT) or anchor.attrs["Config"]["Image"]
+            self._require_running(anchor, workspace_id)
+
+            status, details = self._staging_script(
+                anchor,
+                workspace_id,
+                environment,
+                REAP_STAGING_SCRIPT,
+                (WORKSPACE_MOUNT_PATH, staging_root, *REQUIRED_REAP_TOOLS),
+            )
+            if status == WRITE_MISSING_TOOL:
+                raise _missing_write_tool(
+                    workspace_id, environment, _first_detail(details) or "a POSIX tool"
+                )
+            if status == WRITE_STAGING_UNUSABLE:
+                raise _staging_unusable(workspace_id, _first_detail(details) or UNRESOLVABLE_PATH)
+            if status != 0:
+                raise self._script_broke(
+                    workspace_id,
+                    f"under '{STAGING_DIR_NAME}'",
+                    "reaping staging residue",
+                    status,
+                    _first_detail(details),
+                )
+
+        # Reported the way every other path in this seam reports a location:
+        # relative to the workspace root. The container's absolute path is an
+        # engine-side detail, and a reconciler rendering it would be publishing
+        # a layout headspace does not promise anyone.
+        prefix = f"{WORKSPACE_MOUNT_PATH}/"
+        return tuple(
+            detail[len(prefix) :] if detail.startswith(prefix) else detail for detail in details
+        )
+
+    # --- copying a file in ------------------------------------------------
+
+    def _require_running(self, anchor: Container, workspace_id: str) -> None:
+        """Refuse a workspace whose container cannot execute the verification.
+
+        Checked before anything is staged so the refusal costs one listing
+        rather than a transfer, and checked against ``running`` alone rather
+        than :data:`LIVE_STATUSES`: a ``created`` or ``paused`` container is a
+        runtime object that exists and cannot run an exec, which for this verb
+        is the same situation as an exited one.
+        """
+        status = str((anchor.attrs.get("State") or {}).get("Status") or "")
+        if status != RUNNING_STATUS:
+            raise _anchor_not_running(workspace_id, status)
+
+    def _prepare_staging(self, anchor: Container, landing: _Landing, environment: str) -> None:
+        """Create this write's staging directory, having proved the image can finish."""
+        status, details = self._staging_script(
+            anchor, landing.workspace_id, environment, PREPARE_STAGING_SCRIPT, landing.prepare_args
+        )
+        detail = _first_detail(details)
+        if status == WRITE_MISSING_TOOL:
+            raise _missing_write_tool(landing.workspace_id, environment, detail or "a POSIX tool")
+        if status == WRITE_STAGING_UNUSABLE:
+            raise _staging_unusable(landing.workspace_id, detail or UNRESOLVABLE_PATH)
+        if status != 0:
+            raise self._script_broke(
+                landing.workspace_id,
+                f"for '{landing.relative}'",
+                "preparing a staging directory",
+                status,
+                detail,
+            )
+
+    def _classify_finalize(self, landing: _Landing, status: int, detail: str) -> None:
+        """Turn the finalize script's exit status into this project's own taxonomy.
+
+        One mapping, in one place, so the shell and the exit-code policy meet
+        exactly once. Everything the table does not name is an engine failure
+        with the script's own line kept as evidence — the fail-safe direction,
+        because a status invented later cannot silently become a successful
+        write, only a loud unexplained one.
+
+        :data:`FINALIZE_WRITE_SCRIPT` can exit with exactly 18, 17, 13, 14, 15
+        and 16, and every one of them is named below. The list is written out so
+        a status added to the script and forgotten here is visible by reading
+        the two side by side, rather than only when a caller meets an
+        unexplained failure.
+        """
+        if status == 0:
+            return
+        if status == WRITE_STAGED_PATH_IS_A_LINK:
+            raise _staged_path_is_a_link(landing.workspace_id, landing.relative)
+        if status == WRITE_STAGED_FILE_MISSING:
+            raise _staged_file_vanished(landing.workspace_id, landing.relative)
+        if status == WRITE_DIGEST_MISMATCH:
+            raise _landed_digest_disagrees(
+                landing.workspace_id, landing.relative, landing.expected_sha256, detail
+            )
+        if status == WRITE_ESCAPES_VOLUME:
+            raise _escapes_workspace_volume(
+                landing.workspace_id, landing.relative, detail or UNRESOLVABLE_PATH
+            )
+        if status == WRITE_DESTINATION_EXISTS:
+            raise _destination_exists(landing.workspace_id, landing.relative)
+        if status == WRITE_DESTINATION_IS_DIRECTORY:
+            raise _destination_is_a_directory(landing.workspace_id, landing.relative)
+        raise self._script_broke(
+            landing.workspace_id,
+            f"for '{landing.relative}'",
+            "verifying the staged file",
+            status,
+            detail,
+        )
+
+    def _staging_script(
+        self,
+        anchor: Container,
+        workspace_id: str,
+        environment: str,
+        script: str,
+        args: Sequence[str],
+    ) -> tuple[int, tuple[str, ...]]:
+        """Run one staging script in the workspace container; return status and evidence.
+
+        Every value the script reads arrives as an argument (see
+        :data:`SCRIPT_ARGV0`), never interpolated into the text, so a
+        destination path is data to the shell rather than something the shell
+        might read as syntax.
+
+        Two engine answers are recognised here and nowhere else. An exec whose
+        binary the image lacks comes back as *output*, not as an exception (see
+        :data:`EXEC_START_MARKER`), so a distroless image produces a named
+        refusal rather than a report that the engine broke. And an exec against
+        a container that stopped between the liveness check and this call
+        raises a 409 carrying the container's own id, which is redacted out of
+        existence and answered with the same honest condition the check itself
+        produces. Anything else re-raises untouched and stays exit 7.
+        """
+        try:
+            result = anchor.exec_run([WRITE_SHELL, "-c", script, SCRIPT_ARGV0, *args])
+        except APIError as err:
+            if NOT_RUNNING_MARKER in str(err):
+                raise _anchor_not_running(workspace_id, "it stopped mid-write") from err
+            raise
+        status = int(result.exit_code or 0)
+        output = (result.output or b"").decode("utf-8", "ignore")
+        missing = _exec_binary_missing(status, output)
+        if missing is not None:
+            raise _missing_write_tool(workspace_id, environment, missing)
+        return status, _script_details(output)
+
+    @staticmethod
+    def _script_broke(
+        workspace_id: str, subject: str, doing: str, status: int, detail: str
+    ) -> ProviderError:
+        """A staging script failed in a way this provider has no name for.
+
+        Exit 7 with the script's own evidence attached, because the honest
+        thing to say about an unrecognised status is that headspace does not
+        know — and the direction of the safety matters: an unnamed failure that
+        reported the caller's mistake would send an agent off to change a path
+        that was never the problem.
+        """
+        return ProviderError(
+            f"the workspace container failed while {doing} {subject} in "
+            f"workspace {workspace_id} (status {status})"
+            + (f": {redact_engine_text(detail)}" if detail else ""),
+            remediation=(
+                "the workspace volume was left as it was found — every script here "
+                "refuses before it changes anything — so retry, and run "
+                f"'headspace inspect {workspace_id}' if it repeats"
+            ),
+        )
+
+    def _discard_staging(self, anchor: Container, landing: _Landing) -> None:
+        """Remove one write's staging residue, never masking why it was needed.
+
+        Best-effort on purpose, and suppressed for the same reason
+        :meth:`run`'s job-container removal is: this runs on the failure path,
+        where a second exception would replace the diagnosis with the tidy-up's
+        complaint about a container that had already gone.
+        """
+        with contextlib.suppress(DockerException, OSError):
+            anchor.exec_run(
+                [WRITE_SHELL, "-c", DISCARD_STAGING_SCRIPT, SCRIPT_ARGV0, landing.staging]
+            )
+
+    # --- stopping a job -----------------------------------------------------
+
+    def stop(self, workspace_id: str) -> StopOutcome:
+        """End whatever job is running in a workspace, right now — and nothing else.
+
+        Boundary contract, and the one that matters most: this method never
+        opens ``headspace.core.store``. :meth:`run` is synchronous and
+        blocking, and holds the workspace's flock for a job's *entire*
+        duration — which is what makes it the single writer of that
+        workspace's stored state for as long as the job runs. An operator
+        ending a runaway job cannot go through ``run`` to do it, because that
+        call is already in progress and will not return until the job it is
+        watching does. So ``stop`` reaches the engine directly, on its own
+        connection (:meth:`_engine`), and touches nothing under
+        ``~/.headspace``: no store is constructed, no lock is taken, no record
+        is written — a ``stop`` that did any of those would be racing the
+        ``run`` call it exists to interrupt, exactly the corruption the
+        store's per-workspace lock exists to prevent. The still-blocked
+        ``run`` call discovers the ending on its own next poll of the very
+        engine object this method just signalled (:meth:`_await_exit` already
+        calls ``reload()`` on it every iteration) and journals the outcome
+        itself: one verb ends the job, the other narrates it, and the store
+        keeps exactly one writer even while both act on the same workspace at
+        once.
+
+        Found by label, like everything else this provider looks up
+        (:data:`LABEL_ROLE` = :data:`ROLE_JOB`, scoped by
+        :data:`LABEL_WORKSPACE_ID`), never by a handle this call was given —
+        there is no handle to be given. The process calling ``stop`` is not
+        the process that called ``run``, and a daemonless CLI keeps no
+        in-memory table connecting the two; the label is the only thing that
+        survives between them. :meth:`_find` returns the first match, which in
+        the steady state is the only one there is: a workspace holds at most
+        one live job container at a time, because ``run`` blocks for that
+        container's whole life and reaps it in a ``finally`` the moment it
+        settles (see :meth:`run`). A job container this call finds but that is
+        not in :data:`LIVE_STATUSES` is therefore stale reap residue, not a
+        live job, and is treated exactly like there being none at all.
+
+        Graceful first, forceful only if that fails: ``container.stop()``
+        sends ``SIGTERM`` and waits :data:`STOP_GRACE_SECONDS` for the job to
+        end itself; only a job still alive after that grace period is
+        escalated to ``container.kill()`` (``SIGKILL``). A job that catches
+        the polite signal and exits inside its own window is never killed at
+        all — the same "ask nicely before you force it" shape
+        :meth:`_await_exit` already gives a job that outran its wall-clock
+        budget instead of jumping straight to a kill.
+
+        Reports honestly rather than raising for the ordinary race: a
+        workspace with no live job container — because nothing was ever
+        started, because the last job already finished, or because it
+        finished in the instant between an operator's decision and this call
+        landing — is not a mistake, so it comes back as
+        a :class:`~headspace.providers.base.StopOutcome` naming no job
+        (``job_id`` is ``None``, ``stopped`` is ``False``) instead of a
+        :class:`~headspace.providers.base.CliError`. That is deliberately the
+        same fact/failure split the seam draws: a caller racing a job that just
+        finished on its own gets a true statement back, not an error it has to
+        parse to learn the race was harmless.
+
+        Raises :class:`~headspace.providers.base.CliError` (exit 1) for a
+        workspace id this backend holds no anchor container for at all — the
+        same "unknown workspace" refusal every other verb here raises via
+        :func:`~headspace.providers.base.unknown_workspace`. Raises
+        :class:`ProviderError` (exit 7) when the engine breaks while reaching
+        or signalling the job, exactly as every other verb in this module
+        does.
+        """
+        workspace_id = require_workspace_id(workspace_id)
+        with self._engine(f"stopping the job running in workspace {workspace_id}") as client:
+            self._require(client, workspace_id)
+
+            job = self._find(client, workspace_id, ROLE_JOB)
+            if job is None or not self._container_is_live(job):
+                return StopOutcome(workspace_id=workspace_id, job_id=None, stopped=False)
+
+            job_id = job.labels.get(LABEL_JOB_ID)
+            job.stop(timeout=STOP_GRACE_SECONDS)
+            # The container can disappear between the signal and the follow-up:
+            # `run` removes its own job container the moment the job settles, so
+            # a graceful stop that works is *expected* to race that removal. A
+            # `NotFound` here therefore means the stop succeeded so completely
+            # that the object is already reaped — reporting it as an engine
+            # failure would tell the caller their stop failed at the exact moment
+            # it worked best. The escalation is what needs the object; its
+            # absence is the outcome the escalation was for.
+            with contextlib.suppress(NotFound):
+                job.reload()
+                if self._container_is_live(job):
+                    job.kill()
+
+        return StopOutcome(workspace_id=workspace_id, job_id=job_id, stopped=True)
 
     def remove(self, workspace_id: str) -> RemovalDisposition:
         """Tear the workspace down and report what actually went away.

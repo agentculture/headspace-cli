@@ -15,7 +15,7 @@ this seam is a plain, JSON-serialisable, backend-neutral structure.** The
 conformance suite (``tests/conformance.py``) checks that mechanically, against
 every backend, forever.
 
-Six verbs, chosen from what the orchestration layer needs and nothing else:
+Eight verbs, chosen from what the orchestration layer needs and nothing else:
 
 ===============  ==========================================================
 verb             what it answers
@@ -25,6 +25,8 @@ verb             what it answers
 ``run``          execute this command in that workspace
 ``inspect``      what does the backend say about that workspace now?
 ``read``         hand me the bytes of one file the workspace holds
+``write``        land these bytes at one path inside the workspace
+``stop``         end whatever job is running in that workspace, now
 ``remove``       tear it down and tell me exactly what went away
 ===============  ==========================================================
 
@@ -49,6 +51,26 @@ Only a regular file's bytes cross. A directory, a symlink or a device is
 refused as a user error, and the path itself is normalised and bounded by
 :func:`require_workspace_path` here rather than in each backend — see its
 docstring for why the engine underneath cannot be trusted to do it.
+
+Why ``write`` needs a live workspace, and ``read`` does not
+-------------------------------------------------------------
+``read`` closed one half of the durability gap (issue #3): a result can leave
+the workspace. It never opened the other half — a workspace can receive
+nothing beyond a job's own argv, which is bounded by the host's ``ARG_MAX``
+and, worse, is recorded verbatim in every surface that renders a command
+(issue #14). A caller with a non-trivial payload — a test harness, a fixture
+tree, a dependency a job needs before it can run at all — had no channel that
+was not either too small or a confession.
+
+``write`` is that channel, and it is deliberately not ``read`` run backwards.
+``read`` must work with the runtime dead because that is the case it exists
+for: the runtime has exited but the workspace's storage — and the results in
+it — has not, and a salvage path that needed a live runtime would lose exactly
+what a caller most needs back. A copy-in has no equivalent case to salvage: it
+feeds a job that has not run yet, so a workspace with no live runtime has no
+job waiting for the bytes. A backend is therefore free to require whatever a
+safe, verified write needs — see :meth:`Provider.write`'s docstring for the
+liveness and boundary contract this asymmetry produces.
 
 A :class:`typing.Protocol`, not an abstract base class. A backend is anything
 that *behaves* correctly; nothing about it should have to inherit from
@@ -113,6 +135,22 @@ The destroy guard refuses in the table's own words either way:
 is precisely the edge ``states.py`` deliberately omits — and now asks it about
 a state the workspace is actually in.
 
+Why ``stop`` touches no state
+------------------------------
+``run`` is synchronous and blocking, and holds the workspace lock for a job's
+entire duration — which is what makes it the single writer of a workspace's
+stored state, the property the section above exists to protect. An operator
+ending a runaway job cannot go through ``run`` to do it: that call is already
+in progress, and it will not return until the job it is watching does. Ending
+a job therefore has to be a second, narrower verb that reaches the engine
+directly rather than routing through the one already holding the lock.
+``stop`` is that verb, and it is deliberately engine-side only: it signals the
+job and reports what it found (:class:`StopOutcome`), and it neither takes the
+workspace lock nor writes anything to headspace's own store. The ``run`` call
+still in flight observes the ending through the wait it was already doing, and
+journals the outcome itself — one verb ends the job, the other one still
+narrates it, and the state store keeps exactly one writer throughout.
+
 Why ``remove`` walks a path
 ---------------------------
 ``ready`` has no direct edge to ``destroyed`` either — a workspace created and
@@ -140,10 +178,11 @@ import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Protocol, runtime_checkable
 
 from headspace.cli._errors import EXIT_INFRASTRUCTURE_FAILURE, EXIT_USER_ERROR, CliError
+from headspace.core.artifacts import ByteSource
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import (
     STATUS_CANCELLED,
@@ -750,6 +789,39 @@ class JobOutcome:
 
 
 @dataclass(frozen=True)
+class StopOutcome:
+    """What ``stop`` found and touched in one workspace — an engine-side act only.
+
+    ``stop`` may not lock the workspace or write state (see the module
+    docstring, "Why ``stop`` touches no state"), so this is the whole of what
+    it is allowed to report: what it found, and whether it signalled it. A
+    workspace holding no in-flight job is not an error — an operator racing a
+    job that just finished on its own is the ordinary case, not a mistake —
+    so that outcome is stated here (``job_id`` is ``None``, ``stopped`` is
+    ``False``) rather than raised.
+
+    ``job_id`` is the id of the job whose process ``stop`` found and
+    signalled, echoed back so a caller stopping several workspaces can tell
+    which outcome belongs to which job. ``stopped`` is ``True`` only when a
+    live job was actually found and signalled; a workspace with nothing
+    running reports ``False`` with no job to name, the same "state a fact,
+    never fabricate a failure" posture :class:`RemovalDisposition` already
+    keeps for a teardown.
+    """
+
+    workspace_id: str
+    job_id: str | None
+    stopped: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "workspace_id": self.workspace_id,
+            "job_id": self.job_id,
+            "stopped": self.stopped,
+        }
+
+
+@dataclass(frozen=True)
 class RemovalDisposition:
     """What a removal actually did — the destruction report's factual half.
 
@@ -946,6 +1018,7 @@ class Provider(Protocol):
         policy: EffectivePolicy,
         *,
         job_id: str,
+        env: Mapping[str, str] = MappingProxyType({}),
     ) -> JobOutcome:
         """Execute one command in an existing workspace and normalize the result.
 
@@ -953,6 +1026,16 @@ class Provider(Protocol):
         because there is no daemon to remember it in, and because the wall-clock
         and output-byte budgets are enforced by headspace's own process — the
         provider needs the numbers in hand at each call.
+
+        ``env`` is the job process's environment, and only the job process's: a
+        name in ``env`` reaches the command this call executes and nothing
+        else. A provider must not write it to a descriptor, a label, a log, or
+        any other surface it produces, and the value does not outlive the job
+        it was passed to — the provider never records it. ``env`` defaults to
+        an empty mapping so a caller that passes nothing gets the closed
+        posture structurally rather than by convention, the same way
+        :attr:`WorkspaceDescriptor.network_enabled` defaults closed instead of
+        trusting every caller to ask for it explicitly.
 
         Blocking, synchronous, batch. Returns a :class:`JobOutcome` for any
         outcome *of the job*, including failure and timeout. Raises
@@ -985,6 +1068,94 @@ class Provider(Protocol):
         that would leave the workspace. Raises :class:`ProviderError` (exit 7)
         when the engine broke — including part-way through the stream, where it
         surfaces from the iteration rather than from this call.
+        """
+
+    def write(
+        self,
+        workspace_id: str,
+        path: str,
+        source: ByteSource,
+        *,
+        expected_sha256: str,
+        overwrite: bool = False,
+    ) -> None:
+        """Stream one file's bytes into a workspace, verified by the engine.
+
+        ``read``'s inbound counterpart (see the module docstring, "Why
+        ``write`` needs a live workspace, and ``read`` does not"), built from
+        the same two pieces ``read`` already established: ``path`` is relative
+        to the workspace root and is normalised and bounded by
+        :func:`require_workspace_path`, exactly as ``read``'s is, and the
+        bytes travel as a :data:`~headspace.core.artifacts.ByteSource` — a
+        stream to read from or an iterable of chunks — the same shape an
+        export reads from, so a copy-in and an export share one representation
+        for bytes in motion. ``expected_sha256`` is the digest the caller
+        already computed from the same bytes ``source`` will yield — named to
+        match :func:`headspace.core.artifacts.export_artifact`, so the inbound
+        and outbound halves of the durability boundary ask for a digest by the
+        same name; the engine
+        re-hashes what actually lands in the workspace, and the two must agree
+        before anything is kept.
+
+        Liveness contract, and the one place this verb parts ways with
+        ``read``: ``write`` REQUIRES a live workspace runtime. ``read`` has to
+        work with the runtime dead because that is the case it exists for —
+        the runtime has exited but the workspace's storage, and the results in
+        it, have not, and a salvage read that needed a live runtime would lose
+        exactly what a caller most needs back. A copy-in has no equivalent
+        case to salvage: it feeds a job that has not run yet, so a workspace
+        with no live runtime has no job waiting for the bytes it would
+        deliver. A backend may therefore require a live runtime to stage and
+        verify a write safely, and a workspace whose runtime exists but is not
+        running is refused honestly rather than worked around — a failure mode
+        ``read`` never had to classify, because it never needed the runtime up
+        in the first place.
+
+        Boundary contract: ``overwrite`` defaults to ``False``. A destination
+        path a job already produced is refused rather than silently replaced —
+        overwriting job-written, never-exported work is the same mistake class
+        a destroy guard exists to prevent one layer up, and a copy-in must not
+        reopen it by default. Pass ``overwrite=True`` to replace a destination
+        deliberately.
+
+        Raises :class:`CliError` (exit 1) for a user error: an unknown
+        workspace, a path :func:`require_workspace_path` refuses, or an
+        existing destination with ``overwrite`` left ``False``. Raises
+        :class:`ProviderError` (exit 7) when the engine broke — including a
+        runtime that exists but is not running, and including a landed-bytes
+        re-hash that disagrees with ``sha256``, both of which are the engine
+        failing to deliver what it promised, not a caller mistake.
+        """
+
+    def stop(self, workspace_id: str) -> StopOutcome:
+        """End whatever job is running in a workspace, right now.
+
+        Liveness contract: the mirror image of ``write``'s. ``write`` needs a
+        live runtime because it has a job's future to feed; ``stop`` needs a
+        live *job* because it exists only to end one early, and a workspace
+        with nothing running has nothing for it to do — reported honestly via
+        :class:`StopOutcome` rather than raised as an error, since a caller
+        racing a job that just finished on its own is ordinary, not a mistake.
+
+        Boundary contract: engine-side only, and this is the one that matters
+        most. ``run`` (:meth:`Provider.run`) is blocking and holds the
+        workspace lock for a job's entire duration, which is what makes it the
+        single writer of a workspace's stored state (see the module
+        docstring, "Why the *descriptor* never sits in ``running``"). A caller
+        ending a runaway job cannot go through ``run`` to do it — that call is
+        already in progress — so ``stop`` has to be a second, narrower verb
+        that reaches the engine directly: it signals the job and reports what
+        it found, and it must not take the workspace lock or write anything to
+        headspace's own store. The still-running ``run`` call observes the
+        ending through the wait it was already doing, and journals the outcome
+        itself — one verb ends the job, the other narrates it, and the store
+        keeps exactly one writer even while both act on the same workspace at
+        once.
+
+        Raises :class:`CliError` (exit 1) for a workspace this backend does
+        not hold. Raises :class:`ProviderError` (exit 7) when the engine broke
+        while trying to reach or signal the job — an unreachable engine is an
+        infrastructure failure here exactly as it is for every other verb.
         """
 
     def remove(self, workspace_id: str) -> RemovalDisposition:

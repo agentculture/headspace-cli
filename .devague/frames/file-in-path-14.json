@@ -1,0 +1,1011 @@
+{
+  "slug": "file-in-path-14",
+  "title": "file-in path (#14)",
+  "schema_version": 4,
+  "status": "exported",
+  "created": "2026-07-29T05:52:05Z",
+  "updated": "2026-07-29T07:46:20Z",
+  "claims": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "headspace gains a file-in path: a copy-in that mirrors export's discipline, so a network-disabled workspace can receive a non-trivial payload (issue #14)",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h1",
+          "text": "the mutual exclusion is actually dead: embodiment's live case (the success_signal) passes with --network disabled, using only shipped headspace verbs",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "verified by the success_signal run (c22/h1): embodiment's case end-to-end with --network disabled on shipped verbs only",
+      "revisions": []
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "the Provider protocol (providers/base.py:904) gains an inbound byte verb mirroring read (base.py:968): read streams bytes OUT via ByteStream and works whether or not the runtime is alive; the inbound verb takes a ByteSource under the same liveness guarantee, and both backends must implement it",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h2",
+          "text": "one conformance test set proves the inbound verb on both backends unchanged; a provider lacking the verb fails test_provider_satisfies_the_protocol",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "add the inbound verb to the Provider protocol in providers/base.py beside read (:968), with a docstring stating the liveness and boundary contract; extend tests/conformance.py with inbound tests both backends inherit",
+      "revisions": []
+    },
+    {
+      "id": "c3",
+      "kind": "requirement",
+      "text": "the Docker backend implements the inbound verb on the anchor container's archive endpoint (put_archive), mirroring _archived_file's get_archive (docker.py:1025) \u2014 creates no helper container and works on an exited container, the same two properties the read path documents",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h3",
+          "text": "verified against a real engine: the engine's object list before and after a put is identical (anchor container + volume only) \u2014 the copy-in created and left nothing",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "implement in providers/docker.py beside read(): prepare-exec creates/verifies the staging dir, anchor.put_archive streams the tar into it, finalize-exec verifies and renames; wrap engine calls in _engine_failures; create no helper containers",
+      "revisions": []
+    },
+    {
+      "id": "c4",
+      "kind": "requirement",
+      "text": "the fake backend implements the inbound verb over _Workspace.files (fake.py:265), which is already the volume stand-in read uses; the existing write_file (fake.py:294) stays a test-only seeding shortcut, not the seam verb",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h4",
+          "text": "the conformance inbound tests pass on the fake through the seam verb alone; the suite never calls write_file",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "implement in providers/fake.py over _Workspace.files with require_workspace_path normalisation; do not touch write_file; storage accounting already sums files (fake.py:496)",
+      "revisions": []
+    },
+    {
+      "id": "c5",
+      "kind": "requirement",
+      "text": "the orchestrator verb mirrors export (workspace.py:683): journalled intent before the engine, work under the store lock with guards evaluated after acquisition (lock-then-guard from day one, avoiding a new instance of issue #11's window), and the copied-in file's size+sha256 recorded in workspace state",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h5",
+          "text": "the journal shows the copy-in intent opened before any engine call and settled or abandoned after it; a destroy racing a copy-in either waits on the lock or refuses \u2014 no interleaving produces an unjournalled write or a destroyed-mid-copy workspace",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "new Orchestrator method modeled on export() (workspace.py:683): open an INTENT_PUT journal entry before any engine call, evaluate every guard inside store.lock after acquisition, settle or abandon the intent on every exit path",
+      "revisions": []
+    },
+    {
+      "id": "c6",
+      "kind": "requirement",
+      "text": "the copy-in records host path and sha256, never contents, in all four recording surfaces issue #14/#13 measured: result.outcome_summary, result.provenance.inputs (today run() writes inputs=list(command) verbatim at workspace.py:1271), journal.jsonl intent payloads, and state.json \u2014 plus a test that plants a marker and greps all four",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h6",
+          "text": "the marker test: a copied-in file carrying a distinctive marker yields outcome_summary, provenance.inputs, journal.jsonl and state.json that contain the file's path and sha256 and grep clean for the marker itself",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "intent payloads and provenance carry {path, sha256, size} only; add a recording test that copies in a marker-bearing file and greps outcome_summary, provenance.inputs, journal.jsonl, state.json for path+digest present and marker absent",
+      "revisions": []
+    },
+    {
+      "id": "c7",
+      "kind": "requirement",
+      "text": "the inbound copy digests during the stream in one pass, reusing artifacts.py's discipline (export_artifact digests-during-copy, artifacts.py:266-354, never the whole file in memory); size and digest land in the result package exactly as export reports them",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h7",
+          "text": "the host file is read exactly once per copy-in, and the recorded sha256 equals an independently computed sha256sum of the source",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "reuse artifacts.py's streaming discipline (chunked read, sha256.update per chunk) while building the tar stream in one pass; never buffer the whole file; record size from the same pass",
+      "revisions": []
+    },
+    {
+      "id": "c8",
+      "kind": "requirement",
+      "text": "the copy-in is bounded by the workspace's storage_bytes budget (issue #14's explicit ask): refused up-front when the host file's size would exceed the remaining budget, enforced by headspace's own process \u2014 the same enforcement class as wall_clock/output_bytes/concurrency (policy.py:301-309) \u2014 independent of the engine's merely-measured storage (CapabilitySnapshot.storage_enforceable defaults False)",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h8",
+          "text": "a copy-in larger than the workspace's remaining storage_bytes is refused before any byte reaches the engine, with a failure-taxonomy exit code and a remediation naming the budget; a fitting copy-in is not refused",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "stat the host file(s) before connecting to the engine; refuse when size exceeds storage_bytes minus current usage, with a failure-taxonomy exit code and a remediation naming the budget; add refusal + fitting tests on both providers",
+      "revisions": []
+    },
+    {
+      "id": "c9",
+      "kind": "boundary",
+      "text": "--allow-host-path keeps failing closed: policy.resolve() (policy.py:263-267) refuses a filesystem scope the engine cannot enforce, and issue #14 explicitly endorses that refusal ('the refusal is right'); the copy-in fills the gap the refusal leaves, it does not weaken the mount posture",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h9",
+          "text": "--allow-host-path behavior is unchanged byte-for-byte: the same policy_denied refusal on docker, and the sealed container kwargs still contain no bind mounts",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "change nothing in policy.resolve(); add a regression test pinning the policy_denied refusal for --allow-host-path on docker and asserting _sealed_kwargs still contains no binds",
+      "revisions": []
+    },
+    {
+      "id": "c10",
+      "kind": "non_goal",
+      "text": "secret passing (issue #13) rides on a different feature: the filer states 'a copy-in would not solve the secret problem, and an env flag would not solve this one' \u2014 no --env/--secret/--env-file work lands on this frame",
+      "origin": "llm",
+      "status": "rejected",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c11",
+      "kind": "non_goal",
+      "text": "issues #12 (journal short write), #11 (destroy TOCTOU), #10 (symlink read escape) and #7 (vanished-workspace volume leak) are separate changes with their own tests \u2014 this frame does not fix them, though #10's attack class shapes the new verb's write-path guard and #11's shapes its lock ordering",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c12",
+      "kind": "assumption",
+      "text": "docker-py's put_archive accepts a streamed tar and works on a created/exited container (the same engine mechanism class as get_archive) \u2014 believed true from the SDK surface, to be verified live before the plan hardens",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c13",
+      "kind": "requirement",
+      "text": "the new verb ships across the whole CLI surface the existing five verbs share: registration via cli.py + create.py's shared seam, an explain catalog entry (catalog.py:333-337 keys the five lifecycle verbs today), a README verb-table row, conformance tests both backends pass, and a version bump + changelog per repo CI",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h10",
+          "text": "the introspection tests that bind every verb to a catalog entry and help surface pass with the sixth verb present; README's verb table documents it; CI's version-check and changelog gate pass",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "register the verb through cli.py + create.py's shared seam; add a catalog entry (explain/catalog.py keys, :333); add the README verb-table row; run the version-bump skill before the PR so CI's version-check passes",
+      "revisions": []
+    },
+    {
+      "id": "c14",
+      "kind": "requirement",
+      "text": "both verb shapes ship: 'headspace put <ws> <host-path> <workspace-path>' as the standalone, repeatable, aggregating flow (several puts assemble a workspace before any job runs), and 'run --input NAME=HOST_PATH' as the deliver-and-execute flow; both drive the one orchestrator copy-in path so budget, boundary and recording discipline stay single-sourced",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h11",
+          "text": "put and run --input drive one shared orchestrator copy-in path \u2014 one implementation site structurally, and identical refusal/recording behavior in tests across both flows and both providers",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "one Orchestrator.put(...) implementation; cmd_put calls it directly, run --input calls it per input before the job under the same lock discipline; tests drive both flows against both providers and assert identical recording and refusals",
+      "revisions": []
+    },
+    {
+      "id": "c15",
+      "kind": "requirement",
+      "text": "run's input flow handles a multi-file payload safely: --input is repeatable and a host directory is an acceptable payload (a harness plus its dependencies), delivered through the same staging discipline with per-file path+digest recording in provenance \u2014 no byte lands in the workspace unrecorded, and no archive is recorded as an opaque blob",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h12",
+          "text": "a directory payload yields provenance listing every contained file as path+digest, and the workspace's post-copy file set equals that manifest exactly \u2014 nothing extra, nothing missing, no opaque archive entry",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "expand a directory host path into a sorted, deterministic per-file list host-side; copy and record each as path+digest; assert the workspace's post-copy file set equals the manifest exactly",
+      "revisions": []
+    },
+    {
+      "id": "c16",
+      "kind": "requirement",
+      "text": "the inbound commit point is stage-then-rename: put_archive lands bytes in a headspace-owned staging path inside the volume, digest verified there, then an exec'd finalize renames within the same filesystem \u2014 atomic \u2014 into the destination; this requires a live anchor container, which costs nothing real: a copy-in exists to feed future jobs and a dead workspace has none, unlike read whose salvage-after-death case must keep working exited",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h13",
+          "text": "fault injection killing the copy-in after staging but before finalize leaves the destination path absent and the staging residue identifiable and reaped; a rerun then succeeds",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "stage under a headspace-owned path inside the volume (e.g. .headspace-staging/<nonce>); finalize-exec verifies then renames within the volume filesystem; fault-injection test kills between stage and finalize and asserts destination absent, residue reapable, rerun clean",
+      "revisions": []
+    },
+    {
+      "id": "c17",
+      "kind": "requirement",
+      "text": "write-path/read-path boundary alignment: the staging-prepare and finalize execs verify that the staging path's ancestors and the resolved destination stay inside the volume before any rename, giving the write path the same resolved-inside-volume guarantee the issue #10 fix establishes for reads \u2014 neither direction trusts engine-side path resolution",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h14",
+          "text": "a regression test where a prior job planted an ancestor symlink inside the workspace: the next copy-in refuses, because the finalize exec verified the resolved destination against the volume root before renaming \u2014 proven live on docker, mirrored on the fake where representable",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "the finalize exec resolves the destination parent's realpath inside the container and refuses unless it is under the volume mount root; regression test has a prior job plant an ancestor symlink, then asserts the copy-in refuses \u2014 live on docker, mirrored on the fake",
+      "revisions": []
+    },
+    {
+      "id": "c18",
+      "kind": "audience",
+      "text": "agent runtimes and operator tooling driving headspace as a CLI; the first consumer is agentculture/embodiment's live adversarial probe, which needs a network-disabled workspace to receive a multi-file harness",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h20",
+          "text": "the audience is real, not assumed: both issues were filed from agentculture/embodiment, and their live acceptance runs are this frame's two success signals",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c19",
+      "kind": "after_state",
+      "text": "a network-disabled workspace receives a non-trivial, multi-file payload through a first-class copy-in (headspace put, run --input) whose recorded trace is path+digest only \u2014 the host-HTTP-server workaround and argv smuggling are both dead",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h21",
+          "text": "verified when both success signals (c22, c30) pass on shipped verbs with no workaround component left running",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c20",
+      "kind": "before_state",
+      "text": "delivering code into a workspace requires argv (ARG_MAX-bounded, recorded verbatim in outcome_summary, provenance.inputs, journal.jsonl, state.json) or a host HTTP server reachable only with --network enabled \u2014 so network isolation and non-trivial payloads are mutually exclusive (issue #14, measured on 0.9.0/docker 29.1.3)",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h22",
+          "text": "the before-state is measured, not asserted: issue #14's and #13's console transcripts reproduce on 0.9.0/docker 29.1.3",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c21",
+      "kind": "why_it_matters",
+      "text": "closed-by-default is the product's core posture, and today its most secure setting is its least usable one: the gap pushes exactly the adversarial/untrusted-code callers isolation exists for into weakening it (--network enabled) just to deliver their own code",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h23",
+          "text": "the pressure is documented in the consumer's own words: issue #14 records that the workaround forces --network enabled and that network-disabled callers have no path at all",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c22",
+      "kind": "success_signal",
+      "text": "embodiment's real case runs end-to-end with --network disabled: harness plus dependencies delivered via put / run --input, job runs, results exported \u2014 no HTTP server, no argv payload \u2014 and the four-surface marker grep finds path+digest present, contents absent",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h24",
+          "text": "the signal is a live end-to-end run against a real engine, not a simulated or fake-provider pass",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c23",
+      "kind": "decision",
+      "text": "scope expansion at the consumer's request: issue #13 (secret passing) joins this frame and ships in the same PR as the copy-in \u2014 embodiment needs both to run its live probe; the two stay independent mechanisms (env for values, copy-in for files) sharing one recording discipline",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c24",
+      "kind": "requirement",
+      "text": "run gains --env NAME (forward exactly that variable from the caller's environment by name, refusing an unset name) and --env-file PATH (NAME=VALUE lines from a host file, refusing malformed lines); values reach the job's process environment and nothing else",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h15",
+          "text": "with --env NAME set in the caller's shell the job observes the value; without the flag it does not (issue #13's probe, inverted); an unset name and a malformed env-file line are refused before the engine is touched",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "add both flags to run.py before the workspace id; resolve --env from os.environ at invocation time; parse env-file as NAME=VALUE with loud refusals; pass the merged mapping down as data, never through argv",
+      "revisions": []
+    },
+    {
+      "id": "c25",
+      "kind": "requirement",
+      "text": "name-only recording for secrets: outcome_summary, provenance, journal.jsonl and state.json carry env names (and for --env-file, the host path) but never values \u2014 the four-surface marker test from c6 extends to plant a marker as an env value and grep all four surfaces clean",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h16",
+          "text": "the extended marker test: a job given a marker-valued env variable yields all four surfaces containing the variable's name (and the env-file path where used) and grepping clean for the value",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "record env names in the run intent payload and provenance (e.g. env: [NAME]); extend the c6 recording test with an env-marker case over the same four surfaces",
+      "revisions": []
+    },
+    {
+      "id": "c26",
+      "kind": "requirement",
+      "text": "the seam carries env: Provider.run() (base.py:942, today env-free) gains an env mapping; docker passes it to the job's container environment, the fake exposes it to job-plan assertions, and the conformance suite proves the value reaches the job and no recorded surface on both backends",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h17",
+          "text": "both backends pass the same conformance env tests; a backend whose run() lacks the env parameter fails the protocol check; the docker job receives the value via container environment, not via command mutation",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "thread env: Mapping[str,str] through Provider.run() with a closed default; docker adds it to the job container's environment kwargs; fake records observed env for assertions; add conformance tests both backends inherit",
+      "revisions": []
+    },
+    {
+      "id": "c27",
+      "kind": "boundary",
+      "text": "the closed default stays: no caller environment is forwarded absent an explicit --env/--env-file \u2014 issue #13's own probe (seven image defaults, nothing of the caller's) is pinned by a regression test as the no-flag behavior",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h18",
+          "text": "the no-flag probe stays exactly as issue #13 measured it: a caller-set variable is absent from the job, which sees only image defaults \u2014 pinned by a regression test",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "add the regression test replicating the issue's probe (caller-set marker variable, no flags, assert absent and env count matches image defaults) on both providers",
+      "revisions": []
+    },
+    {
+      "id": "c28",
+      "kind": "non_goal",
+      "text": "no redaction pass over argv: the filer's explicit anti-ask \u2014 headspace cannot know which token is a secret, and a redactor that misses once is worse than a documented absence; the correct channel exists instead",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c29",
+      "kind": "boundary",
+      "text": "env is per-job only: run-level flags, the shortest secret lifetime the CLI can offer; create grows no --env and nothing is baked into the workspace or its anchor container",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h19",
+          "text": "create's flag surface is unchanged (no --env anywhere in it), and a secret's engine-side residue does not outlive its job \u2014 verified live on docker",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "no create-side changes; document the per-job lifetime in run's help and the explain catalog; verify live that the job container (the value's engine-side holder) is removed after run completes",
+      "revisions": []
+    },
+    {
+      "id": "c30",
+      "kind": "success_signal",
+      "text": "the secret leg's signal: embodiment's live gateway probe passes its API key via run --env, the key greps absent from outcome_summary, provenance, journal.jsonl and state.json, and their short-lived-HTTP-server workaround (steps 1-4 of issue #13) is deleted outright",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h25",
+          "text": "the signal is the same live run's secret leg: the key travels via --env, and the four-surface grep is executed against the run's actual outputs",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c31",
+      "kind": "requirement",
+      "text": "the finalize exec re-verifies the staged bytes' sha256 engine-side before the rename: a job container shares the volume and is not a headspace verb, so no lock excludes a running job from writing into staging between put_archive and finalize \u2014 the digest check at the commit point closes that window regardless of lock semantics",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h26",
+          "text": "a test swaps the staged bytes after put_archive and before finalize: the finalize refuses on digest mismatch and nothing lands at the destination",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "the finalize exec runs sha256sum over the staged file inside the container, compares to the host-computed digest, refuses on mismatch, and only then renames",
+      "revisions": []
+    },
+    {
+      "id": "c32",
+      "kind": "requirement",
+      "text": "reconciliation learns the copy-in intent explicitly (workspace.py:976 special-cases INTENT_EXPORT; the generic path rebuilds lifecycle state, which a copy-in never changed): an abandoned put intent is settled, its staging residue reaped, and the workspace stays usable \u2014 never misread as a lifecycle crash",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h27",
+          "text": "kill a copy-in between stage and settle: the next verb's reconciliation settles the intent, reaps the staging residue, and the workspace remains usable, with the disposition journalled honestly",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "branch on the new intent in _reconcile_one mirroring _reconcile_export's shape; reap staging residue by its reserved prefix; add the kill-mid-put regression test",
+      "revisions": []
+    },
+    {
+      "id": "c33",
+      "kind": "requirement",
+      "text": "a copy-in against a present-but-not-running anchor fails with an honest failure-taxonomy classification and a remediation naming the anchor \u2014 the execs need a live anchor where get_archive did not, so this failure mode is new to the inbound direction (issue #7's vanished-anchor precedent, one step earlier)",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h28",
+          "text": "with the anchor stopped out-of-band, a copy-in exits through the failure taxonomy with a remediation naming the anchor \u2014 no traceback, no misclassification as the caller's fault",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "classify through the existing ProviderError/CliError split; the remediation names the anchor container and points at inspect; add a stopped-anchor test",
+      "revisions": []
+    },
+    {
+      "id": "c34",
+      "kind": "requirement",
+      "text": "run --input NAME=HOST_PATH pins NAME as the workspace-relative destination, validated by require_workspace_path at parse time \u2014 the same normalisation and boundary rule the read path already applies (base.py:396)",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h29",
+          "text": "an --input NAME that fails require_workspace_path is refused before any engine contact; an accepted NAME lands at exactly that relative path in the workspace",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "validate NAME through require_workspace_path in run.py's parser, alongside the existing --declare parsing",
+      "revisions": []
+    },
+    {
+      "id": "c35",
+      "kind": "assumption",
+      "text": "the profile images carry the POSIX toolset the prepare/finalize execs need (sh, mv, realpath, sha256sum, mkdir): true for the sole registered profile (python:3.12-slim, Debian base \u2014 profiles.py:66), and a structural constraint on every future profile; a toolless (distroless) profile must fail the copy-in loudly and honestly, never hang or traceback",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h30",
+          "text": "a live per-profile check confirms the exec toolset, and a deliberately toolless image yields a loud, honestly classified refusal naming the missing tool and the profile",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "the prepare exec preflights required tools in one sh -c probe and fails with a message naming the profile; document the toolset constraint in profiles.py",
+      "revisions": []
+    },
+    {
+      "id": "c36",
+      "kind": "boundary",
+      "text": "copied-in files are inputs, not artifacts: they live in their own ledger in state.json, render distinctly in the result package, and never feed the destroy guard \u2014 the guard protects unexported *products* (artifacts.py inventory), and a host-sourced input is re-puttable by definition",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h31",
+          "text": "the result package renders copied-in files under an inputs section, never under artifacts; destroying a workspace holding only copied-in inputs proceeds without the unexported guard firing",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "a separate inputs ledger key in state.json; renderers list it distinctly; the destroy guard keeps reading only the artifact inventory",
+      "revisions": []
+    },
+    {
+      "id": "c37",
+      "kind": "boundary",
+      "text": "the no-value-recording guarantee covers headspace's own recording; a job that prints its environment writes the value into captured output, which persists in state.json's job record and journal \u2014 a documented limitation with a warning in run --help, because a guarantee that overclaims is worse than one that states its edge",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h32",
+          "text": "the recording test distinguishes surface classes: a job that echoes its env puts the value only in captured-output-derived fields, never in provenance, intent payloads, or summaries headspace itself composes \u2014 and the limitation is stated in run --help",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "add the warning sentence under --env/--env-file in run --help and the explain catalog; assert the surface-class split in the recording test",
+      "revisions": []
+    },
+    {
+      "id": "c38",
+      "kind": "boundary",
+      "text": "an --env value's engine-side residue: the job container (which holds the env) is removed best-effort in run's finally (docker.py:918-924, suppressed exceptions by design); a lost race leaves a labeled stray until remove() reaps it \u2014 documented, with destroy as the guaranteed reaper",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h33",
+          "text": "verified live: after a normal run no job container remains; after a simulated removal failure the labeled stray is reaped by remove()/destroy",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "keep the finally-removal as is; assert normal-path removal in the live test; document label-reaping as the backstop in the run docstring",
+      "revisions": []
+    },
+    {
+      "id": "c39",
+      "kind": "requirement",
+      "text": "inbound overwrite refuses by default: a put onto a workspace path that already exists is refused, naming the path; --force overrides \u2014 overwriting job-written, never-exported work is the same mistake class destroy already refuses, and it gets the same protection shape",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h34",
+          "text": "putting onto an existing path without --force is refused with the path named and nothing changed; with --force the new bytes land and the recording says an overwrite happened",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "existence check inside the finalize exec (the one place that sees volume truth at commit time), refusal before rename; --force skips the check and stamps the overwrite into the result package",
+      "revisions": []
+    },
+    {
+      "id": "c40",
+      "kind": "requirement",
+      "text": "copy-in refuses fast while a job is in flight: put takes the workspace flock with blocking=False exactly as destroy does, and the refusal names the running job and points at stop \u2014 an honest 'job in flight, retry or stop it' beats a silent wait of up to the wall-clock budget",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h35",
+          "text": "a put issued while a job runs returns the refusal immediately (not after the job), naming the job id; a put after the job completes succeeds unchanged",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "blocking=False on the put verb's lock acquisition, mirroring destroy (workspace.py:805); remediation text names the in-flight job and the stop verb",
+      "revisions": []
+    },
+    {
+      "id": "c41",
+      "kind": "requirement",
+      "text": "headspace gains a stop verb with destructive protection: by default it previews \u2014 reports the in-flight job (id, command, wall-clock consumed) and changes nothing; only --apply actually stops the job",
+      "origin": "user",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h36",
+          "text": "stop without --apply lists the job and provably changes nothing (engine state identical before and after); stop --apply ends the job and the workspace returns to ready",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "new stop verb through the shared seam (cli.py + create.py helpers), preview default, --apply gate; catalog entry, README row, conformance coverage like every other verb",
+      "revisions": []
+    },
+    {
+      "id": "c42",
+      "kind": "requirement",
+      "text": "stop acts engine-side only: it finds the labeled job container and signals it (graceful stop, then kill), and never takes the workspace flock or writes store state \u2014 run holds the flock for the job's whole duration (workspace.py:557) and must stay the single state writer, observing the stopped exit through its existing await and journalling the outcome itself",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h37",
+          "text": "a stop --apply during a live job returns while the runner still holds the flock (no deadlock), the runner's own result package reports the ending, and the journal shows exactly one writer",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "locate the ROLE_JOB container by labels (docker.py _find_all pattern), container.stop(timeout) then kill; touch no files under ~/.headspace; the fake mirrors with a scripted in-flight job",
+      "revisions": []
+    },
+    {
+      "id": "c43",
+      "kind": "requirement",
+      "text": "a stopped job is reported as stopped by the operator \u2014 a distinct, honest outcome that is neither the job's own computational failure nor an infrastructure fault; the result package, key findings and exit taxonomy all carry the distinction",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h38",
+          "text": "the stopped job's package greps as operator-stopped, its status differs from computation_failed and infrastructure_failure, and the follow-up inspect shows the workspace ready",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "extend JobOutcome and _status with the operator-stopped case; the exact exit-code slot is decided in the plan against the existing taxonomy (README 0-8 table) rather than improvised here",
+      "revisions": []
+    }
+  ],
+  "open_vagueness": [
+    {
+      "id": "v1",
+      "text": "whether the engine resolves a symlinked ancestor on put_archive the way it does on get_archive (issue #10's escape, mirrored on the write path: a job plants 'link -> /host-path' and the next copy-in writes through it) \u2014 needs a live probe against a real engine; the write-path guard design depends on the answer",
+      "kind": "unknown_blocking",
+      "claim_id": null,
+      "resolved": true,
+      "resolution": "demoted from load-bearing to defense-in-depth by the stage-rename design: put_archive only ever extracts into a headspace-owned staging path that a prepare-exec created and verified (never a job-controlled final path), and the finalize exec enforces the inside-volume boundary itself \u2014 so the engine's ancestor-symlink behavior no longer decides the guard design",
+      "resolution_claim_id": "c17"
+    },
+    {
+      "id": "v2",
+      "text": "live-probe put_archive's ancestor-symlink resolution against a real engine once, alongside implementing the c17 guard \u2014 to document what the engine would have done, and to catch an engine behavior change in a pinned test, not because the guard depends on it",
+      "kind": "follow_up",
+      "claim_id": "c17",
+      "resolved": false,
+      "resolution": "",
+      "resolution_claim_id": null
+    },
+    {
+      "id": "v3",
+      "text": "whether the docker job container is removed immediately after run on every path (success, failure, timeout) \u2014 it is where an --env value lives engine-side, so a lingering job container would extend a secret's at-rest lifetime; verify live while implementing c26/c29 and reap or document if it lingers",
+      "kind": "unknown_nonblocking",
+      "claim_id": "c29",
+      "resolved": true,
+      "resolution": "answered from the code during the challenge pass: removal is best-effort in run's finally (docker.py:918-924) with label-reaping via remove() as the backstop \u2014 confirmed as boundary c38, live verification retained in h33",
+      "resolution_claim_id": "c38"
+    },
+    {
+      "id": "v4",
+      "text": "version skew on a shared ~/.headspace: a state.json carrying the new inputs ledger read by an older binary \u2014 strict from_dict parsers exist in this codebase (ArtifactRecord refuses unknown fields), so the failure shape is unverified; check while implementing and document the story",
+      "kind": "unknown_nonblocking",
+      "claim_id": null,
+      "resolved": false,
+      "resolution": "",
+      "resolution_claim_id": null
+    }
+  ],
+  "scope_entries": [
+    {
+      "id": "s1",
+      "surface": "issue #14 (filed from agentculture/embodiment)",
+      "finding": "gap measured on 0.9.0/docker 29.1.3: export is one-way, --allow-host-path fails closed (policy_denied, exit 3), argv is the only inbound channel and is ARG_MAX-bounded plus recorded in four places, so network-disabled and non-trivial payload are mutually exclusive; the filer endorses the fail-closed refusal and asks for a copy-in under export's discipline, bounded by storage-bytes, recording path+digest never contents",
+      "seeds": [
+        "c2",
+        "c8",
+        "c9"
+      ]
+    },
+    {
+      "id": "s2",
+      "surface": "headspace/providers/base.py Provider protocol (read verb, 968-988; remove, 990)",
+      "finding": "the seam has exactly one byte-moving verb and it points outward; read's docstring guarantees it works with the runtime dead, streams bounded chunks, and refuses escapes via require_workspace_path \u2014 the inbound verb inherits all three properties by mirror",
+      "seeds": [
+        "c2"
+      ]
+    },
+    {
+      "id": "s3",
+      "surface": "headspace/providers/docker.py read/_archived_file (956-1049) and create (783-844)",
+      "finding": "outbound bytes ride get_archive on the anchor container (creates nothing, works exited); the volume is named headspace-<id> and mounted at WORKSPACE_MOUNT_PATH; put_archive is the engine's symmetric inbound endpoint; the existing symlink guard checks only the final tar entry (issue #10), so the write path must plan for the ancestor-symlink class from the start",
+      "seeds": [
+        "c3",
+        "c12"
+      ]
+    },
+    {
+      "id": "s4",
+      "surface": "headspace/providers/fake.py _Workspace.files + write_file (242-306)",
+      "finding": "the fake's storage is a dict keyed by normalised workspace path and its volume-usage figure already sums file bytes (fake.py:496), so the inbound verb is nearly free there; write_file exists but is documented as a test seeding shortcut the conformance suite deliberately avoids",
+      "seeds": [
+        "c4"
+      ]
+    },
+    {
+      "id": "s5",
+      "surface": "headspace/core/workspace.py export (683-803), run (540-635), _provenance (1263-1271)",
+      "finding": "export is the template: lock, declared-artifact guard, journalled intent naming path+destination (never bytes), provider read streamed into export_artifact, ledger updated, intent settled with the digest; run's provenance writes inputs=list(command) verbatim at 1271 \u2014 the recording site issues #13/#14 measured \u2014 so the copy-in's provenance must carry path+digest instead",
+      "seeds": [
+        "c5",
+        "c6"
+      ]
+    },
+    {
+      "id": "s6",
+      "surface": "headspace/core/policy.py resolve (230-321) + ResourceBudget (74-89)",
+      "finding": "storage is the canonical measured limit (storage_enforceable defaults False, never a resolution failure) while wall_clock/output_bytes/concurrency are CLI-enforced independent of the engine; a copy-in's size is knowable host-side before any byte moves, so the storage-budget bound can sit in the CLI-enforced class; the filesystem-scope branch (263-267) is the fail-closed refusal issue #14 endorses",
+      "seeds": [
+        "c8",
+        "c9"
+      ]
+    },
+    {
+      "id": "s7",
+      "surface": "headspace/core/artifacts.py export_artifact (266-354)",
+      "finding": "digest-during-copy, one pass, never whole-file-in-memory, .partial sidecar then os.replace as the commit point \u2014 the digesting/streaming half is direction-agnostic and reusable inbound, but the atomic-rename commit point is host-filesystem machinery with no equivalent through the engine's archive endpoint; that gap is recorded as pending decision q2 (inbound commit point)",
+      "seeds": [
+        "c7"
+      ]
+    },
+    {
+      "id": "s8",
+      "surface": "tests/conformance.py ProviderConformance (440+) + cli.py/create.py shared seam + explain/catalog.py (333-337) + README verb table",
+      "finding": "one conformance suite binds both backends (subclass-with-one-fixture rule), read-back is proven against job-produced bytes not seeded ones; the five lifecycle verbs each carry a catalog entry, a README row, and the create.py shared flag seam \u2014 the sixth verb takes all of the same, and repo CI enforces version bump + changelog",
+      "seeds": [
+        "c13"
+      ]
+    },
+    {
+      "id": "s9",
+      "surface": "issues #13, #12, #11, #10, #7 (open sibling issues)",
+      "finding": "#13 is declared independent by its own filer (env flag vs copy-in, neither solves the other); #12/#11/#7 touch durability, destroy locking and reaping \u2014 none block a copy-in, but #11's lock-then-guard lesson and #10's symlink-escape class are both design inputs the new verb adopts rather than defects it fixes",
+      "seeds": [
+        "c10",
+        "c11"
+      ]
+    },
+    {
+      "id": "s10",
+      "surface": "docker archive endpoints (get_archive/put_archive) under the stage-rename decision",
+      "finding": "engine-side path resolution is untrusted in both directions by design (c16/c17): put_archive targets only headspace-prepared staging paths and an exec inside the container owns boundary verification and the atomic rename \u2014 the v1 unknown resolved by removing the dependency rather than by probing it",
+      "seeds": [
+        "c14",
+        "c16",
+        "c17"
+      ]
+    },
+    {
+      "id": "s11",
+      "surface": "issue #13 (filed from agentculture/embodiment)",
+      "finding": "measured on 0.9.0: the caller's environment does not reach the job (seven image defaults \u2014 correct, stays), argv is recorded verbatim in four surfaces, so a credential has no correct channel; the ask is --env NAME / --env-file PATH with name-only recording plus the four-surface grep assertion, and the explicit anti-ask is an argv redaction pass",
+      "seeds": [
+        "c24",
+        "c25",
+        "c27",
+        "c28"
+      ]
+    },
+    {
+      "id": "s12",
+      "surface": "headspace/providers/base.py run() signature (942-960)",
+      "finding": "run() crosses the seam with workspace_id, command, policy and job_id \u2014 no env parameter exists today, so the secret channel is a seam change touching both backends and the conformance suite, not a CLI-only flag",
+      "seeds": [
+        "c26"
+      ]
+    },
+    {
+      "id": "s13",
+      "surface": "challenge pass / concurrency lens: store.py flock (151-191), workspace.py run lock hold (557), shared-volume job containers (docker.py:846-948)",
+      "finding": "the lock serialises headspace verbs, not job processes \u2014 a running job container shares the volume and can write into staging regardless of any lock, which is what makes engine-side digest re-verification at finalize load-bearing rather than paranoid",
+      "seeds": [
+        "c31"
+      ]
+    },
+    {
+      "id": "s14",
+      "surface": "challenge pass / failure-mode lens: workspace.py _reconcile_one (938-1000)",
+      "finding": "reconciliation special-cases INTENT_EXPORT and treats the rest as lifecycle intents rebuilt from engine truth; a copy-in intent is export-shaped (no lifecycle transition), so without an explicit branch an abandoned put would be misread \u2014 seeded the reconciliation requirement",
+      "seeds": [
+        "c32"
+      ]
+    },
+    {
+      "id": "s15",
+      "surface": "challenge pass / lifecycle lens: docker.py run (846-948) job containers, create (783-844) anchor, issue #7",
+      "finding": "jobs run in their own containers; the anchor idles from create and is the exec target, so the inbound path adds a new liveness dependency the read path never had; job-container removal is best-effort in a finally with a label-reaping backstop",
+      "seeds": [
+        "c33",
+        "c38"
+      ]
+    },
+    {
+      "id": "s16",
+      "surface": "challenge pass / hidden-dependency lens: profiles.py registry (66-80)",
+      "finding": "one registered profile, python:3.12-slim on a Debian base \u2014 carries sh/mv/realpath/sha256sum today, but the exec-based finalize makes a POSIX toolset a structural requirement on every future profile, which digest-pinning alone does not guarantee",
+      "seeds": [
+        "c35"
+      ]
+    },
+    {
+      "id": "s17",
+      "surface": "challenge pass / data-flow lens: run() output capture into state.json (workspace.py:588), result.py evidence excerpts",
+      "finding": "captured job output persists in state.json and renders as evidence \u2014 a job echoing its own environment defeats name-only recording from the caller's side, so the guarantee must state its edge; copied-in files also needed a ledger distinct from artifacts so the destroy guard keeps meaning 'unexported product'",
+      "seeds": [
+        "c36",
+        "c37"
+      ]
+    },
+    {
+      "id": "s18",
+      "surface": "challenge pass / reversibility lens: artifacts.py os.replace overwrite (328), inbound destination collision",
+      "finding": "outbound overwrite of the host destination is deliberate and safe (atomic replace, caller-owned path); inbound overwrite destroys workspace-side work a job may never have exported \u2014 no symmetric argument covers it, so the semantics went to the user as a question rather than an assumption",
+      "seeds": [
+        "c34"
+      ]
+    },
+    {
+      "id": "s19",
+      "surface": "challenge pass / adjacent-systems lens: run.py REMAINDER bargain (1-40), create.py shared seam",
+      "finding": "clean pass: --input/--env/--env-file sit before the workspace id under run's existing flags-first bargain, argparse claims nothing of the job's argv, and the shared seam needs no signature change \u2014 no conflict found",
+      "seeds": []
+    },
+    {
+      "id": "s20",
+      "surface": "challenge pass / operations lens: version skew + probes deferred",
+      "finding": "clean pass with residue: the ~/.headspace skew question is parked non-blocking; the two live probes (put_archive ancestor symlinks v2, job-container residue verification) stay deferred to implementation where an engine exists \u2014 this pass ran with no engine and mutated nothing",
+      "seeds": []
+    },
+    {
+      "id": "s21",
+      "surface": "challenge pass / containment-and-recovery lens: docker.py _await_exit/attach (883-948), destroy's non-blocking lock (workspace.py:805)",
+      "finding": "q4's refuse-fast posture needed a recovery path to be livable, which surfaced the missing containment verb: nothing today can end a runaway job short of destroy; the user added stop (preview-by-default, --apply to act), engine-side-only so the runner stays the single state writer",
+      "seeds": [
+        "c41",
+        "c42",
+        "c43"
+      ]
+    }
+  ]
+}

@@ -115,6 +115,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import io
 import json
 import re
 import uuid
@@ -150,6 +151,7 @@ from headspace.providers.base import (
     Provider,
     ProviderError,
     RemovalDisposition,
+    StopOutcome,
     WorkspaceDescriptor,
 )
 
@@ -831,6 +833,96 @@ class ProviderConformance:
         assert isinstance(caught.value, CliError)
         assert caught.value.remediation
 
+    # --- run: the env channel (issue #13) ----------------------------------
+
+    def test_omitting_env_and_passing_empty_env_yield_the_same_outcome(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """The closed default, proven rather than assumed: no ``env`` means none.
+
+        A caller that never mentions ``env`` and a caller that explicitly hands
+        over an empty mapping must be indistinguishable to the job — that is
+        what "closed by default" means structurally rather than by convention,
+        the same property :attr:`WorkspaceDescriptor.network_enabled` defaults
+        closed by rather than trusting every caller to ask for it.
+        """
+        descriptor = workspaces()
+        policy = effective_policy(provider)
+        implicit = provider.run(
+            descriptor.workspace_id,
+            provider_case.succeeding_command,
+            policy,
+            job_id="job-env-implicit",
+        )
+        explicit = provider.run(
+            descriptor.workspace_id,
+            provider_case.succeeding_command,
+            policy,
+            job_id="job-env-explicit",
+            env={},
+        )
+        assert implicit.status == explicit.status == STATUS_SUCCESS
+        assert implicit.exit_status == explicit.exit_status == 0
+        assert implicit.output == explicit.output
+
+    def test_env_never_appears_in_any_returned_structure_and_outlives_no_job(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """``env`` reaches one job's process, and nothing this seam hands back.
+
+        A caller handing a job a secret needs two guarantees at once: the
+        value never surfaces in anything headspace itself records — a job
+        outcome, a workspace descriptor, a removal disposition — and it does
+        not linger for a *second* job on the same workspace that never asked
+        for it (the docstring's "the value does not outlive the job it was
+        passed to"). Both are checked by scanning every structure the seam
+        hands back for a value no command in this suite ever echoes, so a hit
+        can only ever be a leak, never a job legitimately printing its own
+        input.
+        """
+        descriptor = workspaces()
+        policy = effective_policy(provider)
+        marker = f"headspace-conformance-secret-{uuid.uuid4().hex}"
+
+        carrying = provider.run(
+            descriptor.workspace_id,
+            provider_case.succeeding_command,
+            policy,
+            job_id="job-env-secret",
+            env={"HEADSPACE_CONFORMANCE_TOKEN": marker},
+        )
+        assert carrying.status == STATUS_SUCCESS
+        assert provider_case.echo_text in carrying.output
+
+        afterward = provider.run(
+            descriptor.workspace_id,
+            provider_case.succeeding_command,
+            policy,
+            job_id="job-env-afterward",
+        )
+        inspected = provider.inspect(descriptor.workspace_id)
+        disposition = provider.remove(descriptor.workspace_id)
+
+        walk = StructureWalk()
+        for label, structure in (
+            ("run-carrying-env", carrying),
+            ("run-afterward", afterward),
+            ("inspect", inspected),
+            ("remove", disposition),
+        ):
+            walk_structure(structure.to_dict(), label, walk)
+
+        leaked = [
+            path for path, value in walk.scalars if isinstance(value, str) and marker in value
+        ]
+        assert not leaked, f"the env value leaked into: {leaked}"
+
     # --- read -------------------------------------------------------------
 
     def _written(
@@ -978,6 +1070,305 @@ class ProviderConformance:
             provider.read(workspace_id, provider_case.artifact_path)
         assert caught.value.code == EXIT_INFRASTRUCTURE_FAILURE
         assert caught.value.remediation
+
+    # --- write: the inbound half of the durability boundary (issue #13/#14) -
+
+    def test_write_lands_bytes_a_read_finds_afterward(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """The copy-in round trip, proven through the seam alone.
+
+        ``write`` puts bytes in; ``read`` is the only sanctioned way back out.
+        Nothing here reaches into a backend's storage directly — the round
+        trip through the two verbs is the whole proof.
+        """
+        descriptor = workspaces()
+        content = b"headspace copy-in conformance payload\n" * 4
+        digest = hashlib.sha256(content).hexdigest()
+
+        provider.write(
+            descriptor.workspace_id, "copied-in.bin", io.BytesIO(content), expected_sha256=digest
+        )
+
+        with provider.read(descriptor.workspace_id, "copied-in.bin") as stream:
+            landed = b"".join(stream)
+        assert landed == content
+        assert hashlib.sha256(landed).hexdigest() == digest
+
+    def test_write_accepts_a_source_that_is_an_iterable_of_chunks_too(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """``ByteSource`` is one type with two shapes; a copy-in honours both."""
+        descriptor = workspaces()
+        content = b"chunked headspace copy-in conformance payload\n" * 4
+        digest = hashlib.sha256(content).hexdigest()
+        midpoint = len(content) // 2
+
+        provider.write(
+            descriptor.workspace_id,
+            "chunked.bin",
+            [content[:midpoint], content[midpoint:]],
+            expected_sha256=digest,
+        )
+
+        with provider.read(descriptor.workspace_id, "chunked.bin") as stream:
+            assert b"".join(stream) == content
+
+    def test_write_refuses_a_bare_bytes_object_on_every_backend(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """A bare ``bytes`` is not a ``ByteSource``, and both backends say so.
+
+        It satisfies ``Iterable`` structurally while iterating to ``int``, one
+        per byte — the wrong type, and ruinously slow besides. The outbound
+        path has always refused it (:func:`headspace.core.artifacts._reject_non_bytes`)
+        and the Docker backend refuses it inbound.
+
+        This test exists because the two backends once disagreed here: the fake
+        special-cased a bare ``bytes`` and accepted it, so a call that passed
+        against the fake failed against a real engine. That is the single
+        failure mode a fake exists to prevent, and a suite that lets the
+        stand-in be *more permissive* than the thing it stands in for is
+        manufacturing false confidence. Pinned on both backends so the
+        divergence cannot quietly return.
+        """
+        descriptor = workspaces()
+        content = b"a bare bytes object is not a byte source\n"
+        digest = hashlib.sha256(content).hexdigest()
+
+        with pytest.raises(CliError):
+            provider.write(
+                descriptor.workspace_id,
+                "bare.bin",
+                content,
+                expected_sha256=digest,
+            )
+
+    def test_write_refuses_a_digest_that_does_not_describe_the_source(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """A caller's stale or wrong digest is refused, and nothing lands.
+
+        Distinct from a landed-bytes re-hash disagreeing after the transfer
+        (which would mean the engine failed to deliver what it promised): this
+        is a digest that never described ``source`` to begin with, knowable —
+        and answered — before anything is transferred at all.
+        """
+        descriptor = workspaces()
+        content = b"headspace copy-in conformance payload\n"
+        wrong_digest = hashlib.sha256(b"not " + content).hexdigest()
+        source = io.BytesIO(content)
+
+        with pytest.raises(CliError) as caught:
+            provider.write(
+                descriptor.workspace_id,
+                "rejected.bin",
+                source,
+                expected_sha256=wrong_digest,
+            )
+        assert caught.value.code == EXIT_USER_ERROR
+        assert not isinstance(caught.value, ProviderError)
+
+        with pytest.raises(CliError) as missing:
+            provider.read(descriptor.workspace_id, "rejected.bin")
+        assert missing.value.code == EXIT_USER_ERROR
+
+    def test_write_refuses_a_destination_a_job_already_produced_without_overwrite(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """The existing-destination guard applies to a *job's* own output too.
+
+        Read-back's precedent applies here in the other direction: what proves
+        the destination is "already there" is something a job actually wrote,
+        never bytes a test seeded behind the provider's back (see ``_written``
+        and the module docstring's rule for :attr:`ProviderCase.writing_command`).
+        """
+        workspace_id = self._written(
+            provider, provider_case, workspaces, "job-writes-before-copyin"
+        )
+        content = b"a caller's replacement payload\n"
+        digest = hashlib.sha256(content).hexdigest()
+        source = io.BytesIO(content)
+
+        with pytest.raises(CliError) as caught:
+            provider.write(
+                workspace_id,
+                provider_case.artifact_path,
+                source,
+                expected_sha256=digest,
+            )
+        assert caught.value.code == EXIT_USER_ERROR
+        assert "overwrite" in caught.value.remediation.lower()
+
+        with provider.read(workspace_id, provider_case.artifact_path) as stream:
+            assert b"".join(stream) == provider_case.artifact_bytes
+
+    def test_write_with_overwrite_replaces_bytes_a_job_produced(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """Read-back after copy-in, proven through the seam, against job-produced state.
+
+        This is acceptance criterion 2 end to end: a job leaves an artifact, a
+        caller deliberately replaces it through ``write(..., overwrite=True)``,
+        and the only evidence trusted that the replacement really landed is
+        the same ``read`` every other test in this module trusts — never a
+        peek at storage the provider owns, and never a backend-specific
+        seeding shortcut.
+        """
+        workspace_id = self._written(
+            provider, provider_case, workspaces, "job-writes-before-overwrite"
+        )
+        content = b"a caller's deliberate replacement\n" * 3
+        digest = hashlib.sha256(content).hexdigest()
+
+        provider.write(
+            workspace_id,
+            provider_case.artifact_path,
+            io.BytesIO(content),
+            expected_sha256=digest,
+            overwrite=True,
+        )
+
+        with provider.read(workspace_id, provider_case.artifact_path) as stream:
+            landed = b"".join(stream)
+        assert landed == content
+        assert landed != provider_case.artifact_bytes
+
+    @pytest.mark.parametrize("escape", ["../etc/passwd", "/etc/passwd", "a/../../b", "", "   "])
+    def test_write_refuses_a_path_that_leaves_the_workspace(
+        self,
+        provider: Provider,
+        workspaces: Callable[..., WorkspaceDescriptor],
+        escape: str,
+    ) -> None:
+        """The same boundary ``read`` is refused at, refused here on the way in."""
+        descriptor = workspaces()
+        source = io.BytesIO(b"payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
+        with pytest.raises(CliError) as caught:
+            provider.write(
+                descriptor.workspace_id,
+                escape,
+                source,
+                expected_sha256=digest,
+            )
+        assert caught.value.code == EXIT_USER_ERROR
+        assert not isinstance(caught.value, ProviderError)
+
+    def test_write_refuses_an_unknown_workspace(
+        self, provider: Provider, provider_case: ProviderCase
+    ) -> None:
+        unknown_workspace_id = provider_case.workspace_id()
+        source = io.BytesIO(b"payload")
+        digest = hashlib.sha256(b"payload").hexdigest()
+        with pytest.raises(CliError) as caught:
+            provider.write(
+                unknown_workspace_id,
+                "out.bin",
+                source,
+                expected_sha256=digest,
+            )
+        assert caught.value.code == EXIT_USER_ERROR
+
+    # --- stop: ending a job without touching stored state (issue #13/#14) ---
+
+    def test_stop_reports_nothing_running_as_a_fact_never_an_error(
+        self, provider: Provider, workspaces: Callable[..., WorkspaceDescriptor]
+    ) -> None:
+        """A workspace with nothing in flight is the ordinary case, not a mistake.
+
+        Both backends have to agree here specifically: an earlier version of
+        the fake raised instead of reporting this fact — the same kind of
+        divergence a conformance suite exists to catch before a caller does.
+        """
+        descriptor = workspaces()
+        outcome = provider.stop(descriptor.workspace_id)
+        assert isinstance(outcome, StopOutcome)
+        assert outcome.workspace_id == descriptor.workspace_id
+        assert outcome.job_id is None
+        assert outcome.stopped is False
+
+    def test_stop_after_a_job_has_already_finished_still_reports_nothing_running(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """``run`` is synchronous; by the time it returns there is nothing to end."""
+        descriptor = workspaces()
+        outcome = provider.run(
+            descriptor.workspace_id,
+            provider_case.succeeding_command,
+            effective_policy(provider),
+            job_id="job-before-stop",
+        )
+        assert outcome.status == STATUS_SUCCESS
+
+        result = provider.stop(descriptor.workspace_id)
+        assert result.job_id is None
+        assert result.stopped is False
+
+    def test_stop_does_not_alter_the_workspaces_recorded_state(
+        self, provider: Provider, workspaces: Callable[..., WorkspaceDescriptor]
+    ) -> None:
+        """``stop`` is engine-side only; it must leave the descriptor's facts untouched.
+
+        The strongest proof available from outside the backend: what
+        ``inspect`` reports before and after has to be the same set of facts.
+        ``storage_bytes`` is left out on purpose — it is independently
+        *measured* on at least one backend, so comparing it would assert
+        something about measurement stability rather than about ``stop``.
+        """
+        descriptor = workspaces()
+        before = provider.inspect(descriptor.workspace_id)
+        provider.stop(descriptor.workspace_id)
+        after = provider.inspect(descriptor.workspace_id)
+        assert after.workspace_id == before.workspace_id
+        assert after.provider == before.provider
+        assert after.state == before.state
+        assert after.environment_digest == before.environment_digest
+        assert after.created_at == before.created_at
+        assert after.network_enabled == before.network_enabled
+        assert after.active_jobs == before.active_jobs
+        assert after.ref == before.ref
+
+    def test_stop_of_an_unknown_workspace_is_a_user_error(
+        self, provider: Provider, provider_case: ProviderCase
+    ) -> None:
+        unknown_workspace_id = provider_case.workspace_id()
+        with pytest.raises(CliError) as caught:
+            provider.stop(unknown_workspace_id)
+        assert caught.value.code == EXIT_USER_ERROR
+        assert caught.value.remediation
+
+    def test_stop_outcome_is_backend_neutral_and_serialises_every_field(
+        self, provider: Provider, workspaces: Callable[..., WorkspaceDescriptor]
+    ) -> None:
+        """``StopOutcome`` earns the same two mechanical checks every other structure does."""
+        descriptor = workspaces()
+        outcome = provider.stop(descriptor.workspace_id)
+        payload = outcome.to_dict()
+        json.dumps(payload)
+
+        walk = walk_structure(payload, "stop")
+        assert not walk.violations
+
+        declared = {f.name for f in dataclasses.fields(outcome)}
+        assert set(payload) == declared
 
     # --- remove -----------------------------------------------------------
 

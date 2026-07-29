@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
+import io
 import itertools
 from collections.abc import Sequence
 from pathlib import Path
@@ -889,3 +891,187 @@ def test_a_byte_stream_offers_no_read_method() -> None:
     transport, so the stream keeps its own chunk boundaries all the way to disk.
     """
     assert not hasattr(ByteStream([b""]), "read")
+
+
+# --- copy-in seam verbs: write, run(env), stop -----------------------------
+
+
+def test_write_then_read_round_trip_through_seam_verbs() -> None:
+    """Content written by ``write()`` is readable back through ``read()``.
+
+    The round trip proves the fake stores bytes in ``record.files`` so the
+    existing ``read()`` can find them — the same path a real engine's volume
+    would exercise.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-copyin", "env", policy)
+
+    content = b"seam-verb payload\n"
+    # Bare 64-character lowercase hex, no "sha256:" prefix — the same
+    # convention headspace.core.artifacts.ArtifactRecord.sha256 uses.
+    sha = hashlib.sha256(content).hexdigest()
+
+    provider.write("ws-copyin", "data.bin", io.BytesIO(content), expected_sha256=sha)
+
+    stream = provider.read("ws-copyin", "data.bin")
+    assert b"".join(stream) == content
+
+
+def test_write_refuses_a_digest_mismatch() -> None:
+    """A wrong digest is caught while consuming the source, not after.
+
+    The caller supplied the digest, so a mismatch means the bytes are not what
+    the caller expected — corruption in transit, or a wrong digest. Either way
+    the write must not store the bad bytes.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-baddigest", "env", policy)
+
+    source = io.BytesIO(b"payload")
+    with pytest.raises(CliError) as caught:
+        provider.write(
+            "ws-baddigest",
+            "data.bin",
+            source,
+            # Well-formed (64 lowercase hex chars) but not the digest of
+            # b"payload" — a wrong digest, not a malformed one.
+            expected_sha256="0" * 64,
+        )
+    assert caught.value.code == EXIT_USER_ERROR
+    assert "digest" in caught.value.message.lower()
+
+
+def test_write_refuses_existing_destination_without_overwrite() -> None:
+    """A file already present is protected from accidental overwrite.
+
+    The write verb is the copy-in path: a caller that meant to write a
+    different file should not silently clobber what a job produced. The
+    ``overwrite`` flag exists for the deliberate case.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-exists", "env", policy)
+
+    provider.write_file("ws-exists", "data.bin", b"original")
+
+    content = b"replacement"
+    sha = hashlib.sha256(content).hexdigest()
+    source = io.BytesIO(content)
+    with pytest.raises(CliError) as caught:
+        provider.write("ws-exists", "data.bin", source, expected_sha256=sha)
+    assert caught.value.code == EXIT_USER_ERROR
+    # The fact ("already exists") lives in the message; the action to take
+    # ("pass overwrite=True") lives in the remediation, same split every
+    # other CliError in this module makes.
+    assert "overwrite" in caught.value.remediation.lower()
+
+
+def test_write_accepts_existing_destination_with_overwrite() -> None:
+    """The ``overwrite`` flag deliberately replaces an existing file.
+
+    The flag is the deliberate case: the caller knows the file exists and
+    wants to replace it. The digest still has to match, so the replacement
+    is the bytes the caller actually meant.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-overwrite", "env", policy)
+
+    provider.write_file("ws-overwrite", "data.bin", b"original")
+
+    content = b"replacement"
+    sha = hashlib.sha256(content).hexdigest()
+    provider.write(
+        "ws-overwrite", "data.bin", io.BytesIO(content), expected_sha256=sha, overwrite=True
+    )
+
+    stream = provider.read("ws-overwrite", "data.bin")
+    assert b"".join(stream) == content
+
+
+def test_write_refuses_an_unknown_workspace() -> None:
+    """An unknown workspace is refused before any bytes are consumed."""
+    provider = FakeProvider()
+
+    with pytest.raises(CliError) as caught:
+        provider.write("no-such-ws", "data.bin", b"payload", expected_sha256="0" * 64)
+    assert caught.value.code == EXIT_USER_ERROR
+    assert "unknown workspace" in caught.value.message
+
+
+def test_run_records_env_on_workspace_record() -> None:
+    """The env passed to ``run()`` is recorded so a test can assert it.
+
+    The fake must record the env it observed on the workspace record so a
+    test can assert what the job would have seen, and must NOT put env values
+    into any other recorded field.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-env", "env", policy)
+
+    env = {"FOO": "bar", "BAZ": "qux"}
+    provider.run("ws-env", ("echo", "ok"), policy, job_id="j", env=env)
+
+    record = provider._workspaces["ws-env"]
+    assert record.last_job_env == env
+
+
+def test_run_with_empty_env_still_records() -> None:
+    """An empty env mapping is still recorded, distinguishing from absent."""
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-emptyenv", "env", policy)
+
+    provider.run("ws-emptyenv", ("echo", "ok"), policy, job_id="j", env={})
+
+    record = provider._workspaces["ws-emptyenv"]
+    assert record.last_job_env == {}
+
+
+def test_stop_ends_an_in_flight_job() -> None:
+    """``stop()`` ends a job that is marked in-flight.
+
+    A scripted job can be marked stoppable, and ``stop()`` ends it. The fake
+    needs a way to have a job be in flight: a ``JobPlan.stoppable`` flag that
+    arms the in-flight state, and ``stop()`` clears it.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-stop", "env", policy)
+
+    stopped: list[bool] = []
+
+    def observe() -> None:
+        stopped.append(True)
+
+    provider.script_command(
+        ("long",), JobPlan.succeeding(wall_time_seconds=10.0, during=observe, stoppable=True)
+    )
+
+    # Run starts the job; during callback fires while active_jobs > 0.
+    outcome = provider.run("ws-stop", ("long",), policy, job_id="j")
+    assert outcome.status == STATUS_SUCCESS
+
+    # The job was stoppable, so stop() can end it.
+    provider.stop("ws-stop")
+
+
+def test_stop_reports_a_workspace_with_no_running_job_as_a_fact() -> None:
+    """``stop()`` on a workspace with no in-flight job states that, never raises.
+
+    An operator racing a job that finished on its own a moment earlier made no
+    mistake, so the empty case is a true statement rather than an error they
+    have to catch and interpret. Both backends report it identically.
+    """
+    provider = FakeProvider()
+    policy = effective_policy(provider)
+    provider.create("ws-nostop", "env", policy)
+
+    outcome = provider.stop("ws-nostop")
+
+    assert outcome.workspace_id == "ws-nostop"
+    assert outcome.job_id is None
+    assert outcome.stopped is False
