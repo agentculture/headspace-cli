@@ -368,7 +368,7 @@ def test_stop_finds_the_job_by_role_label_and_signals_it(
 
     result = provider.stop(workspace)
 
-    assert result == {"workspace_id": workspace, "job_id": "job-1", "stopped": True}
+    assert result.to_dict() == {"workspace_id": workspace, "job_id": "job-1", "stopped": True}
     assert job.stop_calls, "container.stop() was never called"
 
 
@@ -395,7 +395,7 @@ def test_stop_escalates_to_kill_only_if_the_job_survives_the_graceful_stop(
 
     assert job.stop_calls
     assert job.kill_calls == 1
-    assert result == {"workspace_id": workspace, "job_id": "job-3", "stopped": True}
+    assert result.to_dict() == {"workspace_id": workspace, "job_id": "job-3", "stopped": True}
 
 
 def test_stop_reports_nothing_running_as_a_fact_not_a_failure(
@@ -404,7 +404,7 @@ def test_stop_reports_nothing_running_as_a_fact_not_a_failure(
     """No job container at all — the ordinary "already finished" race."""
     result = provider.stop(workspace)
 
-    assert result == {"workspace_id": workspace, "job_id": None, "stopped": False}
+    assert result.to_dict() == {"workspace_id": workspace, "job_id": None, "stopped": False}
 
 
 def test_stop_treats_a_stray_exited_job_container_as_nothing_running(
@@ -416,7 +416,7 @@ def test_stop_treats_a_stray_exited_job_container_as_nothing_running(
 
     result = provider.stop(workspace)
 
-    assert result == {"workspace_id": workspace, "job_id": None, "stopped": False}
+    assert result.to_dict() == {"workspace_id": workspace, "job_id": None, "stopped": False}
     assert not job.stop_calls
     assert job.kill_calls == 0
 

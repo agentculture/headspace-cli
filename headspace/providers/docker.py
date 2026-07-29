@@ -363,6 +363,7 @@ from headspace.providers.base import (
     OpaqueRef,
     ProviderError,
     RemovalDisposition,
+    StopOutcome,
     WorkspaceDescriptor,
     environment_digest,
     guard_removable,
@@ -2227,21 +2228,12 @@ class DockerProvider:
         started, because the last job already finished, or because it
         finished in the instant between an operator's decision and this call
         landing — is not a mistake, so it comes back as
-        ``{"job_id": None, "stopped": False}`` instead of a
+        a :class:`~headspace.providers.base.StopOutcome` naming no job
+        (``job_id`` is ``None``, ``stopped`` is ``False``) instead of a
         :class:`~headspace.providers.base.CliError`. That is deliberately the
-        same fact/failure split the seam-level ``StopOutcome`` draws on
-        ``fi/t1`` (not yet merged onto this branch's ``base.py`` — see below):
-        a caller racing a job that just finished on its own gets a true
-        statement back, not an error it has to parse to learn the race was
-        harmless.
-
-        Returns a plain mapping shaped exactly like that dataclass's
-        ``to_dict()`` — ``workspace_id``, ``job_id``, ``stopped`` — rather
-        than the dataclass itself, because this branch's
-        ``headspace.providers.base`` does not define ``StopOutcome`` yet. The
-        shape is pinned to match it anyway, so wiring this into the real type
-        once it lands is a mechanical ``StopOutcome(**result)``, not a
-        redesign.
+        same fact/failure split the seam draws: a caller racing a job that just
+        finished on its own gets a true statement back, not an error it has to
+        parse to learn the race was harmless.
 
         Raises :class:`~headspace.providers.base.CliError` (exit 1) for a
         workspace id this backend holds no anchor container for at all — the
@@ -2257,7 +2249,7 @@ class DockerProvider:
 
             job = self._find(client, workspace_id, ROLE_JOB)
             if job is None or not self._container_is_live(job):
-                return {"workspace_id": workspace_id, "job_id": None, "stopped": False}
+                return StopOutcome(workspace_id=workspace_id, job_id=None, stopped=False)
 
             job_id = job.labels.get(LABEL_JOB_ID)
             job.stop(timeout=STOP_GRACE_SECONDS)
@@ -2265,7 +2257,7 @@ class DockerProvider:
             if self._container_is_live(job):
                 job.kill()
 
-        return {"workspace_id": workspace_id, "job_id": job_id, "stopped": True}
+        return StopOutcome(workspace_id=workspace_id, job_id=job_id, stopped=True)
 
     def remove(self, workspace_id: str) -> RemovalDisposition:
         """Tear the workspace down and report what actually went away.

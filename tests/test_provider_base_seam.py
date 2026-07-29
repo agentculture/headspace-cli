@@ -185,8 +185,8 @@ def test_write_signature_matches_the_documented_contract() -> None:
     sig = inspect.signature(Provider.write)
     params = sig.parameters
     assert list(params)[:4] == ["self", "workspace_id", "path", "source"]
-    assert params["sha256"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert params["sha256"].default is inspect.Parameter.empty
+    assert params["expected_sha256"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["expected_sha256"].default is inspect.Parameter.empty
     assert params["overwrite"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["overwrite"].default is False
 

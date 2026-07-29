@@ -1076,7 +1076,7 @@ class Provider(Protocol):
         path: str,
         source: ByteSource,
         *,
-        sha256: str,
+        expected_sha256: str,
         overwrite: bool = False,
     ) -> None:
         """Stream one file's bytes into a workspace, verified by the engine.
@@ -1089,8 +1089,11 @@ class Provider(Protocol):
         bytes travel as a :data:`~headspace.core.artifacts.ByteSource` — a
         stream to read from or an iterable of chunks — the same shape an
         export reads from, so a copy-in and an export share one representation
-        for bytes in motion. ``sha256`` is the digest the caller already
-        computed from the same bytes ``source`` will yield; the engine
+        for bytes in motion. ``expected_sha256`` is the digest the caller
+        already computed from the same bytes ``source`` will yield — named to
+        match :func:`headspace.core.artifacts.export_artifact`, so the inbound
+        and outbound halves of the durability boundary ask for a digest by the
+        same name; the engine
         re-hashes what actually lands in the workspace, and the two must agree
         before anything is kept.
 

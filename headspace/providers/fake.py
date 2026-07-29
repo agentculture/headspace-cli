@@ -70,6 +70,7 @@ from headspace.providers.base import (
     OpaqueRef,
     ProviderError,
     RemovalDisposition,
+    StopOutcome,
     WorkspaceDescriptor,
     environment_digest,
     guard_removable,
@@ -294,6 +295,10 @@ class _Workspace:
     #: ``_Workspace`` is already private at the class level, so the fields
     #: inside it do not need to re-assert that individually.
     job_in_flight: bool = False
+    #: The id of the job ``run()`` last started. ``stop()`` echoes it back so a
+    #: caller stopping several workspaces can tell which outcome belongs to
+    #: which job — the same fact the Docker backend reads off a container label.
+    last_job_id: str | None = None
 
 
 class FakeProvider:
@@ -437,6 +442,7 @@ class FakeProvider:
         started_at = utc_now()
 
         record.active_jobs += 1
+        record.last_job_id = job_id
         if plan.stoppable:
             record.job_in_flight = True
         try:
@@ -594,29 +600,31 @@ class FakeProvider:
 
         record.files[relative] = b"".join(chunks)
 
-    def stop(self, workspace_id: str) -> None:
-        """End an in-flight job on ``workspace_id``.
+    def stop(self, workspace_id: str) -> StopOutcome:
+        """End an in-flight job on ``workspace_id``, and state what was found.
 
-        A stop is an action, not a no-op: it requires a job to be running.
-        If nothing is running, the caller should know — a stop that silently
-        succeeds would hide the fact that the caller stopped the wrong thing.
+        A workspace holding no in-flight job is **not** an error here, and that
+        is a deliberate correction: an operator racing a job that finished on
+        its own a moment earlier made no mistake, and raising at them would
+        turn the ordinary case into a failure they have to handle. So the
+        empty case is reported as a fact — ``job_id`` is ``None``, ``stopped``
+        is ``False`` — exactly as :class:`~headspace.providers.base.StopOutcome`
+        describes, and exactly as the Docker backend reports it. An unknown
+        workspace is still refused: that one really is the caller naming
+        something that does not exist.
 
         The fake tracks in-flight jobs through :attr:`_Workspace.job_in_flight`,
         which is set by :meth:`run` when the plan is stoppable. There is
-        nothing here for a real process to signal, so ending the job is
-        just clearing that flag — the same event a live engine would report
-        through a very different mechanism (killing a container). Returns
-        nothing: a caller that wants confirmation calls :meth:`inspect`.
+        nothing here for a real process to signal, so ending the job is just
+        clearing that flag — the same event a live engine reports through a
+        very different mechanism (signalling, then killing, a container).
         """
         workspace_id = require_workspace_id(workspace_id)
         record = self._require(workspace_id)
         if not record.job_in_flight:
-            raise CliError(
-                code=EXIT_USER_ERROR,
-                message=f"no running job on workspace {workspace_id}",
-                remediation="stop is only valid while a job is in flight",
-            )
+            return StopOutcome(workspace_id=workspace_id, job_id=None, stopped=False)
         record.job_in_flight = False
+        return StopOutcome(workspace_id=workspace_id, job_id=record.last_job_id, stopped=True)
 
     # --- internals --------------------------------------------------------
 

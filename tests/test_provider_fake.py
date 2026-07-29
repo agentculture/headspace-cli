@@ -1054,17 +1054,19 @@ def test_stop_ends_an_in_flight_job() -> None:
     provider.stop("ws-stop")
 
 
-def test_stop_refuses_a_workspace_with_no_running_job() -> None:
-    """``stop()`` on a workspace with no in-flight job reports that honestly.
+def test_stop_reports_a_workspace_with_no_running_job_as_a_fact() -> None:
+    """``stop()`` on a workspace with no in-flight job states that, never raises.
 
-    A stop is not a no-op: it is an action that requires a job to be running.
-    If nothing is running, the caller should know.
+    An operator racing a job that finished on its own a moment earlier made no
+    mistake, so the empty case is a true statement rather than an error they
+    have to catch and interpret. Both backends report it identically.
     """
     provider = FakeProvider()
     policy = effective_policy(provider)
     provider.create("ws-nostop", "env", policy)
 
-    with pytest.raises(CliError) as caught:
-        provider.stop("ws-nostop")
-    assert caught.value.code == EXIT_USER_ERROR
-    assert "no" in caught.value.message.lower() and "running" in caught.value.message.lower()
+    outcome = provider.stop("ws-nostop")
+
+    assert outcome.workspace_id == "ws-nostop"
+    assert outcome.job_id is None
+    assert outcome.stopped is False
