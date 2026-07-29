@@ -134,7 +134,9 @@ job job-9324b5e5a3cd ran python -c ... in workspace demo and reported success
 success
 ## Evidence
 - label: captured output
-  - source: headspace inspect job-9324b5e5a3cd --logs
+  - kind: excerpt
+  - source: job-9324b5e5a3cd
+  - truncated: false
   - excerpt:
     pi=3.1415926536 check_passed=True
 ## Suggested attention
@@ -239,11 +241,19 @@ The MVP Docker provider also supports no host-path mounts at all, so
 | `5` | cancelled | the caller asked for it to stop. |
 | `6` | computation_failed | the job ran correctly and produced a failing result. |
 | `7` | infrastructure_failure | the engine or environment broke — not a computational failure. |
+| `8` | resource_exhausted | the job was killed for exceeding its declared memory ceiling. |
 
-`0`–`2` are the original CLI-error codes and are unchanged. `3`–`7` are the
+`0`–`2` are the original CLI-error codes and are unchanged. `3`–`8` are the
 failure taxonomy, mirroring the result package's `status` vocabulary one to
 one — a caller learns *why* a job failed from the exit code alone, without
 parsing text.
+
+A command the image cannot execute at all is reported as `6`
+(`computation_failed`), not `7` — it is the caller's mistake, not a broken
+engine, and retrying it unchanged will not help. The job's own `exit_status`
+follows shell convention so the two ways a command can be unrunnable stay
+distinguishable: `127` when the command was not found, `126` when it was
+found but not executable.
 
 ## Mesh identity
 

@@ -1,0 +1,627 @@
+{
+  "slug": "honest-failure-taxonomy",
+  "title": "honest failure taxonomy",
+  "frame_slug": "honest-failure-taxonomy",
+  "schema_version": 4,
+  "status": "exported",
+  "created": "2026-07-28T21:47:06Z",
+  "updated": "2026-07-28T21:58:30Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "headspace tells an agent why a job really died: a command the image cannot execute is reported as the caller's error instead of a broken engine, and a job killed for exceeding its memory ceiling says so by name instead of hiding behind exit status 137",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "both defects are demonstrated fixed by re-running the exact live-test reproductions that found them, against the real docker provider, not only against the fake",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "docker run() must stop reporting a command the image cannot execute as a broken engine: container.start() (providers/docker.py:674) sits inside _engine(), and _ENGINE_FAILURES (providers/docker.py:326) catches DockerException \u2014 the base class of APIError \u2014 so Docker's 400 'executable file not found in $PATH' becomes exit 7 with a 'check the engine is running, then retry' hint, a deterministic failure the caller is told to retry forever",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "running a command absent from the image exits 6 with a full nine-section result package whose key findings name both the profile and the executable it lacks, and neither stdout nor stderr contains a container id, an http+docker:// URL, or any other raw engine string",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c3",
+      "kind": "requirement",
+      "text": "docker run() must detect an OOM kill: _await_exit already calls container.reload() (providers/docker.py:1109), so container.attrs['State'] is fresh where exit_status is read at :678 and carries OOMKilled alongside ExitCode \u2014 the signal is available with zero extra engine calls",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "an OOM-killed job is detected from container.attrs['State']['OOMKilled'] using only the reload _await_exit already performs \u2014 a test pins that run() issues no additional engine call for the detection",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c4",
+      "kind": "requirement",
+      "text": "a job killed for exceeding its memory ceiling must name that ceiling in the result package's warnings and attention sections, the way a timeout already names its budget \u2014 live testing produced only 'the command completed with exit status 137' with warnings and attention both empty, leaving an agent no signal to raise --memory-bytes rather than retry unchanged",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "an OOM-killed job's result names the enforced ceiling in bytes in a key finding AND carries an attention entry naming the remedy (raise --memory-bytes or reduce the working set), in both the markdown and --json renderings",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c5",
+      "kind": "requirement",
+      "text": "max_memory_bytes must not under-report the peak that caused a kill: the same live run reported 5320704 bytes for a process killed at the 134217728-byte ceiling, because _Usage.sample() polls on the _await_exit loop and misses the final spike \u2014 the number most relevant to the failure is the one the report gets most wrong",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "whenever a job was OOM-killed, the resource_usage rendering labels max_memory_bytes as a sampled floor rather than a maximum, and no code path ever substitutes the ceiling for the measured value",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c7",
+      "kind": "requirement",
+      "text": "both new behaviours must land in the fake provider as well as docker: providers/fake.py:302 run() builds its JobOutcome from a scripted JobPlan, and tests/conformance.py is 'one behavioural contract, any backend' \u2014 a behaviour only docker implements is one the conformance suite structurally cannot cover, which is this repo's analogue of culture's all-backends rule",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "the fake provider can script both a non-executable command and a memory kill, and every new conformance case passes against the docker AND fake bindings \u2014 with the fake case running on a host with no engine installed",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c8",
+      "kind": "requirement",
+      "text": "tests/conformance.py must grow cases for both failures, which means new ProviderCase fields (it already carries failing_command, slow_command, flooding_command and break_engine at :165-198) that every existing binding must supply \u2014 the docker and fake bindings both",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "the conformance suite fails if a provider reports either failure as infrastructure_failure, and both existing bindings supply every new ProviderCase field",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c9",
+      "kind": "requirement",
+      "text": "the documented taxonomy must stay in sync wherever it is published: README.md:240-241 (the exit-code table), headspace/cli/_commands/learn.py:78-79 (the self-teaching prompt an agent actually reads), and docs/traceability.md:30 (requirement 10)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "README's exit-code table, learn.py's self-teaching prompt, and traceability.md requirement 10 all name code 8 and the reclassified command-not-executable path, and requirement 10's gap column no longer lists these two defects",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c10",
+      "kind": "boundary",
+      "text": "the exit-code band is a stable additive contract: headspace/cli/_errors.py states 'extend downward-compatibly, never renumber an existing code' \u2014 codes 0-7 keep their present meanings, and any new category takes a new number rather than repurposing one",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "a test asserts the exit-code mapping for 0 through 7 is unchanged \u2014 same codes, same category names \u2014 so the change can only add 8 and can never silently re-point an existing code",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c11",
+      "kind": "boundary",
+      "text": "JOB_STATUSES is a closed vocabulary (providers/base.py:165-169: success, partial_success, failure, cancelled, timeout) and base.py:668 states that infrastructure_failure and policy_denied are raised as ProviderError/PolicyError, never returned as an outcome \u2014 so a provider cannot simply invent a new job status without changing that contract deliberately",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h15",
+      "kind": "honesty",
+      "text": "no provider can return a status absent from JOB_STATUSES (JobOutcome.__post_init__ already refuses it), and the new member is added in the same commit as its exit-code row so the two never disagree",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c18",
+      "kind": "requirement",
+      "text": "the exit-8 decision requires four coordinated edits that must land together: STATUSES in core/result.py:97-106, JOB_STATUSES in providers/base.py:164, the _STATUS_EXIT_CODES map in core/workspace.py:273-281, and EXIT_RESOURCE_EXHAUSTED plus EXIT_CATEGORIES and TAXONOMY_CODES in cli/_errors.py \u2014 result.py's own comment warns the tuple is 'shared verbatim with the exit-code mapping', so a partial edit breaks the mapping silently",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "a test asserts that STATUSES, JOB_STATUSES, _STATUS_EXIT_CODES and EXIT_CATEGORIES all agree about resource_exhausted, so landing any one of the four edits without the others fails the suite rather than breaking the mapping silently",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c19",
+      "kind": "requirement",
+      "text": "four test modules pin the status/exit-code vocabulary and must be extended with the new row: tests/test_exit_codes.py, tests/test_workspace.py, tests/test_cli_verbs.py and tests/conformance.py \u2014 docs/traceability.md already records that test_exit_code_for_status_uses_the_documented_taxonomy parametrizes only success, failure and timeout, leaving the other rows unpinned, so the new code should arrive pinned rather than inherit that gap",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "test_exit_code_for_status_uses_the_documented_taxonomy parametrizes resource_exhausted alongside its existing rows, closing rather than widening the incompleteness traceability.md:30 already records",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c20",
+      "kind": "requirement",
+      "text": "the change carries a version bump and a CHANGELOG entry per CLAUDE.md's version-bump-every-PR rule, which CI enforces; the current version is 0.8.1 and a new exit code in a published contract is a minor bump, not a patch",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "pyproject.toml declares 0.9.0, CHANGELOG.md carries the matching entry, and the version-check CI job passes",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c21",
+      "kind": "audience",
+      "text": "agent runtimes that drive headspace as a subprocess and branch on its exit code without a human in the loop \u2014 the embodiment consumer this hand-over is for, specifically \u2014 and secondarily the humans reading the same result markdown",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h16",
+      "kind": "honesty",
+      "text": "both reproductions are verified through the CLI's real process exit code and --json payload \u2014 the surface a subprocess consumer actually reads \u2014 not through in-process Python assertions alone",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c22",
+      "kind": "before_state",
+      "text": "a command the image cannot execute and a genuinely broken Docker daemon are the same exit 7 carrying the same 'check the engine is running and reachable, then retry' hint, and a job the kernel killed at its memory ceiling is indistinguishable from a job whose own logic failed: both are exit 6, 'the command completed with exit status 137', with empty warnings and empty attention",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h17",
+      "kind": "honesty",
+      "text": "each defect gets a regression test that demonstrably fails against today's code and passes after the fix, so the before-state is pinned rather than described",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c23",
+      "kind": "after_state",
+      "text": "a caller can tell four things apart from the exit code alone \u2014 a command that was never executable, a job killed for exceeding a declared budget, an ordinary failing computation, and an engine that actually broke \u2014 without parsing prose",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h18",
+      "kind": "honesty",
+      "text": "one test drives all four outcomes \u2014 a non-executable command, a budget kill, an ordinary failing computation, and a broken engine \u2014 and asserts four distinct exit codes from one workspace",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c24",
+      "kind": "why_it_matters",
+      "text": "an autonomous consumer acts on the exit code, so a wrong code is not cosmetic: today's classification tells an agent to retry a deterministic failure forever, and gives it no signal to raise --memory-bytes instead of re-running an identical job that will be killed identically",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h19",
+      "kind": "honesty",
+      "text": "a resource_exhausted result's attention entry names an actionable remedy, so an agent reading it has a next move other than re-running an identical job",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c25",
+      "kind": "success_signal",
+      "text": "the two live-test reproductions inverted: 'headspace run <ws> definitely-not-a-binary' exits 6 with a full result package naming the profile and the missing executable and no Docker API string anywhere, and a 512 MiB allocation under --memory-bytes 134217728 exits 8 with status resource_exhausted naming the ceiling and the remedy",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h20",
+      "kind": "honesty",
+      "text": "both reproductions run against --provider docker in the integration suite and skip cleanly on a host with no engine, so the success signal is checked against the real backend rather than only the fake",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c26",
+      "kind": "requirement",
+      "text": "OOM detection must key on State.OOMKilled and never on exit status 137: verified live on this host that a genuine memory kill reports OOMKilled=true ExitCode=137, while an ordinary process exiting deliberately with SystemExit(137) reports OOMKilled=false ExitCode=137 \u2014 the exit status alone cannot tell a killed job from one that chose that code, so inferring resource_exhausted from 137 would misclassify an honest computational failure as a budget breach",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "a job that deliberately exits 137 without being killed is still reported as an ordinary failure (exit 6), and only a job carrying OOMKilled=true is reported as resource_exhausted (exit 8) \u2014 both cases are pinned by tests",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c27",
+      "kind": "requirement",
+      "text": "timeout keeps precedence over resource_exhausted: headspace's own wall-clock enforcer stops a job with container.kill() (docker.py:1120), which also yields exit 137, so a job that both outran its clock and pressed against its memory ceiling must still report timeout \u2014 the status must name what actually stopped the job, and headspace stopping it deliberately outranks the kernel's budget",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "a job that is killed by the wall-clock enforcer reports timeout (exit 4) even when OOMKilled is true, and a test covers that ordering explicitly rather than leaving it to whichever branch runs first",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c28",
+      "kind": "requirement",
+      "text": "the not-executable matcher must cover all five observed engine wordings, not just the one the live test happened to hit: probing the docker SDK directly produced 'executable file not found in $PATH' (binary absent from PATH), 'stat <path>: no such file or directory' (absolute path absent), 'is a directory: permission denied' (a directory), and bare 'permission denied' (an existing non-executable file) \u2014 matching only the first wording would leave three of the four still misreported as infrastructure_failure with a retry hint",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h21",
+      "kind": "honesty",
+      "text": "all four probed variants are covered by tests and each is reported as a caller error rather than exit 7",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c29",
+      "kind": "requirement",
+      "text": "the synthesized job exit status must follow the shell convention properly: 127 when the command was not found (absent from PATH, or an absolute path that does not stat) and 126 when it was found but could not be executed (a directory, or a file without the execute bit) \u2014 the exported spec says 127 uniformly, which would report a permission problem as a lookup failure and mislead an agent into re-spelling a command that was actually there",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h22",
+      "kind": "honesty",
+      "text": "a directory and a non-executable file each yield exit_status 126 while an absent binary yields 127, pinned separately by tests",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c30",
+      "kind": "requirement",
+      "text": "the matcher must fail safe toward infrastructure_failure: reclassify only on a confident match of the container-init exec step ('error during container init: exec:', the substring common to all four probed variants), and leave every other 400 on container.start() as exit 7 \u2014 because the opposite misclassification is the more dangerous one, telling an agent a genuinely broken engine is its own bad command and to stop retrying, and defaulting to 7 is exactly today's behaviour, so an unmatched case is a no-op rather than a regression",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h23",
+      "kind": "honesty",
+      "text": "a 400 that is not an exec-step failure still reports infrastructure_failure, pinned by a test that feeds a non-exec 400 through the same path",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c31",
+      "kind": "boundary",
+      "text": "the additive-band framing must not be read as 'no consumer behaviour changes': exit code 8 is a new number, but the OOM case MOVES from 6 to 8 and the not-executable case MOVES from 7 to 6, so a consumer with an explicit branch table sees cases leave the arms they used to land in \u2014 the CHANGELOG and README must say this plainly rather than describing the change as purely additive",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h24",
+      "kind": "honesty",
+      "text": "the CHANGELOG entry names both movements (OOM 6->8, not-executable 7->6) explicitly, not only the addition of code 8",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c32",
+      "kind": "boundary",
+      "text": "a caller legitimately sees two different numbers for one event \u2014 headspace's process exit code (6, the taxonomy category) and the job's own exit_status inside the result package (127 or 126, the command's status) \u2014 and this is correct, not an inconsistency to be harmonised later: they answer different questions, and JobOutcome's invariants already require a non-zero exit_status for a failure status",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h25",
+      "kind": "honesty",
+      "text": "a test asserts the pairing explicitly (process exit 6 alongside exit_status 127/126) so a future change cannot quietly collapse the two",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c33",
+      "kind": "requirement",
+      "text": "a misclassification must stay diagnosable without putting the engine string back into the caller's context: the full engine message should remain retrievable through the existing bounded-evidence escape hatch (the same 'headspace inspect <handle> --logs' path a truncated result already names) rather than being discarded entirely \u2014 otherwise claim c12 buys context cleanliness at the cost of leaving a matcher misfire with no evidence trail at all",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h26",
+      "kind": "honesty",
+      "text": "the raw engine message is absent from the result package's rendered sections yet recoverable for the job handle, and a test asserts both halves",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c34",
+      "kind": "requirement",
+      "text": "the fix must not regress the security improvement it incidentally delivers: today's failure discloses a container id and the engine's internal http+docker://localhost/v1.52/... URL to whatever consumes the CLI's stderr, and suppressing that is an information-disclosure fix as well as a context-hygiene one, so it belongs in the CHANGELOG as such",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h27",
+      "kind": "honesty",
+      "text": "the CHANGELOG names the removal of the container id and engine URL from error output as an information-disclosure fix, and a test asserts neither appears in stdout or stderr for the not-executable path",
+      "deferred": false,
+      "deferred_reason": ""
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Widen the failure taxonomy: add resource_exhausted and exit code 8 across all four vocabulary surfaces in one commit",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "STATUSES (core/result.py), JOB_STATUSES (providers/base.py), _STATUS_EXIT_CODES (core/workspace.py) and EXIT_RESOURCE_EXHAUSTED/EXIT_CATEGORIES/TAXONOMY_CODES (cli/_errors.py) all carry resource_exhausted -> 8, landed together",
+        "a test iterates STATUSES and asserts every member has a row in both _STATUS_EXIT_CODES and EXIT_CATEGORIES, so removing any one of the four edits fails the suite",
+        "a test compares the exit-code mapping for 0 through 7 against a literal expected dict and passes unchanged, proving no existing code was renumbered or re-pointed",
+        "test_exit_code_for_status_uses_the_documented_taxonomy parametrizes resource_exhausted alongside cancelled, policy_denied and infrastructure_failure, closing the gap traceability.md:30 records"
+      ],
+      "deps": [],
+      "covers": [
+        "c18",
+        "h8",
+        "c10",
+        "h14",
+        "c11",
+        "h15",
+        "c19",
+        "h9"
+      ],
+      "instruction": "FILES YOU OWN: headspace/core/result.py, headspace/providers/base.py, headspace/core/workspace.py, headspace/cli/_errors.py, tests/test_exit_codes.py, tests/test_workspace.py. Append STATUS_RESOURCE_EXHAUSTED to STATUSES (result.py:97-106) and JOB_STATUSES (base.py:164), add the row to _STATUS_EXIT_CODES (workspace.py:273-281), and add EXIT_RESOURCE_EXHAUSTED=8 to _errors.py with its EXIT_CATEGORIES and TAXONOMY_CODES entries. NOTE result.py's comment says 'treat this tuple as frozen' \u2014 read it precisely: it forbids RENAMING a member, and appending is exactly what cli/_errors.py's additive band permits. Do not renumber or re-point any code 0-7."
+    },
+    {
+      "id": "t2",
+      "summary": "Classify a command the image cannot execute as the caller's error, not a broken engine",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "an APIError from container.start() whose message contains 'error during container init: exec:' yields a JobOutcome with status failure instead of propagating to _ENGINE_FAILURES",
+        "all four probed wordings are covered: 'executable file not found in $PATH', 'stat <path>: no such file or directory', 'is a directory: permission denied', and bare 'permission denied'",
+        "exit_status is 127 for the two not-found wordings and 126 for the two found-but-not-executable wordings",
+        "a 400 that is NOT an exec-step failure re-raises unchanged and still reports infrastructure_failure (exit 7), pinned by a test",
+        "the key finding names the profile and the caller's argv[0]; stdout and stderr contain no container id, no 'http+docker' substring and no '400 Client Error'",
+        "the full engine message remains retrievable for the job handle via the captured-output path, while absent from the rendered result sections"
+      ],
+      "deps": [],
+      "covers": [
+        "c2",
+        "h1",
+        "c28",
+        "h21",
+        "c29",
+        "h22",
+        "c30",
+        "h23",
+        "c33",
+        "h26",
+        "c34",
+        "h27"
+      ],
+      "instruction": "FILES YOU OWN: headspace/providers/docker.py, tests/test_docker_classification.py (new file). In DockerProvider.run(), catch APIError around container.start() specifically, BEFORE it reaches _engine()'s DockerException handler. Match the substring 'error during container init: exec:' \u2014 verified common to all four wordings \u2014 then branch on the specific wording for 126 vs 127. Anything else re-raises UNCHANGED so it keeps today's exit-7 behaviour; that direction is deliberate, because reading a broken engine as a caller error would make an agent abandon work it should retry. Build the key finding from the profile name and argv[0]; never interpolate the engine's message into it. You do NOT depend on t1 \u2014 use the existing STATUS_FAILURE vocabulary."
+    },
+    {
+      "id": "t3",
+      "summary": "Detect an OOM kill from State.OOMKilled and report it as resource_exhausted",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "OOMKilled is read from container.attrs['State'] at the same point ExitCode is read, using only the reload _await_exit already performs \u2014 no additional engine call",
+        "status is gated on OOMKilled being true and never on exit_status == 137: a job deliberately running SystemExit(137) is still reported as an ordinary failure (exit 6)",
+        "a job killed by the wall-clock enforcer reports timeout (exit 4) even when OOMKilled is true, pinned by a test that sets both conditions rather than relying on branch order"
+      ],
+      "deps": [
+        "t2",
+        "t1"
+      ],
+      "covers": [
+        "c3",
+        "h2",
+        "c26",
+        "h11",
+        "c27",
+        "h12"
+      ],
+      "instruction": "FILES YOU OWN: headspace/providers/docker.py, tests/test_docker_classification.py. YOU MUST BUILD ON t2's merged state \u2014 same file, sequenced deliberately. Read State['OOMKilled'] at docker.py:678 where ExitCode is already read; _await_exit's reload() at :1109 already made it fresh, so add no engine call. Gate the new status on OOMKilled being true and NEVER on exit_status == 137: verified live that a deliberate SystemExit(137) gives OOMKilled=false with ExitCode=137, so 137 alone cannot distinguish the cases. In _status(), evaluate timed_out BEFORE the OOM branch so a wall-clock kill still reports timeout."
+    },
+    {
+      "id": "t4",
+      "summary": "Make the result package name the memory ceiling and label the sampled peak a floor",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a resource_exhausted result carries a key finding naming the enforced memory ceiling in bytes and an attention entry naming an actionable remedy, in both markdown and --json",
+        "max_memory_bytes is labelled a sampled floor in the rendering whenever the job was OOM-killed, and no code path substitutes the ceiling for the measured value"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c4",
+        "h3",
+        "c5",
+        "h4"
+      ],
+      "instruction": "FILES YOU OWN: headspace/core/workspace.py, headspace/core/result.py, tests/test_result.py. Key the new finding and attention entry off the resource_exhausted status; get the ceiling from requested_limit(policy,'memory'). The floor label belongs in the RENDERER \u2014 do not change the measured value, and never substitute the ceiling for it. This mirrors the enforced-vs-measured honesty the storage limit already uses."
+    },
+    {
+      "id": "t5",
+      "summary": "Teach the fake provider to script both new failures",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "JobPlan can script a non-executable command and a memory kill, mirroring how it already scripts infrastructure_failure and timeout",
+        "the fake's new behaviour is exercised on a host with no Docker engine installed"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c7",
+        "h5"
+      ],
+      "instruction": "FILES YOU OWN: headspace/providers/fake.py. Extend JobPlan with fields scripting a non-executable command and a memory kill, mirroring how it already scripts infrastructure_failure (fake.py:314) and timeout. The fake is a genuine second implementation, not a stub \u2014 it is what makes the suite runnable with no engine installed, so its behaviour must match docker's at the seam."
+    },
+    {
+      "id": "t6",
+      "summary": "Extend the conformance suite so both backends are held to the new taxonomy",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "ProviderCase gains fields for a non-executable command and a memory kill, and both bindings (test_provider_docker.py, test_provider_fake.py) supply every new field",
+        "the suite fails if a provider reports either failure as infrastructure_failure",
+        "the new cases pass against the docker binding and the fake binding, with the docker binding skipping cleanly when no engine is present"
+      ],
+      "deps": [
+        "t3",
+        "t5"
+      ],
+      "covers": [
+        "c8",
+        "h6"
+      ],
+      "instruction": "FILES YOU OWN: tests/conformance.py, tests/test_provider_docker.py, tests/test_provider_fake.py. Add ProviderCase fields (conformance.py:165-198) and the suite methods; BOTH bindings must supply every new field or they fail to construct. The module header says binders must not edit conformance.py \u2014 that rule is for binders; you are the suite author. Existing tests test_run_reports_a_failing_job_without_calling_it_infrastructure (:594) and test_run_status_never_claims_infrastructure_or_policy (:612) already assert this intent \u2014 extend that lineage rather than duplicating it."
+    },
+    {
+      "id": "t7",
+      "summary": "Pin both defects with the live-test reproductions that found them",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "each regression test is written first and demonstrably fails against pre-fix HEAD before the fix lands",
+        "'headspace run <ws> definitely-not-a-binary' exits 6 with a full result package naming the profile and the missing executable, asserted via subprocess on the real process exit code and the --json payload",
+        "a 512 MiB allocation under --memory-bytes 134217728 exits 8 with status resource_exhausted, naming the ceiling in a key finding and a remedy in a non-empty attention entry",
+        "one test drives four outcomes from one workspace \u2014 not executable, budget kill, ordinary failing computation, broken engine \u2014 and asserts four distinct exit codes",
+        "a test asserts the pairing of process exit 6 with in-package exit_status 127/126 together, so the two numbers cannot later be quietly collapsed",
+        "both reproductions live behind the existing engine-present skip guard in tests/test_integration_docker.py"
+      ],
+      "deps": [
+        "t3",
+        "t4",
+        "t1"
+      ],
+      "covers": [
+        "c1",
+        "h13",
+        "c21",
+        "h16",
+        "c22",
+        "h17",
+        "c23",
+        "h18",
+        "c24",
+        "h19",
+        "c25",
+        "h20",
+        "c32",
+        "h25"
+      ],
+      "instruction": "FILES YOU OWN: tests/test_integration_docker.py. Write each regression test FIRST and confirm it fails against pre-fix HEAD \u2014 a test that passes before the fix proves nothing. Drive the CLI by subprocess and assert on the real process exit code and --json payload, since that is the surface a subprocess consumer reads. Keep both reproductions behind the existing engine-present skip guard."
+    },
+    {
+      "id": "t8",
+      "summary": "Sync every surface that publishes the taxonomy",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "README.md's exit-code table, learn.py's self-teaching prompt and traceability.md requirement 10 all name code 8 and the reclassified not-executable path",
+        "traceability.md requirement 10's gap column no longer lists these two defects",
+        "markdownlint-cli2 passes on every edited markdown file"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c9",
+        "h7"
+      ],
+      "instruction": "FILES YOU OWN: README.md, headspace/cli/_commands/learn.py, docs/traceability.md. README's exit table is at :236-241, learn.py's prompt at :74-79. traceability.md requirement 10 is at :30 and is ALREADY marked Partial \u2014 update its status and gap columns; these two defects were gaps in that row, so the row improves rather than gaining a new entry. Run markdownlint-cli2 on every markdown file you touch."
+    },
+    {
+      "id": "t9",
+      "summary": "Release the contract change honestly: version bump and a CHANGELOG that names what moved",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "pyproject.toml declares 0.9.0 and the version-check CI job passes",
+        "the CHANGELOG entry names both case movements explicitly \u2014 OOM kills 6 -> 8 and not-executable 7 -> 6 \u2014 under a Changed heading, not only 'Added: exit code 8'",
+        "the CHANGELOG names the removal of the container id and engine API URL from error output as an information-disclosure fix"
+      ],
+      "deps": [
+        "t2",
+        "t3",
+        "t4",
+        "t5",
+        "t6",
+        "t7",
+        "t8"
+      ],
+      "covers": [
+        "c20",
+        "h10",
+        "c31",
+        "h24"
+      ],
+      "instruction": "FILES YOU OWN: pyproject.toml, CHANGELOG.md. Use the version-bump skill for a MINOR bump to 0.9.0 \u2014 a new exit code in a published contract is not a patch. The CHANGELOG must name both case MOVEMENTS under Changed (OOM kills 6->8, not-executable 7->6), not only 'Added: exit code 8': the code numbers are additive but two failure cases change which code they emit, and a reader could take 'additive' as a compatibility guarantee it does not make. Also name the removal of the container id and engine API URL as an information-disclosure fix."
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "t2 and t3 both edit DockerProvider.run(); they are sequenced by an explicit dependency for file-disjointness at merge, not because t3 needs t2's logic \u2014 a scheduler that ignores the dep and runs them in one wave will collide",
+      "kind": "unknown_nonblocking",
+      "task_id": "t3",
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r2",
+      "text": "widening ProviderCase is a breaking change for any out-of-tree conformance binding, which would fail to construct until it supplies the new fields; in-tree there are only two bindings and both are updated by t6",
+      "kind": "unknown_nonblocking",
+      "task_id": "t6",
+      "resolved": false,
+      "resolution": ""
+    }
+  ]
+}

@@ -50,9 +50,13 @@ import pytest
 
 import headspace.core.workspace as workspace_module
 from headspace.cli._errors import (
+    EXIT_CANCELLED,
+    EXIT_CATEGORIES,
     EXIT_COMPUTATION_FAILED,
     EXIT_ENV_ERROR,
     EXIT_INFRASTRUCTURE_FAILURE,
+    EXIT_POLICY_DENIED,
+    EXIT_RESOURCE_EXHAUSTED,
     EXIT_TIMEOUT,
     EXIT_USER_ERROR,
     CliError,
@@ -71,9 +75,15 @@ from headspace.core.policy import (
 )
 from headspace.core.profiles import DEFAULT_PROFILE
 from headspace.core.result import (
+    STATUS_CANCELLED,
     STATUS_FAILURE,
+    STATUS_INFRASTRUCTURE_FAILURE,
+    STATUS_PARTIAL_SUCCESS,
+    STATUS_POLICY_DENIED,
+    STATUS_RESOURCE_EXHAUSTED,
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
+    STATUSES,
     Artifact,
 )
 from headspace.core.states import State
@@ -1082,6 +1092,10 @@ def test_only_exported_artifacts_reach_the_result_packages_artifact_section(
         (STATUS_SUCCESS, 0),
         (STATUS_FAILURE, EXIT_COMPUTATION_FAILED),
         (STATUS_TIMEOUT, EXIT_TIMEOUT),
+        (STATUS_CANCELLED, EXIT_CANCELLED),
+        (STATUS_POLICY_DENIED, EXIT_POLICY_DENIED),
+        (STATUS_INFRASTRUCTURE_FAILURE, EXIT_INFRASTRUCTURE_FAILURE),
+        (STATUS_RESOURCE_EXHAUSTED, EXIT_RESOURCE_EXHAUSTED),
     ],
 )
 def test_exit_code_for_status_uses_the_documented_taxonomy(status: str, code: int) -> None:
@@ -1091,6 +1105,52 @@ def test_exit_code_for_status_uses_the_documented_taxonomy(status: str, code: in
 def test_exit_code_for_an_unknown_status_is_refused() -> None:
     with pytest.raises(CliError):
         exit_code_for_status("invented")
+
+
+def test_every_status_has_a_row_in_the_exit_code_mapping_and_its_category() -> None:
+    """Landing any one of the four vocabulary edits without the others must fail here.
+
+    Iterates the shared :data:`STATUSES` tuple rather than a hand-picked subset,
+    so a status appended to that tuple without a matching row in either
+    ``_STATUS_EXIT_CODES`` or ``EXIT_CATEGORIES`` breaks this test instead of
+    surfacing later as a silent, unmapped status.
+    """
+    status_exit_codes = workspace_module._STATUS_EXIT_CODES
+    for status in STATUSES:
+        assert status in status_exit_codes, f"{status!r} has no row in _STATUS_EXIT_CODES"
+        code = status_exit_codes[status]
+        assert (
+            code in EXIT_CATEGORIES
+        ), f"exit code {code} for {status!r} has no EXIT_CATEGORIES row"
+
+
+def test_exit_code_mapping_for_codes_0_through_7_is_unchanged() -> None:
+    """A literal pin of the pre-existing mapping: proves no code 0-7 was renumbered.
+
+    Compared against a hand-written dict rather than derived from the module
+    under test, so a future edit that re-points an existing code (rather than
+    only appending a new one) fails this test even if it also updates whatever
+    it was checked against.
+    """
+    expected = {
+        STATUS_SUCCESS: 0,
+        STATUS_PARTIAL_SUCCESS: 0,
+        STATUS_FAILURE: EXIT_COMPUTATION_FAILED,
+        STATUS_TIMEOUT: EXIT_TIMEOUT,
+        STATUS_CANCELLED: EXIT_CANCELLED,
+        STATUS_POLICY_DENIED: EXIT_POLICY_DENIED,
+        STATUS_INFRASTRUCTURE_FAILURE: EXIT_INFRASTRUCTURE_FAILURE,
+    }
+    for status, code in expected.items():
+        assert exit_code_for_status(status) == code
+    assert set(expected.values()) == {
+        0,
+        EXIT_COMPUTATION_FAILED,
+        EXIT_TIMEOUT,
+        EXIT_CANCELLED,
+        EXIT_POLICY_DENIED,
+        EXIT_INFRASTRUCTURE_FAILURE,
+    }
 
 
 # --- layering -------------------------------------------------------------

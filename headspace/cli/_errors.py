@@ -27,6 +27,10 @@ from dataclasses import dataclass
 #            6 = computation_failed     ran correctly, produced a failing result
 #            7 = infrastructure_failure engine/environment broke — NOT a
 #                                       computational failure
+#            8 = resource_exhausted     killed for exceeding a declared
+#                                       resource ceiling (e.g. an OOM kill) —
+#                                       NOT an ordinary computational failure
+#                                       and NOT an infrastructure failure
 # Additive band: extend downward-compatibly, never renumber an existing code.
 EXIT_SUCCESS = 0
 EXIT_USER_ERROR = 1
@@ -36,6 +40,7 @@ EXIT_TIMEOUT = 4
 EXIT_CANCELLED = 5
 EXIT_COMPUTATION_FAILED = 6
 EXIT_INFRASTRUCTURE_FAILURE = 7
+EXIT_RESOURCE_EXHAUSTED = 8
 
 # Exit code -> category name, so structured error output can NAME the
 # category instead of making a caller memorize integers.
@@ -48,6 +53,7 @@ EXIT_CATEGORIES: dict[int, str] = {
     EXIT_CANCELLED: "cancelled",
     EXIT_COMPUTATION_FAILED: "computation_failed",
     EXIT_INFRASTRUCTURE_FAILURE: "infrastructure_failure",
+    EXIT_RESOURCE_EXHAUSTED: "resource_exhausted",
 }
 
 # The reserved 3+ band — the failure taxonomy proper. Plain-text rendering
@@ -61,6 +67,7 @@ TAXONOMY_CODES = frozenset(
         EXIT_CANCELLED,
         EXIT_COMPUTATION_FAILED,
         EXIT_INFRASTRUCTURE_FAILURE,
+        EXIT_RESOURCE_EXHAUSTED,
     }
 )
 
