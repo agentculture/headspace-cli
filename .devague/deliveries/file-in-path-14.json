@@ -1,0 +1,80 @@
+{
+  "plan_slug": "file-in-path-14",
+  "schema_version": 1,
+  "created": "2026-07-29T08:55:13Z",
+  "updated": "2026-07-29T10:50:27Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "merge t1 (Provider protocol tightening) after t4 and t5 land, instead of at the end of wave 1 \u2014 task execution order and all acceptance criteria are unchanged; only the merge point moves",
+      "task_ref": "t1",
+      "reason": "t1 adds write/stop to the runtime_checkable Provider protocol, but DockerProvider only satisfies it at t4 (wave 2) and t5 (wave 3). Merging t1 at the end of wave 1 makes test_provider_satisfies_the_protocol fail for the docker binding across two full waves, which violates assign-to-workforce's hard rule that tests pass after every merge. Deferring t1's merge keeps the protocol tightening simultaneous with the backends satisfying it, so the suite stays green at every merge point.",
+      "affects": [
+        "t3",
+        "t4",
+        "t5",
+        "c2",
+        "h2"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d2",
+      "what": "the main agent reconciles two signature divergences at merge time rather than re-dispatching the task agents: the digest keyword becomes expected_sha256 (t1 authored sha256) and the fake's stop() returns StopOutcome (t1 authored the dataclass, t3 returned None)",
+      "task_ref": "t1",
+      "reason": "t1 and t3 built the two halves of one seam concurrently in wave 1 and diverged on two names despite pinned briefs. expected_sha256 wins because it matches the established convention in core/artifacts.py::export_artifact; StopOutcome wins because a verb that reports what it found beats one that reports nothing. Reconciling at the merge point costs one small commit; re-dispatching both agents costs a wave.",
+      "affects": [
+        "t3",
+        "c42"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d3",
+      "what": "serialize every test run that touches the live Docker engine: no merge gate runs while a task agent is running its suite, and Docker-heavy tasks are staggered rather than dispatched alongside a gate",
+      "task_ref": "t6",
+      "reason": "The t6 merge gate went red on two Docker tests that both pass in isolation, with no leaked engine resources; a re-run with the t4 agent quiescent gave 763 passed / 0 failed. Cause: t4's agent was running its own full suite against the same Docker daemon as the gate, and this project's live-engine tests use deterministic object names (headspace-<workspace_id>), so two concurrent suites collide on shared engine state. The plan's wave structure guarantees file-disjointness, which says nothing about a shared external resource \u2014 the daemon is a single global object every worktree reaches into, so 'parallel = serial' holds for the source tree and breaks for the engine.",
+      "affects": [
+        "t4",
+        "t5",
+        "t12",
+        "t14"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "needs-follow-up"
+    },
+    {
+      "id": "d4",
+      "what": "honesty condition h6 is satisfied per-verb, not uniformly: 'headspace put' records path+sha256 in all four surfaces including outcome_summary, but 'run --input' deliberately summarises a copy-in by file count and total bytes in outcome_summary while still recording path+sha256 in provenance.inputs, the journal intent payload and state.json",
+      "task_ref": "t11",
+      "reason": "h6 as confirmed says the marker test yields an outcome_summary containing the file's path and sha256. A multi-file run --input cannot list every file's path and digest in a one-line summary without becoming the unbounded blob the result package exists to avoid, so _run_summary reports count and total bytes instead. The load-bearing half of c6/h6 \u2014 path and digest recorded, contents never \u2014 holds on every surface for both verbs; only the outcome_summary rendering differs, and t11 pinned that difference with an explicit assertion rather than switching verbs to make the test pass.",
+      "affects": [
+        "c6",
+        "h6",
+        "t7"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d5",
+      "what": "confirmed claim c43 ships half-met: the stop verb reports cancelled/exit 5 on every backend, but the stopped job's own recorded outcome on Docker stays failure/exit 137 and its run invocation exits 6 \u2014 tracked as issue #16, not silently absorbed",
+      "task_ref": "t8",
+      "reason": "The job's outcome is written by the concurrent run invocation from what its backend reports, and DockerProvider._status has no branch that can produce STATUS_CANCELLED. Verified live, not inferred. It is not a one-line fix: docker.py's own docstring establishes that exit 137 with OOMKilled false is indistinguishable from a job that deliberately exited 137, so the backend needs a cross-process discriminator that stop can set and run can read \u2014 and stop is engine-side-only by design (no lock, no state write), so that discriminator cannot be a state file. Choosing where it may live is a design decision that deserves its own change and its own live test rather than being improvised at the end of a large delivery. t8's tests pin the contract on the fake and none pretends Docker already meets it.",
+      "affects": [
+        "c43",
+        "h38",
+        "t12"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "needs-follow-up"
+    }
+  ]
+}
