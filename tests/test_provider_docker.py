@@ -1192,18 +1192,6 @@ class TestOnlyVerifiedBytesAreCommitted:
         assert not (volume_root / "out.bin").is_symlink()
         assert _tree(_staging_of(copy_in_anchor)) == []
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "KNOWN HOLE, not a flake: FINALIZE_WRITE_SCRIPT's '[ -f \"$staged\" ]' and its "
-            "sha256sum both follow a link, so a job that replaces the staged payload with a "
-            "symlink to a file it controls passes verification and 'mv -f' renames the LINK "
-            "into the caller's destination. The copy-in reports success and the destination "
-            "resolves outside the volume. Remedy is one clause in the script: refuse when "
-            "'[ -L \"$staged\" ]'. Remove this marker with the fix — strict=True makes the "
-            "test fail the day it starts passing."
-        ),
-    )
     def test_a_staged_payload_swapped_for_a_link_is_never_committed(
         self,
         copy_in_provider: DockerProvider,

@@ -707,6 +707,17 @@ WRITE_ESCAPES_VOLUME = 14
 WRITE_DESTINATION_EXISTS = 15
 WRITE_DESTINATION_IS_DIRECTORY = 16
 WRITE_STAGED_FILE_MISSING = 17
+#: The staged path is a symlink rather than the regular file the transfer put
+#: there. Checked before anything reads it, because ``[ -f ]`` and ``sha256sum``
+#: both *follow* a link: a job sharing the volume can race the window between
+#: the transfer and this exec, replace the staged file with a link to a path it
+#: controls, and have the digest certify the link's target. Every later check
+#: would then pass and ``mv`` would rename the link itself into the caller's
+#: destination — a file inside the workspace resolving outside the volume,
+#: whose bytes the job can still rewrite after the copy-in reported success.
+#: The digest is what makes this fatal rather than untidy: it would be a true
+#: statement about bytes nobody can rely on afterwards.
+WRITE_STAGED_PATH_IS_A_LINK = 18
 
 #: How large a bite is taken out of the caller's source at a time.
 WRITE_CHUNK_BYTES = 1 << 20
@@ -806,6 +817,7 @@ dest=$5
 expected=$6
 overwrite=$7
 trap 'rm -rf "$staging" 2>/dev/null || true' EXIT
+[ ! -L "$staged" ] || { echo "headspace-write: $staged"; exit 18; }
 [ -f "$staged" ] || { echo "headspace-write: $staged"; exit 17; }
 actual=$(sha256sum "$staged")
 actual=${actual%% *}
@@ -1057,6 +1069,36 @@ def _landed_digest_disagrees(
             "the workspace volume rewrote the staged bytes before they were verified — "
             "retry the copy-in, and if it repeats, stop any job writing to the workspace "
             "first"
+        ),
+    )
+
+
+def _staged_path_is_a_link(workspace_id: str, relative: str) -> ProviderError:
+    """The staged file became a symlink between the transfer and the check.
+
+    Nothing legitimate produces this. The transfer writes one regular file into
+    a directory this exec created a moment earlier under a name no caller
+    chooses, so a link standing there means something else sharing the volume
+    put it there — and the only thing it buys is the one thing the verification
+    exists to prevent. ``[ -f ]`` and ``sha256sum`` both follow a link, so a
+    link pointing at a job-controlled copy of the payload hashes to exactly the
+    digest the caller declared; every later check passes, and the rename moves
+    *the link* into the destination. The caller is then told a path holds bytes
+    with a verified digest, when it holds a pointer to bytes the job can
+    rewrite at will.
+
+    Infrastructure rather than caller error, for the same reason a digest
+    mismatch is: the caller's own stream was already checked host-side, so
+    nothing they passed can cause this. Something raced them inside their
+    workspace.
+    """
+    return ProviderError(
+        f"the file staged in workspace {workspace_id} for '{relative}' was replaced by a "
+        "symlink before it could be verified — nothing was renamed into place",
+        remediation=(
+            "nothing was written: something sharing the workspace volume swapped the staged "
+            "file for a link while the copy-in was in flight. Stop any job running in the "
+            "workspace, then retry the copy-in"
         ),
     )
 
@@ -2082,6 +2124,8 @@ class DockerProvider:
         """
         if status == 0:
             return
+        if status == WRITE_STAGED_PATH_IS_A_LINK:
+            raise _staged_path_is_a_link(landing.workspace_id, landing.relative)
         if status == WRITE_DIGEST_MISMATCH:
             raise _landed_digest_disagrees(
                 landing.workspace_id, landing.relative, landing.expected_sha256, detail

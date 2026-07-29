@@ -593,18 +593,16 @@ class JobEnvironment:
     def provider_kwargs(self) -> dict[str, Mapping[str, str]]:
         """The ``env=`` keyword for :meth:`~headspace.providers.base.Provider.run`.
 
-        Present only when there is an environment to pass. That is not a
-        micro-optimisation: the seam's own default *is* the empty mapping, so
-        "no env" is expressed at the seam by absence, and a job that forwards
-        nothing produces exactly the call it produced before this feature
-        existed. Backends are structurally typed here (see
-        :mod:`headspace.providers.base` on why ``Provider`` is a ``Protocol``
-        rather than a base class), which means a correct backend written against
-        the seam as it stood is still a correct backend for every job that does
-        not use an environment — and it is not this module's place to break one
-        over a feature it was never asked to serve.
+        Always present, now that ``env`` is part of the seam every backend
+        implements. It was briefly conditional — omitted when there was nothing
+        to forward — while this feature's halves were being built in parallel
+        and one backend's ``run`` had not grown the parameter yet. That is a
+        scaffolding shape, not a design: passing the empty mapping explicitly is
+        exactly what the seam's own default already means, and a caller that
+        forwards nothing now produces the same call as one that forwards an
+        empty environment, because they are the same request.
         """
-        return {"env": self.values} if self.values else {}
+        return {"env": self.values}
 
     def __bool__(self) -> bool:
         return bool(self.values) or bool(self.sources)
