@@ -86,6 +86,8 @@ from headspace.core.store import HOME_ENV_VAR, Store
 from headspace.core.workspace import ArtifactDeclaration, Orchestrator
 from headspace.providers.base import ProviderError
 from headspace.providers.docker import (
+    EXIT_COMMAND_NOT_EXECUTABLE,
+    EXIT_COMMAND_NOT_FOUND,
     LABEL_CAPABILITY_PREFIX,
     LABEL_ENVIRONMENT,
     LABEL_LIMIT_PREFIX,
@@ -129,6 +131,23 @@ WRITING_COMMAND = (
     "-c",
     f"yes headspace | head -c {len(ARTIFACT_BYTES)} > {WORKSPACE_MOUNT_PATH}/{ARTIFACT_PATH}",
 )
+
+#: The conformance suite's two "this environment cannot run that" commands, on
+#: this engine. Both are refused by the container's init step rather than by a
+#: shell, so ``/bin/sh -c`` is deliberately absent: a shell would run, print its
+#: own diagnostic and exit 127 itself, which would prove the *shell* classifies
+#: correctly and say nothing about the provider. The second is a real file in
+#: the image with no execute bit, which is the 126 half — the two must not
+#: collapse to one number.
+ABSENT_COMMAND = ("definitely-not-a-binary",)
+UNRUNNABLE_COMMAND = ("/etc/hostname",)
+
+#: The conformance suite's memory case: an allocation four times the ceiling
+#: declared beneath it, so the kernel stops it well before any other budget
+#: bites. The ceiling is comfortably above what the environment needs to start,
+#: so a failure here is the allocation and never the interpreter's own startup.
+MEMORY_CEILING_BYTES = 128 * 1024 * 1024
+MEMORY_HUNGRY_COMMAND = ("python", "-c", f"x = bytearray({4 * MEMORY_CEILING_BYTES})")
 
 
 @functools.cache
@@ -221,6 +240,12 @@ class TestDockerProviderConformance(ProviderConformance):
             echo_text="headspace-conformance",
             failing_command=("/bin/sh", "-c", "exit 7"),
             failing_exit_status=7,
+            absent_command=ABSENT_COMMAND,
+            absent_exit_status=EXIT_COMMAND_NOT_FOUND,
+            unrunnable_command=UNRUNNABLE_COMMAND,
+            unrunnable_exit_status=EXIT_COMMAND_NOT_EXECUTABLE,
+            memory_hungry_command=MEMORY_HUNGRY_COMMAND,
+            memory_ceiling_bytes=MEMORY_CEILING_BYTES,
             slow_command=("sleep", "30"),
             slow_seconds=1,
             flooding_command=("/bin/sh", "-c", "yes headspace | head -c 200000"),

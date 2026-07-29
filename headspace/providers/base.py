@@ -149,6 +149,7 @@ from headspace.core.result import (
     STATUS_CANCELLED,
     STATUS_FAILURE,
     STATUS_PARTIAL_SUCCESS,
+    STATUS_RESOURCE_EXHAUSTED,
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
     ResourceUsage,
@@ -161,12 +162,16 @@ from headspace.core.states import State, validate_transition
 #: vocabulary minus the two that describe something other than the job.
 #: ``infrastructure_failure`` and ``policy_denied`` are raised, never returned
 #: (see the module docstring) — omitting them here is what makes that true.
+#: ``resource_exhausted`` (e.g. an OOM kill) *is* a statement about the job —
+#: the command ran and was stopped for exceeding a declared ceiling — so it
+#: belongs in this tuple, unlike the two that are raised instead.
 JOB_STATUSES: tuple[str, ...] = (
     STATUS_SUCCESS,
     STATUS_PARTIAL_SUCCESS,
     STATUS_FAILURE,
     STATUS_CANCELLED,
     STATUS_TIMEOUT,
+    STATUS_RESOURCE_EXHAUSTED,
 )
 
 #: Statuses that mean the command never produced an exit status of its own.
@@ -656,6 +661,13 @@ class JobOutcome:
     started_at: str
     finished_at: str
     usage: ResourceUsage = field(default_factory=ResourceUsage)
+    #: True only when the backend *observed* the environment refuse to exec
+    #: ``argv[0]``. It is deliberately not inferred from ``exit_status``: a
+    #: command that really ran can return 126 or 127 on its own account —
+    #: ``/bin/sh -c missing-tool`` runs the shell perfectly and returns 127
+    #: about a name the shell looked for. Only a backend that watched the
+    #: start fail can tell the two apart, so only a backend may set this.
+    command_refused: bool = False
 
     def __post_init__(self) -> None:
         if self.status not in JOB_STATUSES:
@@ -694,6 +706,18 @@ class JobOutcome:
                 message="a failed job cannot exit 0",
                 remediation=f"report status {STATUS_SUCCESS!r} for a zero exit status",
             )
+        if self.status == STATUS_RESOURCE_EXHAUSTED and self.exit_status == 0:
+            # Every other status carries a coherence rule; without this one a
+            # backend could report a job the kernel killed while also recording
+            # that its command succeeded, and the CLI would exit 8 over a zero.
+            raise CliError(
+                code=EXIT_USER_ERROR,
+                message="a job killed for exceeding a resource ceiling cannot exit 0",
+                remediation=(
+                    "report the status the kill produced (137 for a memory kill), or "
+                    f"status {STATUS_SUCCESS!r} if the command really succeeded"
+                ),
+            )
         captured = len(self.output.encode("utf-8"))
         if self.usage.output_bytes < captured:
             raise CliError(
@@ -715,7 +739,13 @@ class JobOutcome:
             "truncated": self.truncated,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "usage": self.usage.to_dict(),
+            # The stored record must not label the same measurement differently
+            # from the package the caller was shown: on a kill, the sample is a
+            # floor there and a floor here.
+            "usage": self.usage.to_dict(
+                memory_is_sampled_floor=self.status == STATUS_RESOURCE_EXHAUSTED
+            ),
+            "command_refused": self.command_refused,
         }
 
 

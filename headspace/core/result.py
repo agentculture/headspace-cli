@@ -47,6 +47,25 @@ path (:func:`inspect_path`), so a reader is never left guessing where the rest
 went. That marker is the contract's honesty clause: compression is allowed to
 hide volume, never to hide its own existence.
 
+Measured numbers, labelled with what they are
+---------------------------------------------
+The one value the rendering *derives* rather than copies is
+``resource_usage.max_memory_basis``, and it exists because peak memory is
+sampled rather than accounted: the figure is a lower bound always, and worst
+exactly where it matters, since a job killed at its memory ceiling was killed by
+the allocation spike a poller is least likely to catch. So a package whose
+status is :data:`STATUS_RESOURCE_EXHAUSTED` labels its own memory figure a
+sampled *floor* (:data:`MEMORY_BASIS_SAMPLED_FLOOR`), and every other package
+labels it a sampled peak. Deriving it from the status here, rather than storing
+it on :class:`ResourceUsage`, is what makes it structurally impossible for an
+exhausted result to present its sample as a maximum.
+
+The measured number itself is never touched, and the enforced ceiling is never
+substituted for it — that would state a figure headspace did not observe. The
+ceiling is named where it can be stated honestly, in the key finding the
+orchestrator writes for an exhausted job. Same enforced-versus-measured
+discipline the storage limit already keeps.
+
 The byte bound
 --------------
 :data:`DEFAULT_MAX_BYTES` is 8 KiB — roughly two thousand tokens, about one
@@ -86,6 +105,10 @@ from headspace.cli._errors import EXIT_USER_ERROR, CliError
 # --- status vocabulary ----------------------------------------------------
 # Shared verbatim with the exit-code mapping in headspace.cli._errors; renaming
 # a member here silently breaks that mapping, so treat this tuple as frozen.
+# Appending a new member is the sanctioned exception — the exit-code band is
+# additive by the same policy (see cli._errors: "extend downward-compatibly,
+# never renumber an existing code") — so a new status is added at the end,
+# never inserted or reordered.
 STATUS_SUCCESS = "success"
 STATUS_PARTIAL_SUCCESS = "partial_success"
 STATUS_FAILURE = "failure"
@@ -93,6 +116,7 @@ STATUS_CANCELLED = "cancelled"
 STATUS_TIMEOUT = "timeout"
 STATUS_POLICY_DENIED = "policy_denied"
 STATUS_INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+STATUS_RESOURCE_EXHAUSTED = "resource_exhausted"
 
 STATUSES: tuple[str, ...] = (
     STATUS_SUCCESS,
@@ -102,6 +126,7 @@ STATUSES: tuple[str, ...] = (
     STATUS_TIMEOUT,
     STATUS_POLICY_DENIED,
     STATUS_INFRASTRUCTURE_FAILURE,
+    STATUS_RESOURCE_EXHAUSTED,
 )
 
 # --- byte bound -----------------------------------------------------------
@@ -113,6 +138,28 @@ MIN_EXCERPT_BYTES = 80
 INSPECT_COMMAND = "headspace inspect"
 INSPECT_LOGS_FLAG = "--logs"
 TRUNCATION_MARKER_PREFIX = "[truncated:"
+
+# --- what the memory figure actually is -----------------------------------
+# Peak memory is *sampled*, not accounted: a poller reads the usage counter
+# every so often and keeps the highest reading. That makes the reported number
+# a lower bound in every case, and an especially bad one in the case where it
+# matters most — a job killed for exceeding its memory ceiling was killed *by*
+# the allocation spike a poller is least likely to catch. Live testing measured
+# 5320704 bytes for a process the kernel killed at a 134217728-byte ceiling.
+#
+# So the rendering states the basis of the number beside it. It is derived from
+# the package's own status by :meth:`ResultPackage.to_dict` rather than stored,
+# which is what makes it impossible for a ``resource_exhausted`` package to
+# present its sampled figure as a maximum. What it never does is *replace* the
+# figure: naming the ceiling here would state a number headspace did not
+# observe, and the enforced ceiling already has its own honest home in the
+# ``resource_exhausted`` key finding. Same enforced-vs-measured discipline the
+# storage limit keeps.
+MEMORY_BASIS_SAMPLED_PEAK = "sampled peak"
+MEMORY_BASIS_SAMPLED_FLOOR = (
+    "sampled floor, not a maximum -- the job was killed for exceeding its memory "
+    "ceiling, and sampling misses the spike that did it, so the true peak was higher"
+)
 
 SECTION_TITLES: dict[str, str] = {
     "outcome_summary": "Outcome summary",
@@ -232,6 +279,12 @@ class ResourceUsage:
 
     ``output_bytes`` is the volume actually captured — the number that explains
     to a reader why the evidence excerpts are truncated.
+
+    ``max_memory_bytes`` is a *sampled* peak, and the rendering says so: every
+    payload carries a ``max_memory_basis`` label next to it, which the caller of
+    :meth:`to_dict` sets from the outcome (see the module-level constants). The
+    stored number is never adjusted to match the label — a measurement stays a
+    measurement.
     """
 
     wall_time_seconds: float = 0.0
@@ -240,11 +293,13 @@ class ResourceUsage:
     storage_bytes: int = 0
     output_bytes: int = 0
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, memory_is_sampled_floor: bool = False) -> dict[str, Any]:
+        basis = MEMORY_BASIS_SAMPLED_FLOOR if memory_is_sampled_floor else MEMORY_BASIS_SAMPLED_PEAK
         return {
             "wall_time_seconds": self.wall_time_seconds,
             "cpu_seconds": self.cpu_seconds,
             "max_memory_bytes": self.max_memory_bytes,
+            "max_memory_basis": basis,
             "storage_bytes": self.storage_bytes,
             "output_bytes": self.output_bytes,
         }
@@ -332,7 +387,13 @@ class ResultPackage:
                 item.to_dict(text_budget=text_budget, fallback_ref=ref) for item in self.artifacts
             ],
             "warnings": [_fit_text(t, text_budget, ref)[0] for t in self.warnings],
-            "resource_usage": self.resource_usage.to_dict(),
+            # The one value the renderer *derives* rather than copies. Keying it
+            # on the package's own status is what makes it structurally
+            # impossible for a job killed at its memory ceiling to present its
+            # sampled figure as a maximum.
+            "resource_usage": self.resource_usage.to_dict(
+                memory_is_sampled_floor=self.status == STATUS_RESOURCE_EXHAUSTED
+            ),
             "provenance": self.provenance.to_dict(),
             "attention": [_fit_text(t, text_budget, ref)[0] for t in self.attention],
         }

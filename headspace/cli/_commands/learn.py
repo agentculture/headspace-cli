@@ -14,6 +14,7 @@ from headspace.cli._errors import (
     EXIT_COMPUTATION_FAILED,
     EXIT_INFRASTRUCTURE_FAILURE,
     EXIT_POLICY_DENIED,
+    EXIT_RESOURCE_EXHAUSTED,
     EXIT_TIMEOUT,
     category_for_code,
 )
@@ -75,9 +76,15 @@ Exit-code policy
   3 policy_denied — refused by policy before running
   4 timeout — wall-clock or budget limit hit
   5 cancelled — caller asked for it to stop
-  6 computation_failed — ran correctly, produced a failing result
+  6 computation_failed — ran correctly, produced a failing result. If the
+    job's own exit_status is 126 or 127, the command itself is what failed
+    (127 = not found, 126 = found but not executable) — fix the command,
+    do not retry it unchanged and do not suspect the engine.
   7 infrastructure_failure — engine/environment broke, not a computation
     failure
+  8 resource_exhausted — the job was killed for exceeding its declared
+    memory ceiling. Raise the memory budget (or shrink the job's working
+    set) before retrying; retrying unchanged will be killed again.
 
 More detail
 -----------
@@ -117,11 +124,16 @@ def _as_json_payload() -> dict[str, object]:
             "5": f"{category_for_code(EXIT_CANCELLED)} — caller asked for it to stop",
             "6": (
                 f"{category_for_code(EXIT_COMPUTATION_FAILED)} — ran correctly, "
-                "produced a failing result"
+                "produced a failing result; exit_status 127/126 means the command "
+                "itself is not found/not executable — fix the command, not the engine"
             ),
             "7": (
                 f"{category_for_code(EXIT_INFRASTRUCTURE_FAILURE)} — engine/environment "
                 "broke, not a computation failure"
+            ),
+            "8": (
+                f"{category_for_code(EXIT_RESOURCE_EXHAUSTED)} — killed for exceeding "
+                "its declared memory ceiling; raise the memory budget, do not retry unchanged"
             ),
         },
         "json_support": True,

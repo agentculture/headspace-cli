@@ -60,7 +60,12 @@ from headspace.providers.base import (
     require_command,
     require_workspace_path,
 )
-from headspace.providers.fake import FakeProvider, JobPlan
+from headspace.providers.fake import (
+    EXIT_COMMAND_NOT_EXECUTABLE,
+    EXIT_COMMAND_NOT_FOUND,
+    FakeProvider,
+    JobPlan,
+)
 from tests.conformance import (
     ProviderCase,
     ProviderConformance,
@@ -76,11 +81,19 @@ PROVIDERS_DIR = Path(__file__).resolve().parents[1] / "headspace" / "providers"
 # real backend treats an argv it hands to an engine.
 SUCCEEDING = ("headspace-echo", "conformance-ok")
 FAILING = ("headspace-exit", "7")
+ABSENT = ("headspace-absent",)
+UNRUNNABLE = ("headspace-unrunnable",)
+HUNGRY = ("headspace-allocate", "everything")
 SLOW = ("headspace-sleep", "forever")
 FLOODING = ("headspace-flood",)
 WRITING = ("headspace-write", "artifact.bin")
 ECHO_TEXT = "conformance-ok"
 FLOOD_BUDGET = 4096
+#: The ceiling the conformance memory case declares. The fake enforces no
+#: memory budget — :meth:`JobPlan.oom_killed` states the outcome directly — so
+#: the number is here only to make the case's two halves consistent, and it is
+#: deliberately the same order of magnitude a live engine needs.
+MEMORY_CEILING_BYTES = 128 * 1024 * 1024
 #: The same bytes the Docker binding's writing command produces, so both
 #: bindings hold the seam to one artifact rather than to two.
 ARTIFACT_PATH = "artifact.bin"
@@ -90,6 +103,28 @@ ARTIFACT_BYTES = (b"headspace\n" * 820)[:8192]
 def _scripted(provider: FakeProvider) -> FakeProvider:
     provider.script_command(SUCCEEDING, JobPlan.succeeding(output=f"{ECHO_TEXT}\n"))
     provider.script_command(FAILING, JobPlan.failing(exit_status=7, output="boom\n"))
+    # The two answers a real runtime gives for "I cannot run that", scripted
+    # apart: 127 is nothing under that name, 126 is there and not runnable. The
+    # conformance suite asserts they stay two numbers.
+    provider.script_command(
+        ABSENT,
+        JobPlan.not_executable(
+            exit_status=EXIT_COMMAND_NOT_FOUND,
+            output="headspace: no executable named 'headspace-absent' exists here\n",
+        ),
+    )
+    provider.script_command(
+        UNRUNNABLE,
+        JobPlan.not_executable(
+            exit_status=EXIT_COMMAND_NOT_EXECUTABLE,
+            output="headspace: 'headspace-unrunnable' exists here but cannot be executed\n",
+        ),
+    )
+    # Stopped at its memory ceiling, which is a fact about the job — the fake
+    # states it, where a live engine has to read it off the kernel's verdict.
+    provider.script_command(
+        HUNGRY, JobPlan.oom_killed(output="allocating until the ceiling stopped it\n")
+    )
     provider.script_command(SLOW, JobPlan.timing_out())
     # A genuine over-budget capture: the fake really truncates this string, so
     # the conformance assertion exercises the same code path a live engine does.
@@ -114,6 +149,12 @@ def _case_for(provider: FakeProvider) -> ProviderCase:
         echo_text=ECHO_TEXT,
         failing_command=FAILING,
         failing_exit_status=7,
+        absent_command=ABSENT,
+        absent_exit_status=EXIT_COMMAND_NOT_FOUND,
+        unrunnable_command=UNRUNNABLE,
+        unrunnable_exit_status=EXIT_COMMAND_NOT_EXECUTABLE,
+        memory_hungry_command=HUNGRY,
+        memory_ceiling_bytes=MEMORY_CEILING_BYTES,
         slow_command=SLOW,
         slow_seconds=1,
         flooding_command=FLOODING,
@@ -297,6 +338,43 @@ def test_the_conformance_suite_itself_fails_a_provider_that_leaks() -> None:
     suite = ProviderConformance()
     with pytest.raises(AssertionError, match="opaque backend handle"):
         suite.test_returned_structures_are_backend_neutral(provider, case, make)
+
+
+@pytest.mark.parametrize(
+    ("suite_test", "command"),
+    [
+        ("test_a_command_the_environment_cannot_run_is_the_callers_failure", ABSENT),
+        ("test_a_command_the_environment_cannot_run_is_the_callers_failure", UNRUNNABLE),
+        ("test_a_job_stopped_at_its_memory_ceiling_is_resource_exhausted", HUNGRY),
+    ],
+)
+def test_the_conformance_suite_fails_a_provider_that_blames_the_engine(
+    suite_test: str, command: Sequence[str]
+) -> None:
+    """The teeth again, on the taxonomy rather than on the neutrality scanner.
+
+    Both new cases exist because a backend genuinely can get them wrong in the
+    same direction: the engine reports a command it cannot exec, and a container
+    the kernel killed, through channels that also report the engine's own
+    breakage. So the miss to guard against is not "returns the wrong status" —
+    it is "raises :class:`ProviderError` instead of returning at all", which
+    would tell a caller to retry work that can never succeed. This scripts a
+    provider that makes exactly that mistake and drives the real conformance
+    method over it, asserting the suite objects rather than erroring out.
+    """
+    provider = FakeProvider()
+    case = _case_for(provider)
+    provider.script_command(command, JobPlan.breaking("the engine died"))
+    counter = itertools.count()
+
+    def make(policy: object = None) -> WorkspaceDescriptor:
+        return provider.create(
+            f"blaming-{next(counter)}", case.environment, effective_policy(provider)
+        )
+
+    suite = ProviderConformance()
+    with pytest.raises(pytest.fail.Exception, match="reported as an infrastructure failure"):
+        getattr(suite, suite_test)(provider, case, make)
 
 
 def test_key_words_splits_the_naming_styles_a_backend_might_use() -> None:

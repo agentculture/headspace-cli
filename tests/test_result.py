@@ -15,16 +15,22 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 
 import pytest
 
 from headspace.cli._errors import CliError
+from headspace.core.policy import Policy, ResourceBudget
+from headspace.core.profiles import DEFAULT_PROFILE
 from headspace.core.result import (
     DEFAULT_MAX_BYTES,
     INSPECT_COMMAND,
     INSPECT_LOGS_FLAG,
+    MEMORY_BASIS_SAMPLED_FLOOR,
+    MEMORY_BASIS_SAMPLED_PEAK,
     MIN_RENDER_BYTES,
     SECTION_TITLES,
+    STATUS_RESOURCE_EXHAUSTED,
     STATUSES,
     TRUNCATION_MARKER_PREFIX,
     Artifact,
@@ -37,6 +43,9 @@ from headspace.core.result import (
     render_json,
     render_markdown,
 )
+from headspace.core.store import HOME_ENV_VAR, Store
+from headspace.core.workspace import Orchestrator
+from headspace.providers.fake import FakeProvider, JobPlan
 
 # --- helpers --------------------------------------------------------------
 
@@ -137,6 +146,25 @@ def _headings(markdown: str) -> list[str]:
     return [line[3:].strip() for line in markdown.splitlines() if line.startswith("## ")]
 
 
+def _section(markdown: str, title: str) -> str:
+    """The body of one ``## <title>`` section, so an assertion cannot match elsewhere.
+
+    Load-bearing rather than tidy: the memory ceiling a key finding must name
+    also appears in the provenance section's policy summary, so a whole-document
+    substring check would pass even if the finding were never written.
+    """
+    body: list[str] = []
+    inside = False
+    for line in markdown.splitlines():
+        if line.startswith("## "):
+            inside = line[3:].strip() == title
+            continue
+        if inside:
+            body.append(line)
+    assert body, f"no section titled {title!r} in the rendering"
+    return "\n".join(body)
+
+
 def _dedented(markdown: str) -> str:
     """Markdown with nesting indentation removed, so multi-line leaves match contiguously."""
     return "\n".join(line.strip() for line in markdown.splitlines())
@@ -177,7 +205,15 @@ def test_default_package_never_carries_raw_logs() -> None:
     assert not banned & set(_keys(bounded_dict(_package()), []))
 
 
-def test_status_vocabulary_is_the_shared_seven() -> None:
+def test_status_vocabulary_is_the_shared_eight() -> None:
+    """Exact equality on purpose: the vocabulary is shared across four surfaces.
+
+    ``STATUSES`` is mirrored by ``JOB_STATUSES`` (providers/base.py),
+    ``_STATUS_EXIT_CODES`` (core/workspace.py) and ``EXIT_CATEGORIES``
+    (cli/_errors.py). A membership check would let a member be added here and
+    nowhere else; equality makes any change to the vocabulary fail loudly, which
+    is exactly the moment to go and check the other three.
+    """
     assert STATUSES == (
         "success",
         "partial_success",
@@ -186,6 +222,7 @@ def test_status_vocabulary_is_the_shared_seven() -> None:
         "timeout",
         "policy_denied",
         "infrastructure_failure",
+        "resource_exhausted",
     )
 
 
@@ -352,3 +389,150 @@ def test_renderers_are_pure_and_leave_the_package_untouched() -> None:
     assert render_markdown(package) == first_markdown
     assert render_json(package) == first_json
     assert package.evidence[0].excerpt == huge
+
+
+# --- what a failure is allowed to leave unsaid ----------------------------
+#
+# Two renderings of one honesty rule, so they live together in the file that
+# owns the rendering contract even though half the assembly happens in
+# :mod:`headspace.core.workspace`:
+#
+# * an OOM-killed job must name the ceiling it hit (the orchestrator knows the
+#   policy) and must label its sampled peak a *floor* (the renderer knows the
+#   status) — because the sampler polls, and the spike that triggered the kill
+#   is precisely the one it is most likely to miss;
+# * a command the image could not execute must name the profile and the
+#   caller's own ``argv[0]``, built from what headspace knows rather than from
+#   whatever sentence the engine happened to produce.
+#
+# The packages are built by driving a real :class:`Orchestrator` over the fake
+# provider, so the wiring is under test and not only the helpers.
+
+#: The ceiling the 2026-07-28 live test enforced (128 MiB) ...
+MEMORY_CEILING = 134217728
+#: ... and what the sampler actually observed under it before the kernel killed
+#: the job: low by a factor of about 25. This pair is the whole reason the label
+#: exists, so the fixtures use the real numbers rather than round ones.
+SAMPLED_PEAK = 5320704
+
+KILLED_COMMAND = ("allocate", "512MiB")
+KILLED_JOB = JobPlan(
+    status=STATUS_RESOURCE_EXHAUSTED,
+    exit_status=137,
+    output="Killed\n",
+    max_memory_bytes=SAMPLED_PEAK,
+)
+
+
+@pytest.fixture
+def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Store:
+    """A throwaway store root, never the real ``~/.headspace``."""
+    monkeypatch.setenv(HOME_ENV_VAR, str(tmp_path / "headspace-home"))
+    return Store()
+
+
+def _job_package(
+    plan: JobPlan,
+    command: tuple[str, ...],
+    store: Store,
+    *,
+    memory_bytes: int = MEMORY_CEILING,
+    workspace_id: str = "ws-ceiling",
+) -> ResultPackage:
+    """The result package one scripted job produces, through the real orchestrator."""
+    orchestrator = Orchestrator(FakeProvider(script={command: plan}), store)
+    orchestrator.create(
+        workspace_id=workspace_id,
+        policy=Policy(budget=ResourceBudget(memory_bytes=memory_bytes)),
+    )
+    return orchestrator.run(workspace_id, command)
+
+
+def test_a_resource_exhausted_result_names_the_ceiling_and_a_remedy(store: Store) -> None:
+    package = _job_package(KILLED_JOB, KILLED_COMMAND, store)
+    assert package.status == STATUS_RESOURCE_EXHAUSTED
+
+    payload = json.loads(render_json(package))
+    findings = " ".join(payload["key_findings"])
+    assert str(MEMORY_CEILING) in findings, "the finding must name the enforced ceiling in bytes"
+    assert "memory" in findings
+
+    assert payload["attention"], "an OOM kill must not leave the attention section empty"
+    remedy = " ".join(payload["attention"])
+    assert "--memory-bytes" in remedy
+    assert "working set" in remedy
+
+    markdown = render_markdown(package)
+    assert str(MEMORY_CEILING) in _section(markdown, SECTION_TITLES["key_findings"])
+    assert "--memory-bytes" in _section(markdown, SECTION_TITLES["attention"])
+
+
+def test_an_oom_kill_labels_the_sampled_peak_a_floor_and_keeps_the_number(store: Store) -> None:
+    package = _job_package(KILLED_JOB, KILLED_COMMAND, store)
+
+    # The measured value is untouched, and the ceiling is never put in its place.
+    assert package.resource_usage.max_memory_bytes == SAMPLED_PEAK
+    usage = json.loads(render_json(package))["resource_usage"]
+    assert usage["max_memory_bytes"] == SAMPLED_PEAK
+    assert usage["max_memory_basis"] == MEMORY_BASIS_SAMPLED_FLOOR
+    assert "floor" in usage["max_memory_basis"]
+
+    rendered = _section(render_markdown(package), SECTION_TITLES["resource_usage"])
+    assert f"max_memory_bytes: {SAMPLED_PEAK}" in rendered
+    assert MEMORY_BASIS_SAMPLED_FLOOR in rendered
+    assert str(MEMORY_CEILING) not in rendered, "the ceiling must not stand in for a measurement"
+
+
+@pytest.mark.parametrize("status", STATUSES)
+def test_only_an_exhausted_package_calls_its_sampled_memory_a_floor(status: str) -> None:
+    """The label is derived from the status, so the two can never disagree."""
+    package = _package(status=status)
+    expected = (
+        MEMORY_BASIS_SAMPLED_FLOOR
+        if status == STATUS_RESOURCE_EXHAUSTED
+        else MEMORY_BASIS_SAMPLED_PEAK
+    )
+    assert json.loads(render_json(package))["resource_usage"]["max_memory_basis"] == expected
+    assert expected in _section(render_markdown(package), SECTION_TITLES["resource_usage"])
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "wording"),
+    [(127, "not found"), (126, "not executable")],
+)
+def test_a_command_the_image_cannot_run_names_the_profile_and_argv0(
+    store: Store, exit_status: int, wording: str
+) -> None:
+    command = ("definitely-not-a-binary", "--iterations=4")
+    # `not_executable`, not `failing`: the finding is gated on the backend having
+    # OBSERVED the refusal, because a command that ran can return 126/127 itself.
+    package = _job_package(JobPlan.not_executable(exit_status=exit_status), command, store)
+
+    findings = " ".join(json.loads(render_json(package))["key_findings"])
+    assert DEFAULT_PROFILE in findings
+    assert "definitely-not-a-binary" in findings
+    assert str(exit_status) in findings
+    assert wording in findings
+    # argv[0], not the command line: the rest is already in provenance inputs.
+    assert "--iterations=4" not in findings
+
+
+def test_the_two_not_executable_statuses_do_not_share_a_finding(store: Store) -> None:
+    """126 and 127 tell a caller to do different things, so they cannot read alike."""
+    command = ("definitely-not-a-binary",)
+    not_found = _job_package(JobPlan.not_executable(exit_status=127), command, store)
+    not_executable = _job_package(
+        JobPlan.not_executable(exit_status=126), command, store, workspace_id="ws-126"
+    )
+    # Differing in the digits alone would not count: the two must say different
+    # things about what to do next, not just report different numbers.
+    assert not_found.key_findings != [
+        text.replace("126", "127") for text in not_executable.key_findings
+    ]
+
+
+def test_an_ordinary_non_zero_exit_keeps_the_plain_finding(store: Store) -> None:
+    """The branch is narrow: an ordinary failing computation reads exactly as before."""
+    package = _job_package(JobPlan.failing(exit_status=3), ("solver",), store)
+    assert package.key_findings == ["the command completed with exit status 3"]
+    assert package.attention == []

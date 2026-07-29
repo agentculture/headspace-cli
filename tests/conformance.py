@@ -40,6 +40,12 @@ Create ``tests/test_provider_<backend>.py``. **Do not edit this module.**
                 echo_text="headspace-conformance",
                 failing_command=("/bin/sh", "-c", "exit 7"),
                 failing_exit_status=7,
+                absent_command=("definitely-not-a-binary",),
+                absent_exit_status=127,
+                unrunnable_command=("/etc/hostname",),
+                unrunnable_exit_status=126,
+                memory_hungry_command=("python", "-c", "x = bytearray(512 * 1024 * 1024)"),
+                memory_ceiling_bytes=128 * 1024 * 1024,
                 slow_command=("sleep", "30"),
                 slow_seconds=1,
                 flooding_command=("/bin/sh", "-c", "yes headspace | head -c 200000"),
@@ -127,7 +133,12 @@ from headspace.core.policy import (
     ResourceBudget,
 )
 from headspace.core.policy import resolve as resolve_policy
-from headspace.core.result import STATUS_FAILURE, STATUS_SUCCESS, STATUS_TIMEOUT
+from headspace.core.result import (
+    STATUS_FAILURE,
+    STATUS_RESOURCE_EXHAUSTED,
+    STATUS_SUCCESS,
+    STATUS_TIMEOUT,
+)
 from headspace.core.states import State
 from headspace.providers.base import (
     ENVIRONMENT_DIGEST_RE,
@@ -172,6 +183,24 @@ class ProviderCase:
     #: A command that exits with :attr:`failing_exit_status` (non-zero).
     failing_command: Sequence[str]
     failing_exit_status: int
+    #: A command nothing in this environment provides — a typo, or a tool that
+    #: was never installed. It never runs at all, which is the caller's mistake
+    #: and never the engine's, so it has an exit status like any other failure.
+    absent_command: Sequence[str]
+    absent_exit_status: int
+    #: A path this environment *does* hold but cannot execute — no execute bit,
+    #: a directory, a data file. Supplied separately from :attr:`absent_command`
+    #: and asserted to report a different status, because the two send a caller
+    #: to different fixes: only one of them is a spelling to correct.
+    unrunnable_command: Sequence[str]
+    unrunnable_exit_status: int
+    #: A command that tries to hold more memory than :attr:`memory_ceiling_bytes`
+    #: at once, and is therefore stopped at the ceiling instead of finishing.
+    memory_hungry_command: Sequence[str]
+    #: The memory ceiling to declare so that happens. Must be low enough that
+    #: :attr:`memory_hungry_command` really exceeds it and high enough that the
+    #: environment can start at all.
+    memory_ceiling_bytes: int
     #: A command that runs longer than :attr:`slow_seconds` wall-clock.
     slow_command: Sequence[str]
     slow_seconds: int
@@ -607,6 +636,93 @@ class ProviderConformance:
         )
         assert outcome.status == STATUS_FAILURE
         assert outcome.exit_status == provider_case.failing_exit_status
+        assert outcome.exit_status != 0
+
+    def _ran(
+        self,
+        provider: Provider,
+        workspace_id: str,
+        command: Sequence[str],
+        policy: EffectivePolicy,
+        job_id: str,
+    ) -> JobOutcome:
+        """Run a job whose failure belongs to the *job*, and say so if it is raised.
+
+        The taxonomy's whole load-bearing distinction is between a result and a
+        fault: a returned outcome means "this is what your work did", a raised
+        :class:`ProviderError` means "ask again later, the engine is broken".
+        A backend that raises for one of the failures below would otherwise fail
+        these tests as an error with a stack trace; caught here, it fails as the
+        taxonomy violation it actually is.
+        """
+        try:
+            return provider.run(workspace_id, command, policy, job_id=job_id)
+        except ProviderError as raised:
+            pytest.fail(
+                f"{tuple(command)} was reported as an infrastructure failure "
+                f"({raised.message}); nothing about the engine broke, so a caller "
+                "would retry this forever"
+            )
+
+    def test_a_command_the_environment_cannot_run_is_the_callers_failure(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """Same slot as a job that lost, different cause: it never ran at all.
+
+        A backend learns this the hard way — the engine reports a command it
+        cannot exec through the same channel it reports its own breakage — so
+        the pull towards exit 7 is real, and this is what resists it. The two
+        POSIX answers are asserted apart rather than together, because
+        collapsing them would send a caller off to re-spell a command that was
+        sitting exactly where they said it was.
+        """
+        assert provider_case.absent_exit_status != provider_case.unrunnable_exit_status, (
+            "an absent command and an unrunnable one must not report the same status: "
+            "only one of the two is a spelling to fix"
+        )
+        descriptor = workspaces()
+        policy = effective_policy(provider)
+        for job_id, command, expected in (
+            ("job-absent", provider_case.absent_command, provider_case.absent_exit_status),
+            (
+                "job-unrunnable",
+                provider_case.unrunnable_command,
+                provider_case.unrunnable_exit_status,
+            ),
+        ):
+            outcome = self._ran(provider, descriptor.workspace_id, command, policy, job_id)
+            assert outcome.status == STATUS_FAILURE, f"{job_id}: {outcome.output!r}"
+            assert outcome.exit_status == expected
+
+    def test_a_job_stopped_at_its_memory_ceiling_is_resource_exhausted(
+        self,
+        provider: Provider,
+        provider_case: ProviderCase,
+        workspaces: Callable[..., WorkspaceDescriptor],
+    ) -> None:
+        """Exhaustion is its own status: the ceiling held, and it says which one.
+
+        Not ``failure``, because the job did not compute a wrong answer — it was
+        stopped, and a caller's next move is to raise the ceiling or shrink the
+        work. Not ``infrastructure_failure``, because retrying an unchanged job
+        against an unchanged budget cannot succeed. Unlike a timeout the command
+        did produce an exit status on its way out, which is exactly why the two
+        statuses are separate.
+        """
+        policy = effective_policy(provider, memory_bytes=provider_case.memory_ceiling_bytes)
+        descriptor = workspaces(policy)
+        outcome = self._ran(
+            provider,
+            descriptor.workspace_id,
+            provider_case.memory_hungry_command,
+            policy,
+            "job-exhausted",
+        )
+        assert outcome.status == STATUS_RESOURCE_EXHAUSTED, f"job-exhausted: {outcome.output!r}"
+        assert outcome.exit_status is not None, "a job stopped at a ceiling still exited"
         assert outcome.exit_status != 0
 
     def test_run_status_never_claims_infrastructure_or_policy(
