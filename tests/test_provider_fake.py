@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import hashlib
+import io
 import itertools
 from collections.abc import Sequence
 from pathlib import Path
@@ -911,7 +912,7 @@ def test_write_then_read_round_trip_through_seam_verbs() -> None:
     # convention headspace.core.artifacts.ArtifactRecord.sha256 uses.
     sha = hashlib.sha256(content).hexdigest()
 
-    provider.write("ws-copyin", "data.bin", content, expected_sha256=sha)
+    provider.write("ws-copyin", "data.bin", io.BytesIO(content), expected_sha256=sha)
 
     stream = provider.read("ws-copyin", "data.bin")
     assert b"".join(stream) == content
@@ -932,7 +933,7 @@ def test_write_refuses_a_digest_mismatch() -> None:
         provider.write(
             "ws-baddigest",
             "data.bin",
-            b"payload",
+            io.BytesIO(b"payload"),
             # Well-formed (64 lowercase hex chars) but not the digest of
             # b"payload" — a wrong digest, not a malformed one.
             expected_sha256="0" * 64,
@@ -957,7 +958,7 @@ def test_write_refuses_existing_destination_without_overwrite() -> None:
     content = b"replacement"
     sha = hashlib.sha256(content).hexdigest()
     with pytest.raises(CliError) as caught:
-        provider.write("ws-exists", "data.bin", content, expected_sha256=sha)
+        provider.write("ws-exists", "data.bin", io.BytesIO(content), expected_sha256=sha)
     assert caught.value.code == EXIT_USER_ERROR
     # The fact ("already exists") lives in the message; the action to take
     # ("pass overwrite=True") lives in the remediation, same split every
@@ -980,7 +981,9 @@ def test_write_accepts_existing_destination_with_overwrite() -> None:
 
     content = b"replacement"
     sha = hashlib.sha256(content).hexdigest()
-    provider.write("ws-overwrite", "data.bin", content, expected_sha256=sha, overwrite=True)
+    provider.write(
+        "ws-overwrite", "data.bin", io.BytesIO(content), expected_sha256=sha, overwrite=True
+    )
 
     stream = provider.read("ws-overwrite", "data.bin")
     assert b"".join(stream) == content
