@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import itertools
 from collections.abc import Sequence
 from pathlib import Path
@@ -901,14 +902,14 @@ def test_write_then_read_round_trip_through_seam_verbs() -> None:
     existing ``read()`` can find them — the same path a real engine's volume
     would exercise.
     """
-    import hashlib
-
     provider = FakeProvider()
     policy = effective_policy(provider)
     provider.create("ws-copyin", "env", policy)
 
     content = b"seam-verb payload\n"
-    sha = "sha256:" + hashlib.sha256(content).hexdigest()
+    # Bare 64-character lowercase hex, no "sha256:" prefix — the same
+    # convention headspace.core.artifacts.ArtifactRecord.sha256 uses.
+    sha = hashlib.sha256(content).hexdigest()
 
     provider.write("ws-copyin", "data.bin", content, expected_sha256=sha)
 
@@ -932,7 +933,9 @@ def test_write_refuses_a_digest_mismatch() -> None:
             "ws-baddigest",
             "data.bin",
             b"payload",
-            expected_sha256="sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            # Well-formed (64 lowercase hex chars) but not the digest of
+            # b"payload" — a wrong digest, not a malformed one.
+            expected_sha256="0" * 64,
         )
     assert caught.value.code == EXIT_USER_ERROR
     assert "digest" in caught.value.message.lower()
@@ -945,8 +948,6 @@ def test_write_refuses_existing_destination_without_overwrite() -> None:
     different file should not silently clobber what a job produced. The
     ``overwrite`` flag exists for the deliberate case.
     """
-    import hashlib
-
     provider = FakeProvider()
     policy = effective_policy(provider)
     provider.create("ws-exists", "env", policy)
@@ -954,11 +955,14 @@ def test_write_refuses_existing_destination_without_overwrite() -> None:
     provider.write_file("ws-exists", "data.bin", b"original")
 
     content = b"replacement"
-    sha = "sha256:" + hashlib.sha256(content).hexdigest()
+    sha = hashlib.sha256(content).hexdigest()
     with pytest.raises(CliError) as caught:
         provider.write("ws-exists", "data.bin", content, expected_sha256=sha)
     assert caught.value.code == EXIT_USER_ERROR
-    assert "overwrite" in caught.value.message.lower()
+    # The fact ("already exists") lives in the message; the action to take
+    # ("pass overwrite=True") lives in the remediation, same split every
+    # other CliError in this module makes.
+    assert "overwrite" in caught.value.remediation.lower()
 
 
 def test_write_accepts_existing_destination_with_overwrite() -> None:
@@ -968,8 +972,6 @@ def test_write_accepts_existing_destination_with_overwrite() -> None:
     wants to replace it. The digest still has to match, so the replacement
     is the bytes the caller actually meant.
     """
-    import hashlib
-
     provider = FakeProvider()
     policy = effective_policy(provider)
     provider.create("ws-overwrite", "env", policy)
@@ -977,7 +979,7 @@ def test_write_accepts_existing_destination_with_overwrite() -> None:
     provider.write_file("ws-overwrite", "data.bin", b"original")
 
     content = b"replacement"
-    sha = "sha256:" + hashlib.sha256(content).hexdigest()
+    sha = hashlib.sha256(content).hexdigest()
     provider.write("ws-overwrite", "data.bin", content, expected_sha256=sha, overwrite=True)
 
     stream = provider.read("ws-overwrite", "data.bin")
@@ -989,7 +991,7 @@ def test_write_refuses_an_unknown_workspace() -> None:
     provider = FakeProvider()
 
     with pytest.raises(CliError) as caught:
-        provider.write("no-such-ws", "data.bin", b"payload", expected_sha256="sha256:0" * 64)
+        provider.write("no-such-ws", "data.bin", b"payload", expected_sha256="0" * 64)
     assert caught.value.code == EXIT_USER_ERROR
     assert "unknown workspace" in caught.value.message
 
