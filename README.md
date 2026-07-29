@@ -129,6 +129,20 @@ recording discipline on this side can unsee it — `run --help` says so where
 the flags live, and it is worth repeating here: a guarantee that overclaims
 is worse than one that states its edge.
 
+There is a second edge, in the engine rather than in headspace. A forwarded
+value reaches the job the only way a process environment can be set, so while
+the job container exists the value is readable from the container's own
+configuration — `docker inspect` on that container shows it under
+`Config.Env`. Measured, not assumed. Two bounds hold and are tested: the value
+reaches neither the container's command nor its labels, and the job container
+is removed as soon as the job settles, so the exposure lasts the job and not
+the workspace. But the honest statement is that **`--env` keeps a secret out
+of headspace's durable records, not out of the reach of whoever can already
+talk to your Docker daemon** — and anyone who can do that could read the
+value out of a running process anyway. Choose `--env` because it beats argv,
+which is recorded forever in four places; not because it hides a value from
+the machine the job runs on.
+
 ### Introspection verbs
 
 | Verb | What it does |

@@ -396,8 +396,12 @@ def register(sub: argparse._SubParsersAction) -> None:
         "line is recorded verbatim, which is the leak this flag exists to close. Edge worth "
         "knowing: a job that prints its own environment (env, printenv, a traceback) writes "
         "the value into its captured output, and captured output is kept — that is the job's "
-        "doing, and no recording rule on this side can unsee it. The environment lives for "
-        "this job only; nothing is baked into the workspace.",
+        "doing, and no recording rule on this side can unsee it. Second edge, in the engine: "
+        "while the job container exists the value is readable from its own configuration "
+        "(docker inspect shows it under Config.Env), because that is how a process "
+        "environment is set — so this keeps a secret out of headspace's durable records, not "
+        "out of reach of whoever can already talk to your Docker daemon. The environment "
+        "lives for this job only; nothing is baked into the workspace.",
     )
     parser.add_argument(
         "--env-file",
