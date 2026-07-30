@@ -350,7 +350,8 @@ program can check without reading a word of prose:
 Five operations, matching the CLI's five state-changing lifecycle verbs one
 for one. Each function takes the same parameters as the `Orchestrator` method
 it calls — checked mechanically against each other, not just described
-consistently — and returns the identical `ResultPackage` the CLI renders to
+consistently — plus one the CLI spells as a flag: `provider="docker"` (the
+default) or `"fake"`. Each returns the identical `ResultPackage` the CLI renders to
 markdown or JSON: the same nine sections (`outcome_summary`, `status`,
 `key_findings`, `evidence`, `artifacts`, `warnings`, `resource_usage`,
 `provenance`, `attention`) as a plain dataclass instance instead of rendered
