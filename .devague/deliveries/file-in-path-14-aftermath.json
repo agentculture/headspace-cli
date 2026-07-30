@@ -2,7 +2,7 @@
   "plan_slug": "file-in-path-14-aftermath",
   "schema_version": 1,
   "created": "2026-07-30T05:22:12Z",
-  "updated": "2026-07-30T14:51:18Z",
+  "updated": "2026-07-30T15:31:04Z",
   "deviations": [
     {
       "id": "d1",
@@ -124,6 +124,20 @@
       "origin": "llm",
       "status": "proposed",
       "classification": "needs-follow-up"
+    },
+    {
+      "id": "d10",
+      "what": "closed issue #20 in this delivery rather than deferring it, after qodo's PR review independently found the same residual t7's adversarial wave had found. Implemented qodo's shape, which is better than the one filed in #20: a per-workspace token (128 bits from secrets.token_hex) minted at DockerProvider.create and carried as LABEL_CANCEL_TOKEN on the ANCHOR container only; stop writes '<token>:<job_id>' in both markers; run requires the whole string verbatim. #20's own candidate (1) \u2014 a per-run nonce held in run's memory \u2014 was unworkable and the issue says so now: stop is a different process and cannot read run's memory. A label is the correct home because both processes already hold the anchor and no process inside any container can read engine metadata, let alone another container's.",
+      "task_ref": "t7",
+      "reason": "The user's standing instruction for this run is to fix qodo comments as they arrive. Leaving it would have meant merging a PR carrying a known, reviewer-confirmed integrity finding in the exact property the delivery claims. Two consequences beyond the fix, both pinned by tests: a workspace whose anchor predates the token classifies no cancellation at all rather than falling back to bare job ids (the fallback IS the hole), and a job's self-planted intent marker no longer buys it the 2s settle wait \u2014 closing the forgery closed a small denial-of-service lever with it.",
+      "affects": [
+        "c21",
+        "c24",
+        "h17"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
     }
   ]
 }

@@ -2040,7 +2040,7 @@ def test_a_tampering_job_can_delete_the_intent_marker_but_never_reaches_the_coun
     ``resource_exhausted``, and — the direction that matters — the tamper never
     moved the record *towards* ``cancelled``, because a stop really did happen
     here. The manufacturing direction is probed separately by
-    :func:`test_an_intent_marker_a_job_planted_for_itself_never_becomes_a_cancellation`.
+    :func:`test_an_intent_marker_a_job_planted_for_itself_buys_it_nothing_at_all`.
 
     What this is NOT evidence of: that ``cancelled`` will be recorded on any
     given host. If a future change makes ``run`` read the volume sooner, this
@@ -2222,10 +2222,10 @@ def test_a_job_that_catches_and_ignores_sigterm_is_recorded_cancelled_after_the_
     assert recorded["stubborn-job"]["exit_status"] is None
 
 
-def test_an_intent_marker_a_job_planted_for_itself_never_becomes_a_cancellation(
+def test_an_intent_marker_a_job_planted_for_itself_buys_it_nothing_at_all(
     home: Path, workspace: Any, orch: Orchestrator
 ) -> None:
-    """The manufacturing direction, with the attacker handed the one thing it lacks.
+    """Not an ending, and since issue #20 not even a delay.
 
     Producing a genuine intent-only state is the hard part of this probe, and
     the two obvious routes are both dead ends. A completed ``stop`` always
@@ -2241,27 +2241,27 @@ def test_an_intent_marker_a_job_planted_for_itself_never_becomes_a_cancellation(
     So this test does the only remaining thing, and does it in the attacker's
     favour: it *tells the job its own job id*, by naming the job on the command
     line and writing the same string into the intent marker from inside the
-    container. That is deliberately more than the threat model allows. The real
-    guarantee is that a job cannot learn its id from inside the box at all
-    (:func:`test_no_surface_inside_a_job_container_carries_its_own_job_id`), and
-    granting it here removes that protection so the *next* one can be tested on
-    its own: even holding the correct id, an intent marker is not an ending.
+    container. That is deliberately more than the threat model allows, so that
+    the properties above it can be tested on their own.
 
-    The wall-clock assertion is what makes this more than a branch check. An
-    intent marker naming the job that just settled is precisely the condition
-    that sends ``run`` into
-    :meth:`~headspace.providers.docker.DockerProvider._await_countersignal`, so
-    a job that exits immediately and is nonetheless recorded as having taken
-    longer than :data:`CANCELLATION_SETTLE_SECONDS` is direct evidence that the
-    door really was held open — and that what came through it was still
-    nothing. A settle wait that turned intent into a verdict would have had two
-    full seconds in which to do it.
+    Two facts, and the second one moved. **The record is a failure** — intent
+    means an operator asked, never that they succeeded — which was true before
+    the workspace token existed and is unchanged by it. **And the run does not
+    pay the settle wait**, which is new. Holding the correct job id used to be
+    enough to satisfy ``_ended_by_an_operator``'s intent test and send ``run``
+    into :meth:`~headspace.providers.docker.DockerProvider._await_countersignal`
+    for two seconds; the job could not manufacture a cancellation that way, but
+    it could make every one of its own runs burn the budget. Now the intent
+    marker must carry the workspace's token too, so a job's self-planted intent
+    fails to match and is simply cleared. Closing a forgery closed a small
+    denial-of-service lever with it, which is worth pinning so a future change
+    that loosens the intent test cannot quietly reopen both.
 
-    What this is NOT evidence of: that the marker channel is unforgeable given
-    a known job id. It is not, and
-    :func:`test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation`
-    says so explicitly. The unforgeability claim in the provider's docstring is
-    a claim about what a job can *learn*, not about what it can *write*.
+    The settle wait's *timeout* path — a real intent marker with a countersignal
+    that never arrives — is no longer reachable from inside a container at all,
+    which is the point. It is covered where it can now be staged honestly:
+    ``test_the_wait_for_a_countersignal_ends`` in
+    ``tests/test_docker_classification.py``.
     """
     workspace_id = workspace()
     orch.create(workspace_id=workspace_id)
@@ -2287,48 +2287,51 @@ def test_an_intent_marker_a_job_planted_for_itself_never_becomes_a_cancellation(
     planted = recorded[victim]
     assert planted["status"] == STATUS_FAILURE
     assert planted["exit_status"] == 9, "the job's own exit status was not preserved"
-    assert planted["usage"]["wall_time_seconds"] >= _CANCELLATION_SETTLE_SECONDS, (
-        "the run finished faster than the settle wait, so the door was never "
-        "held open and this test proves nothing about what the wait does with "
-        f"intent alone: {planted['usage']['wall_time_seconds']}s"
+    assert planted["usage"]["wall_time_seconds"] < _CANCELLATION_SETTLE_SECONDS, (
+        "the run paid the settle wait for an intent marker the job wrote itself, "
+        "so the intent test is matching on something a job can produce — the "
+        f"workspace token is supposed to prevent that: {planted['usage']['wall_time_seconds']}s"
     )
 
 
-def test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation(
+def test_a_countersignal_a_job_planted_for_itself_is_refused(
     home: Path, workspace: Any, orch: Orchestrator
 ) -> None:
-    """Recorded, not asserted as desirable: exactly what the guarantee rests on.
+    """The forgery this test used to record, now refused — live (issue #20).
 
-    The provider's docstring calls the channel unforgeable and then says why in
-    the same breath — "the one string it cannot write is its own job id,
-    because nothing inside the box ever tells it one". This test is that
-    sentence read as a conditional and tested at its hinge: hand a job its own
-    id, and the countersignal it writes for itself is believed. The job below
-    fails on its own account, nobody stops it, no operator is involved anywhere,
-    and it is recorded ``cancelled`` with no exit status at all — the record now
-    asserts that a human deliberately ended work that in truth broke by itself,
-    which is the exact failure the two-phase channel was built to prevent.
+    Its previous incarnation was committed deliberately as a *recorded
+    weakness*, and it ended with an instruction to whoever closed it:
 
-    It is committed deliberately, for three reasons. It pins the *real*
-    boundary of the guarantee, so nobody reads "unforgeable" as a property of
-    the marker file. It makes
-    :func:`test_no_surface_inside_a_job_container_carries_its_own_job_id` a
-    load-bearing test rather than a nicety — that test is the only thing
-    standing between this behaviour and a job that can reach it. And it names
-    the one configuration where the premise genuinely does not hold: a caller
-    who passes ``--job-id`` with a predictable value *and* runs code it does not
-    trust has told the job its id by another route, and gets the record below.
-    Job ids headspace mints itself are ``job-`` plus twelve random hex
-    characters and are not guessable from inside a container.
+        If a future change makes this test fail — because the channel grew a
+        provenance check, a nonce, or a write path a job cannot reach — that is
+        an improvement, and this test should be rewritten to assert the refusal
+        rather than deleted.
 
-    If a future change makes this test fail — because the channel grew a
-    provenance check, a nonce, or a write path a job cannot reach — that is an
-    improvement, and this test should be rewritten to assert the refusal rather
-    than deleted.
+    That change arrived. What it recorded was the guarantee's real hinge: the
+    provider called the channel unforgeable and justified it with "the one
+    string it cannot write is its own job id", which is a conditional, and
+    ``--job-id`` is the *caller's* to choose. A caller who picked predictable
+    ids and ran code it did not trust had told the job its id by another route,
+    and the job could then write its own countersignal and be believed —
+    recorded ``cancelled``, with no operator anywhere, asserting that a human
+    deliberately ended work that in truth broke by itself.
 
-    What this is NOT evidence of: any weakness reachable by a job that was not
-    told its id. Every other probe in this group holds that fact intact and
-    finds nothing.
+    The fix is not to make the write harder to reach — a job with a shell in
+    the volume can always write these bytes. It is to make the *payload*
+    contain something no job can obtain: a per-workspace token minted at
+    ``create`` and carried as a label on the anchor container, which is engine
+    metadata no process inside any container can read, on an object that is not
+    even the job's own container. So the body below is unchanged from the
+    version that forged successfully — same job, same id, same bytes at the
+    same path — and only the verdict moved.
+
+    That is what makes this evidence rather than assertion: the attack was not
+    weakened to make the test pass.
+
+    What this is still NOT evidence of: safety against anyone who can reach the
+    Docker socket or ``~/.headspace``. They can read the label and edit the
+    record respectively. The adversary here is the untrusted code inside the
+    box, which is the one that cannot be reasoned with.
     """
     workspace_id = workspace()
     orch.create(workspace_id=workspace_id)
@@ -2344,16 +2347,16 @@ def test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation(
         job_id=forger,
     )
 
-    assert package.status == STATUS_CANCELLED, (
-        "the forge was refused — re-read this test's docstring, because that is "
-        "an improvement over the recorded behaviour and this test should now "
-        "assert the refusal"
+    assert package.status == STATUS_FAILURE, (
+        "a job forged a cancellation for itself using only its own job id — the "
+        "workspace token is meant to make that impossible; check that create "
+        "still writes the anchor label and that run still requires it"
     )
     recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
-    assert recorded[forger]["status"] == STATUS_CANCELLED
-    assert recorded[forger]["exit_status"] is None, (
-        "the forged cancellation kept the job's own exit status, which the "
-        "outcome type is supposed to refuse outright"
+    assert recorded[forger]["status"] == STATUS_FAILURE
+    assert recorded[forger]["exit_status"] == 9, (
+        "the job's own exit status was lost, so the refusal cost more than the "
+        "forged cancellation it refused"
     )
 
 
@@ -2512,11 +2515,13 @@ def test_no_surface_inside_a_job_container_carries_its_own_job_id(
     Placement disciplines rot silently. A future change that put the job id in
     an environment variable for convenience, or set ``hostname`` to it for
     nicer logs, would leave every existing test passing and quietly hand every
-    job the ability to forge its own cancellation — which
-    :func:`test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation`
-    shows is all that would be required. This test is the tripwire for that,
-    and the job id is passed explicitly with ``--job-id`` so the exact string
-    being hunted for is known rather than inferred.
+    job half of what a forged countersignal needs. Only half, since issue #20:
+    the payload also carries a per-workspace token a job cannot reach, and
+    :func:`test_a_countersignal_a_job_planted_for_itself_is_refused`
+    holds that line. Which is exactly why this test still earns its keep — the
+    token is the guarantee, and this is the defence that keeps the token from
+    being the *only* one. The job id is passed explicitly with ``--job-id`` so
+    the exact string being hunted for is known rather than inferred.
 
     Every surface a process can interrogate about itself is dumped and searched:
     the whole environment, the kernel's idea of the hostname and the image's

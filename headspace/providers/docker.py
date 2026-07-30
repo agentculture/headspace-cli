@@ -386,29 +386,39 @@ container has been reaped and the anchor may itself have exited.
 
 Four properties this shape has to carry, none of them optional:
 
-* **Unforgeable by a job that was not told its own id — which is a narrower
-  claim than "unforgeable", and the difference is where the whole guarantee
-  lives.** A job shares the volume and can write anything it likes at either
-  marker's path; a countersignal it plants naming itself *is* believed, and a
-  live test records exactly that
-  (``test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation``)
-  rather than leaving it as something a reader has to infer. What stops it is
-  not the write — it is that nothing inside the box ever tells a job the one
-  string that would make the write work. The id travels as a container *name*
-  and a ``headspace.job_id`` label, and a process can read neither from inside
-  its own container: a container's hostname is its engine id, not its name.
-  :meth:`run` puts it in no environment variable and no argv entry, which is
-  the same placement discipline ``env`` is held to and is tested the same way,
-  across seven surfaces at once
-  (``test_a_job_never_learns_its_own_job_id_from_any_surface_it_can_read``).
+* **Unforgeable from inside the box.** A job shares the volume and can write
+  anything it likes at either marker's path, so what makes a marker believable
+  cannot be the write — it has to be the *payload*, and the payload has to
+  contain something the job cannot obtain. It contains two things: the job id,
+  and a per-workspace secret (:data:`LABEL_CANCEL_TOKEN`) minted at
+  :meth:`create` and carried on the anchor container as an engine label. The
+  pair is compared verbatim, never parsed, so a ``job_id`` holding the
+  separator cannot shift the boundary between them.
 
-  So the property is conditional, and the condition is the id's *entropy*, not
-  its secrecy in the abstract. A headspace-minted id is
-  ``job-`` + 12 hex characters of :func:`uuid.uuid4` — 48 bits, unguessable
-  from inside. A caller-supplied ``--job-id`` is whatever the caller chose, and
-  a caller who both picks predictable ids *and* runs code it does not trust has
-  handed that code the string. Tracked as issue #20; it is a property of the
-  id, not of this channel, and no amount of marker hardening reaches it.
+  Neither half is reachable from inside a container. The id travels as a
+  container *name* and a ``headspace.job_id`` label, and a process can read
+  neither from within its own container — a container's hostname is its engine
+  id, not its name; :meth:`run` puts it in no environment variable and no argv
+  entry, held to the same placement discipline as ``env`` and tested the same
+  way, across seven surfaces at once
+  (``test_no_surface_inside_a_job_container_carries_its_own_job_id``). The
+  token is a label on a *different container* again, and labels are engine
+  metadata no process inside any container can read.
+
+  The id alone was not enough, and the reason is worth keeping: ``--job-id`` is
+  the **caller's** to choose, so a caller who picks predictable ids *and* runs
+  code it does not trust would have handed that code the only string it was
+  missing. That was real — a live test forged a cancellation exactly that way
+  before the token existed, and the same test now asserts the refusal
+  (``test_a_countersignal_a_job_planted_for_itself_is_refused``). With the
+  token the job must guess 128 bits it can never observe, whatever the caller
+  named the job.
+
+  The boundary is job-versus-record and nothing more is claimed. Whoever can
+  reach the Docker socket can read the label; whoever can reach
+  ``~/.headspace`` can edit the record directly. The adversary this defends
+  against is the untrusted code inside the box, which is the one that cannot
+  be reasoned with.
 * **Hardened against what a job can plant, both directions.** The write renames
   onto a marker's name rather than redirecting at it, because a redirection
   follows a link a job planted and a rename replaces it; it refuses outright
@@ -456,6 +466,7 @@ import hashlib
 import math
 import posixpath
 import re
+import secrets
 import tarfile
 import tempfile
 import threading
@@ -531,6 +542,42 @@ LABEL_CREATED_AT = "headspace.created_at"
 #: kept so a job container can be built from the same environment without the
 #: caller having to hand it back, and so provenance survives the process.
 LABEL_ENVIRONMENT = "headspace.environment"
+#: The per-workspace secret that makes a cancellation marker *unforgeable*
+#: rather than merely hard to guess. Minted at :meth:`DockerProvider.create`,
+#: written onto the **anchor container only** — never the volume, never a job
+#: container, never headspace's own state — and required verbatim in both
+#: markers before ``run`` will read a cancellation out of them.
+#:
+#: A label is exactly the right home and the reason is structural. ``stop`` and
+#: ``run`` are separate processes that share no memory, so a secret held in
+#: either one's variables is a secret the other cannot check; both, however,
+#: already hold the anchor. And a label is engine metadata: it is readable by
+#: anyone who can talk to the daemon and by *no process inside any container* —
+#: not even the anchor's own, and the job runs in a different container again.
+#:
+#: What this closes is the gap that made ``job_id`` alone insufficient. That id
+#: is the caller's to choose (``--job-id``), so a caller who picks predictable
+#: ids and runs code it does not trust has handed that code the only string it
+#: was missing. With a token in the payload the job would have to guess 128
+#: bits it can never observe, whatever the caller named the job.
+#:
+#: The boundary is job-versus-record, and nothing more is claimed: whoever can
+#: reach the Docker socket can read this label, and whoever can reach
+#: ``~/.headspace`` can edit the record directly. The adversary this defends
+#: against is the untrusted code *inside* the box.
+#:
+#: The ``nosec`` is a false positive worth naming rather than skipping
+#: repo-wide: B105 matches on the *variable name* ending in ``token``, and what
+#: is hardcoded here is the label's **key**. The value it names is minted per
+#: workspace by :func:`secrets.token_hex` at :meth:`DockerProvider.create` and
+#: appears in no source file.
+LABEL_CANCEL_TOKEN = "headspace.cancel_token"  # nosec B105
+
+#: Bytes of entropy behind that token. 128 bits, from :mod:`secrets` rather
+#: than :mod:`random`, because this one is guessed against rather than merely
+#: collided with.
+CANCEL_TOKEN_BYTES = 16
+
 #: ``headspace.capability.<field>`` — the create-time capability probe, one
 #: label per :class:`~headspace.core.policy.CapabilitySnapshot` field.
 LABEL_CAPABILITY_PREFIX = "headspace.capability."
@@ -1234,6 +1281,38 @@ rm -rf "$1"
 #: job with a shell can still write anything it likes at these paths. What it
 #: closes is the route that needs no job.
 RESERVED_ROOT_NAMES = (STAGING_DIR_NAME,) + CANCELLATION_MARKER_NAMES
+
+#: What separates the two fields of a marker's payload. Never parsed on — the
+#: whole string is compared verbatim — so a ``job_id`` containing this
+#: character cannot shift the boundary between the secret and the name.
+MARKER_FIELD_SEPARATOR = ":"
+
+
+def cancellation_evidence(anchor: Container, job_id: str) -> str | None:
+    """The exact bytes a marker must hold to name *this* job, or ``None``.
+
+    One function so the writer and the reader cannot drift: ``stop`` puts this
+    string in the volume and ``run`` compares against it, and a handshake whose
+    two halves each build their own payload is a handshake one refactor away
+    from silently never matching.
+
+    Compared **verbatim**, never split. Parsing on
+    :data:`MARKER_FIELD_SEPARATOR` would let a ``job_id`` containing that
+    character move the boundary between the secret and the name, which is the
+    classic way a two-field credential becomes a one-field one.
+
+    ``None`` means *no cancellation can be read here at all*, and it is
+    returned for a workspace whose anchor carries no
+    :data:`LABEL_CANCEL_TOKEN` — one created before this channel required a
+    token. That is deliberately not a fallback to comparing bare job ids: the
+    fallback is the hole. Such a workspace classifies a stopped job exactly as
+    the code before any of this existed, which is the same direction every
+    other partial state of this channel fails in.
+    """
+    token = anchor.labels.get(LABEL_CANCEL_TOKEN)
+    if not token or not job_id:
+        return None
+    return f"{token}{MARKER_FIELD_SEPARATOR}{job_id}"
 
 
 @dataclass(frozen=True)
@@ -2073,7 +2152,12 @@ class DockerProvider:
                     image=environment,
                     command=list(IDLE_COMMAND),
                     name=self._container_name(workspace_id),
-                    labels=labels,
+                    # The cancellation token goes on the anchor and on nothing
+                    # else — not the volume above, not the job containers
+                    # `run` builds, which assemble their labels from scratch.
+                    # One object holds it, and it is the one object both `stop`
+                    # and `run` already fetch.
+                    labels={**labels, LABEL_CANCEL_TOKEN: secrets.token_hex(CANCEL_TOKEN_BYTES)},
                     **self._sealed_kwargs(policy, network_enabled, workspace_id),
                 )
             except Exception:
@@ -2829,10 +2913,15 @@ class DockerProvider:
         requirement for an anchor that can execute a shell, which it has never
         had and must not grow silently.
         """
+        # What a marker has to say to be about this job at all. `None` when
+        # this workspace's anchor carries no token — see
+        # :func:`cancellation_evidence` for why that is a refusal to classify
+        # rather than a fallback to comparing bare job ids.
+        evidence = cancellation_evidence(anchor, job_id)
         signalled = self._read_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME)
         intent = self._read_marker(anchor, CANCELLATION_INTENT_MARKER_NAME)
-        if job_id and intent.value == job_id and signalled.value != job_id:
-            signalled = self._await_countersignal(anchor, job_id, signalled)
+        if evidence is not None and intent.value == evidence and signalled.value != evidence:
+            signalled = self._await_countersignal(anchor, evidence, signalled)
         # Walked over the names rather than over the two locals, so the
         # clearing obligation is spelled by :data:`CANCELLATION_MARKER_NAMES`
         # itself: a phase added to that tuple and forgotten here raises rather
@@ -2844,9 +2933,9 @@ class DockerProvider:
         for name in CANCELLATION_MARKER_NAMES:
             if found[name].present:
                 self._clear_marker(anchor, name)
-        return bool(job_id) and signalled.value == job_id
+        return evidence is not None and signalled.value == evidence
 
-    def _await_countersignal(self, anchor: Container, job_id: str, found: _Marker) -> _Marker:
+    def _await_countersignal(self, anchor: Container, evidence: str, found: _Marker) -> _Marker:
         """Give the other process its bounded moment to finish saying so.
 
         Entered only when an intent marker names the job that just settled, so
@@ -2871,7 +2960,7 @@ class DockerProvider:
         while time.monotonic() < deadline:
             time.sleep(POLL_INTERVAL_SECONDS)
             found = self._read_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME)
-            if found.value == job_id:
+            if found.value == evidence:
                 return found
         return found
 
@@ -3014,8 +3103,14 @@ class DockerProvider:
             # a failure to write it is a `False` this call proceeds past,
             # because ending the job is the need and naming it is the
             # improvement.
-            if job_id:
-                self._write_marker(anchor, CANCELLATION_INTENT_MARKER_NAME, job_id)
+            #
+            # The payload is the workspace's secret plus the job id, not the id
+            # alone: the id is the caller's to choose, so a caller who picks a
+            # predictable one and runs untrusted code would otherwise have
+            # handed that code everything it needed to write this file itself.
+            evidence = cancellation_evidence(anchor, job_id or "")
+            if evidence is not None:
+                self._write_marker(anchor, CANCELLATION_INTENT_MARKER_NAME, evidence)
             job.stop(timeout=STOP_GRACE_SECONDS)
             # The container can disappear between the signal and the follow-up:
             # `run` removes its own job container the moment the job settles, so
@@ -3037,8 +3132,8 @@ class DockerProvider:
             # the anchor is what makes it writable at all: the job's own
             # container is dead by now, and the anchor outlives every job the
             # workspace runs.
-            if job_id:
-                self._write_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME, job_id)
+            if evidence is not None:
+                self._write_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME, evidence)
 
         return StopOutcome(workspace_id=workspace_id, job_id=job_id, stopped=True)
 

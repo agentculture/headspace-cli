@@ -108,7 +108,9 @@ from headspace.providers.docker import (
     EXEC_INIT_MARKER,
     EXIT_COMMAND_NOT_EXECUTABLE,
     EXIT_COMMAND_NOT_FOUND,
+    LABEL_CANCEL_TOKEN,
     LABEL_ROLE,
+    MARKER_FIELD_SEPARATOR,
     POLL_INTERVAL_SECONDS,
     ROLE_WORKSPACE,
     WORKSPACE_MOUNT_PATH,
@@ -279,12 +281,41 @@ class StubContainer:
 
     # -- the workspace volume, as the archive endpoint and an exec see it -----
 
-    def plant(self, name: str, payload: str, kind: str = "file", *, on_probe: int = 1) -> None:
-        """Leave one marker in the volume, as the other process would have.
+    def plant(self, name: str, job_id: str, kind: str = "file", *, on_probe: int = 1) -> None:
+        """Leave one marker in the volume, as a real ``stop`` would have.
+
+        Takes the **job id** and builds the payload the provider itself would
+        write — this workspace's cancellation token from the anchor's own
+        label, then the id. Deriving it here rather than at two dozen call
+        sites is what keeps those tests about *classification*: none of them
+        wants to be a test of the payload's format, and a suite that spelled
+        the format out everywhere would have to be edited everywhere the format
+        moved.
+
+        A marker that is *not* authenticated is a different thing entirely —
+        it is what a forging job writes — so it has its own verb,
+        :meth:`plant_unauthenticated`, and reads as the attack it is.
 
         ``on_probe`` is which read of that name first finds it: ``1`` (the
         default) for a marker already standing there when ``run`` looks, and
         anything higher for one ``stop`` is still on its way to writing.
+        """
+        self.plant_unauthenticated(
+            name,
+            f"{self.labels[LABEL_CANCEL_TOKEN]}{MARKER_FIELD_SEPARATOR}{job_id}",
+            kind,
+            on_probe=on_probe,
+        )
+
+    def plant_unauthenticated(
+        self, name: str, payload: str, kind: str = "file", *, on_probe: int = 1
+    ) -> None:
+        """Leave literal bytes at a marker name, carrying no workspace token.
+
+        What a job with a shell in the volume can actually do: it writes
+        whatever it likes, and the one thing it cannot put there is this
+        workspace's secret. Kept separate from :meth:`plant` so a test that
+        uses it is visibly staging an attack rather than a stop.
         """
         if on_probe <= 1:
             self.markers[name] = (kind, payload)
@@ -1483,3 +1514,112 @@ def test_the_cli_exits_five_on_a_job_an_operator_stopped(
     assert code == EXIT_CANCELLED
     payload = json.loads(captured.out)
     assert payload["status"] == STATUS_CANCELLED
+
+
+# --- criterion 3: the secret is what makes the id enough (issue #20) ---------
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        pytest.param("job-forger", id="the-bare-job-id"),
+        pytest.param(f"{MARKER_FIELD_SEPARATOR}job-forger", id="an-empty-token"),
+        pytest.param(f"guessed{MARKER_FIELD_SEPARATOR}job-forger", id="a-guessed-token"),
+        pytest.param(f"job-forger{MARKER_FIELD_SEPARATOR}job-forger", id="the-id-as-the-token"),
+    ],
+)
+def test_a_countersignal_a_job_wrote_for_itself_is_refused(
+    engine: StubEngine,
+    provider: DockerProvider,
+    policy: EffectivePolicy,
+    workspace: str,
+    forged: str,
+) -> None:
+    """The hole a caller-chosen ``--job-id`` used to open, closed.
+
+    A job shares the volume, so it can write anything it likes at either
+    marker's path — the write was never what made a marker believable. Until
+    the payload carried a secret, the *only* thing standing between a job and a
+    fabricated ``cancelled`` was its not knowing its own id, and that id is the
+    caller's to choose. A caller who picks predictable ids and runs code it
+    does not trust had handed that code everything it needed.
+
+    So the payload is the workspace's token *and* the job id, and this test is
+    the guarantee: every shape a job could plant knowing its own id in full —
+    the bare id, an empty token, a guessed one, the id reused as the token —
+    reaches classification and is refused. What it cannot produce is 128 bits
+    it has no way to observe, because the token lives on the anchor container's
+    labels and a label is readable by no process inside any container, let
+    alone by a job in a *different* container.
+
+    Recorded as a `cancelled` before the token existed; a live probe forged one
+    exactly this way. Compare
+    :func:`test_a_job_an_operator_stopped_is_recorded_cancelled_not_failed`,
+    which plants the same names *with* the token and is believed — the pair is
+    what makes this an assertion about the secret rather than about the write.
+    """
+    engine.job_exit_code = SELF_CHOSEN_137
+    anchor = _anchor(engine)
+    anchor.plant_unauthenticated(CANCELLATION_INTENT_MARKER_NAME, forged)
+    anchor.plant_unauthenticated(CANCELLATION_SIGNALLED_MARKER_NAME, forged)
+
+    outcome = provider.run(workspace, ("./train.py",), policy, job_id="job-forger")
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == SELF_CHOSEN_137
+    # And they are still cleared: refusing to believe a marker is not a reason
+    # to leave it in the volume for the next job to be measured against.
+    assert anchor.markers == {}
+
+
+def test_a_workspace_with_no_token_classifies_no_cancellation_at_all(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """An anchor from before the token: the honest answer is the old answer.
+
+    A workspace created by an earlier headspace has an anchor carrying no
+    :data:`LABEL_CANCEL_TOKEN`, so there is no secret for either process to put
+    in a marker or to check one against. The tempting move — fall back to
+    comparing the bare job id when no token is present — is precisely the hole
+    this closes, and an attacker who could induce the fallback would have the
+    whole of it back.
+
+    So no token means no cancellation can be read here, whatever stands in the
+    volume, and such a workspace records a stopped job exactly as headspace did
+    before any of this channel existed. That is the same direction every other
+    partial state of this channel fails in: it costs a true cancellation its
+    name and never invents one.
+    """
+    engine.job_exit_code = SELF_CHOSEN_137
+    anchor = _anchor(engine)
+    # Both markers, complete and well-formed for the *previous* payload format.
+    anchor.plant_unauthenticated(CANCELLATION_INTENT_MARKER_NAME, "job-legacy")
+    anchor.plant_unauthenticated(CANCELLATION_SIGNALLED_MARKER_NAME, "job-legacy")
+    del anchor.labels[LABEL_CANCEL_TOKEN]
+
+    outcome = provider.run(workspace, ("./train.py",), policy, job_id="job-legacy")
+
+    assert outcome.status == STATUS_FAILURE
+    assert anchor.markers == {}
+
+
+def test_two_workspaces_never_share_a_cancellation_token(
+    provider: DockerProvider, policy: EffectivePolicy, engine: StubEngine, workspace: str
+) -> None:
+    """A token shared across workspaces would be one leak away from useless.
+
+    Nothing in the design says a job in workspace A cannot end up learning
+    A's token — a caller might print it, an image might be built from an
+    inspect dump, a support bundle might carry it. What the design *does* say
+    is that such a leak costs exactly one workspace, so the tokens have to be
+    independent draws rather than anything derived from the workspace id or
+    minted once per process.
+    """
+    provider.create("second-ws", profiles.resolve(profiles.DEFAULT_PROFILE), policy)
+
+    tokens = {
+        container.labels[LABEL_CANCEL_TOKEN]
+        for container in engine.registry
+        if container.labels.get(LABEL_ROLE) == ROLE_WORKSPACE
+    }
+    assert len(tokens) == 2, f"two workspaces produced {len(tokens)} distinct token(s)"

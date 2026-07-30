@@ -98,11 +98,13 @@ from headspace.providers.docker import (
     CANCELLATION_MARKER_NAMES,
     CANCELLATION_SIGNALLED_MARKER_NAME,
     CLEAR_CANCELLATION_SCRIPT,
+    LABEL_CANCEL_TOKEN,
     LABEL_CREATED_AT,
     LABEL_JOB_ID,
     LABEL_PROVIDER,
     LABEL_ROLE,
     LABEL_WORKSPACE_ID,
+    MARKER_FIELD_SEPARATOR,
     PROVIDER_NAME,
     RESERVED_ROOT_NAMES,
     ROLE_JOB,
@@ -669,6 +671,19 @@ def _countersignal(engine: _StubEngine) -> Path:
     return _marker(engine, CANCELLATION_SIGNALLED_MARKER_NAME)
 
 
+def _evidence(engine: "_StubEngine", job_id: str) -> str:
+    """What a real ``stop`` writes: this workspace's token, then the job id.
+
+    Read off the anchor's own label rather than spelled out, so these tests
+    assert the *handshake* — that the writer put the workspace's secret in and
+    the reader would accept it — instead of pinning a payload format they have
+    no stake in. The token itself is 128 random bits, so there is nothing to
+    hard-code even if we wanted to.
+    """
+    anchor = _anchors(engine)[0]
+    return f"{anchor.labels[LABEL_CANCEL_TOKEN]}{MARKER_FIELD_SEPARATOR}{job_id}"
+
+
 def _volume_entries(engine: _StubEngine) -> list[str]:
     """Everything in the volume, links never followed and never resolved."""
     return sorted(entry.name for entry in engine.volume_root.iterdir())
@@ -704,8 +719,8 @@ def test_stop_writes_two_markers_naming_the_job_it_signalled(
 
     provider.stop(workspace)
 
-    assert _intent(engine).read_text() == "job-marked"
-    assert _countersignal(engine).read_text() == "job-marked"
+    assert _intent(engine).read_text() == _evidence(engine, "job-marked")
+    assert _countersignal(engine).read_text() == _evidence(engine, "job-marked")
 
 
 @requires_a_host_shell
@@ -867,8 +882,8 @@ def test_a_planted_directory_still_leaves_the_channel_recoverable(
     _in_flight_job(engine, workspace, "job-after-the-wedge")
     provider.stop(workspace)
 
-    assert _intent(engine).read_text() == "job-after-the-wedge"
-    assert _countersignal(engine).read_text() == "job-after-the-wedge"
+    assert _intent(engine).read_text() == _evidence(engine, "job-after-the-wedge")
+    assert _countersignal(engine).read_text() == _evidence(engine, "job-after-the-wedge")
 
 
 @requires_a_host_shell
@@ -919,8 +934,8 @@ def test_writing_the_markers_still_constructs_no_state_store(
     _in_flight_job(engine, workspace, "job-store-3")
     provider.stop(workspace)
 
-    assert _intent(engine).read_text() == "job-store-3"
-    assert _countersignal(engine).read_text() == "job-store-3"
+    assert _intent(engine).read_text() == _evidence(engine, "job-store-3")
+    assert _countersignal(engine).read_text() == _evidence(engine, "job-store-3")
 
 
 @requires_a_host_shell
@@ -1139,3 +1154,63 @@ def test_the_reservation_does_not_swallow_an_ordinary_destination_that_merely_lo
         with pytest.raises(CliError) as caught:
             provider.write(workspace, allowed, source, expected_sha256="0" * 64)
         assert "reserves for its own state" not in caught.value.message, allowed
+
+
+# --- criterion 3: where the workspace's secret is, and is not (issue #20) ----
+
+
+def test_the_cancellation_token_is_on_the_anchor_and_reaches_no_job(
+    engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """One object holds the secret, and it is not one a job can reach.
+
+    The job id alone was not enough to make a marker believable, because
+    ``--job-id`` is the caller's to choose: a caller who picks predictable ids
+    and runs code it does not trust had handed that code the only string it was
+    missing. The payload therefore carries a per-workspace token as well, and
+    the token's entire value is that a job cannot observe it — so *where it is
+    not* is the claim worth pinning.
+
+    It goes on the anchor container, which both ``stop`` and ``run`` already
+    fetch and which no job container inherits from: ``run`` assembles a job's
+    labels from scratch rather than copying the anchor's. This holds that line,
+    so a future refactor that "tidies up" by spreading the anchor's labels onto
+    the job cannot quietly hand every job the secret.
+
+    The same placement discipline as ``env`` above, for the same reason and
+    against the same four surfaces — and note the asymmetry it completes:
+    ``env`` must reach the job's ``environment=`` and nothing durable, while
+    this must reach the *anchor's* labels and nothing the job can see.
+    """
+    provider.run(workspace, ("echo", "hi"), policy, job_id="job-token-placement")
+
+    anchor = _anchors(engine)[0]
+    token = anchor.labels[LABEL_CANCEL_TOKEN]
+    assert len(token) == 2 * docker_backend.CANCEL_TOKEN_BYTES
+
+    jobs = _jobs(engine)
+    assert jobs, "no job container was made, so this proves nothing"
+    for job in jobs:
+        assert LABEL_CANCEL_TOKEN not in job.labels
+        assert all(token not in str(value) for value in job.labels.values())
+        environment = job.kwargs.get("environment") or {}
+        assert all(token not in str(value) for value in environment.values())
+        assert all(token not in str(part) for part in (job.command or ()))
+
+
+def test_two_workspaces_never_share_a_cancellation_token(
+    engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """A token shared across workspaces would be one leak away from useless.
+
+    Nothing claims a workspace's token can never escape — a caller might print
+    an ``inspect`` dump, a support bundle might carry one. What the design does
+    claim is that such a leak costs exactly *one* workspace, which holds only
+    if the tokens are independent draws rather than something derived from the
+    workspace id or minted once per process. Both of those would pass every
+    other test in this file.
+    """
+    provider.create("ctrl-ws-second", ENVIRONMENT, policy)
+
+    tokens = {anchor.labels[LABEL_CANCEL_TOKEN] for anchor in _anchors(engine)}
+    assert len(tokens) == 2, f"two workspaces produced {len(tokens)} distinct token(s)"
