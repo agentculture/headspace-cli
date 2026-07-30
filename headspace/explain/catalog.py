@@ -245,10 +245,11 @@ argparse claims none of it — so `run ws-1 echo hi --json` passes `--json` to
 The exit code is the job's status, not merely zero or non-zero: `6` for a
 command that ran correctly and failed, `4` for one the budget stopped, `7` for
 an engine that broke, `8` for one killed over its memory ceiling. A failed job
-leaves a perfectly good workspace behind. On the `docker` provider, a job
-ended by `headspace-cli stop --apply` is today also reported through this
-`6` path rather than the `cancelled`/`5` outcome `stop`'s own invocation
-reports — a known gap, tracked as issue #16.
+leaves a perfectly good workspace behind. A job that another process ended
+with `headspace-cli stop --apply` exits `5` (`cancelled`) and carries no
+`exit_status` at all — on every backend, and never inferred from the number
+the engine reports, which cannot tell an ended job from one that chose to
+exit that way.
 
 ## See also
 
@@ -311,11 +312,16 @@ been.
 
 `stop` itself is provably inert without `--apply`, on every backend: it takes
 no workspace lock and writes no state, which is what keeps it from
-deadlocking against the very `run` it interrupts. What it does not yet
-guarantee everywhere is the *other* half of the story — the *job's own*
-recorded outcome, which the interrupted `run` invocation writes separately.
-See `headspace-cli explain run`'s Exit codes section for the Docker-specific
-gap there (issue #16).
+deadlocking against the very `run` it interrupts. The *other* half of the
+story — the *job's own* recorded outcome, which the interrupted `run`
+invocation writes separately — now agrees with it everywhere: that job is
+recorded `cancelled` with no exit status, and its `run` exits `5`. On
+`docker` that costs a signal `stop` leaves in the workspace volume for the
+blocked `run` to find, because the two are separate processes and the engine's
+own numbers cannot tell an ended job from one that exited that way itself.
+The signal is written in two phases and only the second one classifies, so a
+`stop` that dies partway through costs a real cancellation its name rather
+than inventing one that never happened.
 
 ## Usage
 
