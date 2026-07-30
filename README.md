@@ -82,7 +82,7 @@ package's status (see [Exit codes](#exit-codes)).
 | `create` | Provision an ephemeral workspace under a declared policy; the only verb that mints a workspace id. |
 | `put <workspace> <host-path> <destination>` | Copy a host file or directory into a workspace, recording its destination, size and sha256 — never its bytes. Refuses an existing destination unless `--overwrite`. |
 | `run <workspace> <command> ...` | Execute one command in an existing workspace. Flags for `run` go *before* the workspace id — everything after it belongs to the command. `--input`, `--env` and `--env-file` get files and secrets into the job without argv (see [below](#getting-files-and-secrets-into-a-job)). |
-| `stop <workspace>` | End a workspace's in-flight job. **Previews by default** — reports what is running and changes nothing; `--apply` ends it, and the `stop` invocation's own result reads `cancelled`. |
+| `stop <workspace>` | End a workspace's in-flight job. **Previews by default** — reports what is running and changes nothing; `--apply` ends it, and both the `stop` invocation's own result and the job's own record read `cancelled`. |
 | `inspect <handle>` | Report a workspace's lifecycle state, the engine's view of it, and what the session has cost. `--logs` returns captured output in full and unbounded. |
 | `export <workspace> <name> --to <path>` | Publish a *declared* artifact to a durable host path, digest-verified, by atomic rename. |
 | `destroy <workspace>` | Remove a workspace — or refuse, and remove nothing, when declared artifacts were never exported (`--force` to discard them deliberately). |
@@ -298,7 +298,7 @@ The MVP Docker provider also supports no host-path mounts at all, so
 | `2` | environment_error | a local setup/tooling problem. |
 | `3` | policy_denied | the declared policy could not be satisfied — refused before anything ran. |
 | `4` | timeout | a wall-clock or budget ceiling was hit. |
-| `5` | cancelled | the caller asked for it to stop — `headspace stop <workspace> --apply` ended a job in flight, and the `stop` invocation's own result reads `cancelled`. On the `docker` provider the *job's* separately recorded outcome doesn't yet follow: it still reads `failure`/`6`, a known gap tracked as [#16](https://github.com/agentculture/headspace-cli/issues/16). |
+| `5` | cancelled | the caller asked for it to stop — `headspace stop <workspace> --apply` ended a job in flight, and, on every provider, both the `stop` invocation's own result and the job's separately recorded outcome read `cancelled`, with no exit status attached to either. |
 | `6` | computation_failed | the job ran correctly and produced a failing result. |
 | `7` | infrastructure_failure | the engine or environment broke — not a computational failure. |
 | `8` | resource_exhausted | the job was killed for exceeding its declared memory ceiling. |
@@ -314,6 +314,106 @@ engine, and retrying it unchanged will not help. The job's own `exit_status`
 follows shell convention so the two ways a command can be unrunnable stay
 distinguishable: `127` when the command was not found, `126` when it was
 found but not executable.
+
+## Python API
+
+Issue [#18](https://github.com/agentculture/headspace-cli/issues/18) asked the
+question this section exists to settle, filed by an agent that wanted to
+depend on headspace-cli as a library rather than shell out to its CLI: is the
+Python package a supported import surface, or is the CLI the only contract?
+Before this section — and before `headspace/api.py` existed to back it — the
+honest answer was neither. `headspace.core.workspace`, `.policy`, `.result`
+all imported cleanly and said nothing about whether depending on them was
+safe; a caller could not tell "CLI-first, but the package is reachable" from
+"library, just undocumented."
+
+**`headspace.api` is the one supported import surface, covered by the same
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html) commitment
+`CHANGELOG.md` already makes for the CLI.** A breaking change to one of its
+five functions — a renamed parameter, a changed default, a removed one — is a
+breaking release, exactly like a removed CLI flag. **`headspace.core` — and
+everything else under `headspace.` that is not `headspace.api` — is
+private**: no stability promise, free to change shape in any release,
+including a patch one. Importing it directly, the way issue #18's filer had
+to guess whether to do, opts out of the one surface this project promises to
+keep still.
+
+`headspace/api.py`'s own `__all__` is the same declaration in a form a
+program can check without reading a word of prose:
+
+```python
+>>> import headspace.api
+>>> headspace.api.__all__
+['create', 'run', 'put', 'export', 'destroy']
+```
+
+Five operations, matching the CLI's five state-changing lifecycle verbs one
+for one. Each function takes the same parameters as the `Orchestrator` method
+it calls — checked mechanically against each other, not just described
+consistently — plus one the CLI spells as a flag: `provider="docker"` (the
+default) or `"fake"`. Each returns the identical `ResultPackage` the CLI renders to
+markdown or JSON: the same nine sections (`outcome_summary`, `status`,
+`key_findings`, `evidence`, `artifacts`, `warnings`, `resource_usage`,
+`provenance`, `attention`) as a plain dataclass instance instead of rendered
+text. `.status` is the field worth checking first — the same vocabulary the
+exit codes above mirror one to one.
+
+```python
+import io
+from headspace import api
+
+# provider="fake" makes this whole example runnable with no engine at all;
+# the default is provider="docker", the same real backend the CLI uses.
+# Importing headspace.api never touches an engine either way — only
+# *calling* create/run against provider="docker" does.
+created = api.create(provider="fake")
+workspace_id = created.provenance.workspace_id
+
+ran = api.run(
+    workspace_id,
+    ["python3", "report.py"],
+    declares=[api.ArtifactDeclaration(name="report.json", purpose="pi to 10 digits")],
+    provider="fake",
+)
+assert ran.status == "success"
+
+# A library caller that already holds the bytes may hand them to export()
+# directly (source=), skipping the provider read the CLI has no choice but
+# to take — see export()'s own docstring.
+exported = api.export(
+    workspace_id,
+    "report.json",
+    source=io.BytesIO(b'{"pi": 3.1415926536}'),
+    destination="./report.json",
+    provider="fake",
+)
+assert exported.status == "success"
+
+destroyed = api.destroy(workspace_id, provider="fake")
+assert destroyed.status == "success"
+```
+
+Every line above ran, verbatim, against `provider="fake"` while writing this
+section. That is the whole reason `fake` exists as a `provider=` choice here
+too: an external consumer testing *against* headspace — in CI, or locally
+with nothing installed — drives these same five functions against `"fake"`
+instead of `"docker"`, with no daemon required. `ArtifactDeclaration` (and
+`run`'s other parameter types, `InputRequest` and `JobEnvironment`, plus the
+`ResultPackage` every function returns) are reachable as plain attributes of
+`headspace.api` too — `api.ArtifactDeclaration`, never
+`headspace.core.workspace.ArtifactDeclaration` — because a caller of `run`
+needs the type to build a `declares=` value, not because this facade widens
+its own promise: `__all__` still names only the five operations, since those
+are what the semver commitment above actually covers.
+
+One verb is deliberately absent: `Orchestrator.stop` has no `headspace.api`
+counterpart. Not an oversight — `stop` must run in a genuinely separate
+process from the `run` it interrupts (see the [`stop
+<workspace>`](#lifecycle-verbs) row above), which makes it a CLI-shaped
+operation in a way the other five are not, and naming it here anyway would
+have been a unilateral call this facade was never asked to make. A consumer
+that needs it programmatically is a real, open question for a future
+revision of this surface, not a gap this section is papering over.
 
 ## Mesh identity
 

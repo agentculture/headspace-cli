@@ -109,10 +109,36 @@ else, because a stub engine can only confirm what its author already believed:
 * whether a job container is genuinely gone on the normal path, and whether the
   label-reaping backstop genuinely works when the removal genuinely fails.
 * whether ``stop --apply`` genuinely ends a live job in another process — and
-  what the still-blocked ``run`` genuinely records about it, which today is
-  ``failure``/137/exit 6 rather than ``cancelled``/exit 5. That gap is issue
-  #16 and it is asserted *as it is*, deliberately: see
-  :func:`test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_as_issue_16_describes`.
+  whether the still-blocked ``run`` now genuinely records that honestly:
+  ``cancelled``/exit 5 with no ``exit_status`` at all, rather than the
+  ``failure``/137/exit 6 the identical scenario produced before issue #16's
+  two-phase cancellation channel existed. See
+  :func:`test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_cancelled`.
+
+The adversarial group: the same channel, with a job fighting it
+----------------------------------------------------------------
+The group above shows the cancellation channel working when nothing is
+attacking it. The last group assumes the opposite, because the threat model
+does: a job shares the workspace volume with headspace's two reserved marker
+names, and a job is the caller's own code. Everything there is one direction of
+a single asymmetry the provider's docstring claims out loud — *tampering can
+cost a real cancellation its name; it can never manufacture one that did not
+happen* — and it is tested live because a stub engine cannot produce the two
+things that decide it: real signal delivery ordering, and what a real
+``/proc`` shows a real process about itself.
+
+Six probes, plus one that records the boundary rather than a guarantee: a
+SIGTERM handler that deletes both markers; a job that catches and ignores
+SIGTERM and dies to the escalation; an intent marker a job planted naming
+itself; a job both operator-stopped and past its wall-clock budget in one
+window; every identity surface a job can read, searched for its own job id;
+symlinks planted at both reserved names by the job about to be stopped; and —
+the seventh — what happens when a job *is* told its own id, which is the exact
+hinge the unforgeability claim turns on. Two findings from writing them are
+recorded in the tests themselves rather than here, because they are not
+obvious: a marker a job plants is consumed by that job's *own* run before any
+later job can meet it, and the countersignal is never within reach of the job
+it names because it is written only after that job is dead.
 
 Running without an engine, and leaving nothing behind
 -------------------------------------------------------
@@ -138,6 +164,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -1632,28 +1659,42 @@ def test_a_job_container_is_removed_on_the_normal_path_and_a_failed_removal_is_r
     ), "the label-reaping backstop did not reap a stray it was the backstop for"
 
 
-def test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_as_issue_16_describes(
+def test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_cancelled(
     home: Path, engine: docker.DockerClient, workspace: Any
 ) -> None:
-    """Two processes, one job: the stop reports honestly, and the run does not yet.
+    """Two processes, one job: the stop reports honestly, and now so does the run.
 
     ``run`` blocks and holds the workspace lock for a job's whole duration, so
     the only way to prove ``stop`` works is to have a genuinely separate process
-    arrive with nothing but the workspace id. That half works, and is asserted
-    as it should be: ``cancelled``, exit 5.
+    arrive with nothing but the workspace id. That half has always worked, and
+    is asserted as it should be: ``cancelled``, exit 5.
 
-    The other half is a **known gap, tracked as issue #16**, and it is asserted
-    here exactly as it behaves today rather than marked ``xfail`` or quietly
-    omitted. The still-blocked ``run`` sees a container the engine killed with
-    SIGKILL: exit status 137, ``OOMKilled: false``. ``DockerProvider._status``
-    has no branch that can produce ``cancelled`` — and it could not invent one
-    from these facts anyway, because a job that deliberately calls
-    ``sys.exit(137)`` presents identically (that indistinguishability is itself
-    pinned by
-    ``test_regression_one_workspace_tells_four_outcomes_apart``). So the run
-    reports ``failure`` and exits 6. **If a future change fixes #16, this test
-    will fail** — that is deliberate: read this docstring, then update the
-    assertions under the ``issue #16`` banner below to ``cancelled`` / 5.
+    The other half used to be a known gap, tracked as issue #16: the
+    still-blocked ``run`` sees a container the engine killed with SIGKILL —
+    exit status 137, ``OOMKilled: false`` — and that is byte for byte what
+    ``python -c "raise SystemExit(137)"`` leaves behind too, a fact pinned
+    independently by ``test_regression_one_workspace_tells_four_outcomes_apart``.
+    No amount of staring at the engine's own numbers can tell those two jobs
+    apart, which is exactly what makes the assertions below meaningful rather
+    than circular: if ``cancelled`` shows up here, it did not come from the
+    exit code, the ``OOMKilled`` flag, or any other fact the engine can report
+    about this container, because none of those facts differ between a job an
+    operator stopped and a job that chose 137 for itself. It can only have come
+    from the positive, out-of-band signal described in
+    ``headspace/providers/docker.py``'s module docstring under "Recording that
+    an operator ended it": the intent marker ``stop`` writes into the
+    workspace volume before it signals, and the countersignal it writes
+    through the anchor once the signalling has run its course — both read back
+    by ``run`` and matched against the job id that just ran.
+
+    ``exit_status`` being absent below is not this provider merely asserting
+    that a stopped job carries none — it is
+    :meth:`~headspace.providers.base.JobOutcome.__post_init__` refusing, at
+    construction, to build a ``cancelled`` outcome that carries an exit status
+    at all. So even a provider that classified the job correctly but also
+    tried to report the 137 it observed at the engine would fail loudly right
+    there, rather than quietly leaking a number the taxonomy says a cancelled
+    job never produces.
     """
     workspace_id = workspace()
     _create_workspace(home, workspace_id)
@@ -1695,16 +1736,16 @@ def test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_as_issue_16_d
             runner.kill()
             runner.communicate(timeout=30)
 
-    # --- issue #16: the honest, current behaviour of the job's own record ---
-    assert runner.returncode == _EXIT_COMPUTATION_FAILED, (
-        f"the interrupted run exited {runner.returncode}; issue #16 says 6 today, "
-        f"and 5 once cancellation is distinguishable. stderr: {err}"
+    # --- the job's own record, honest about who ended it (since issue #16) ---
+    assert runner.returncode == _EXIT_CANCELLED, (
+        f"the interrupted run exited {runner.returncode}, expected {_EXIT_CANCELLED}; "
+        f"stderr: {err}"
     )
     run_package = json.loads(out)
-    assert run_package["status"] == STATUS_FAILURE  # issue #16: 'cancelled' one day
+    assert run_package["status"] == STATUS_CANCELLED  # the countersignal, not the exit code
     recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
-    assert recorded["stoppable-job"]["exit_status"] == 137  # issue #16: SIGKILL, not a verdict
-    assert recorded["stoppable-job"]["status"] == STATUS_FAILURE  # issue #16
+    assert recorded["stoppable-job"]["exit_status"] is None  # a cancelled outcome carries none
+    assert recorded["stoppable-job"]["status"] == STATUS_CANCELLED  # since issue #16
 
 
 def test_put_archive_writes_straight_through_a_planted_ancestor_symlink(
@@ -1792,3 +1833,922 @@ def test_put_archive_writes_straight_through_a_planted_ancestor_symlink(
     check = orch.run(workspace_id, ("cat", "/workspace/ordinary.txt"), job_id="check-ordinary")
     assert check.status == STATUS_SUCCESS
     assert "landed where it was asked to" in check.evidence[0].excerpt
+
+
+# --- the adversarial wave: what a job inside the box can do to the channel ---
+#
+# Everything above proves the cancellation channel works when nobody is
+# fighting it. This group assumes the opposite, because the threat model says
+# so out loud: a job shares the workspace volume with headspace's own two
+# reserved marker names, runs code the caller wrote rather than code headspace
+# wrote, and is under no obligation to be polite about either. Every test below
+# is one direction of a single asymmetry claimed in
+# ``headspace/providers/docker.py``'s module docstring under "Recording that an
+# operator ended it":
+#
+#     tampering can cost a real cancellation its name — it can never
+#     manufacture one that did not happen.
+#
+# The claim rests on one fact and one ordering, and the tests are split along
+# them. The fact is that nothing inside the box ever tells a job its own id, so
+# a job cannot write the one string that would make a marker speak about
+# itself (probe 5 below, and probe 7 which shows precisely what the guarantee
+# costs if that fact ever stops being true). The ordering is that the
+# countersignal — the only marker ``run`` will classify from — is written after
+# the job is already dead, so it is never within reach of the job it names
+# (probe 1). What a job *can* reach is everything else, and probes 3 and 6 show
+# what that buys it: nothing, twice, in two different ways.
+#
+# Same single-writer constraint as the rest of this module: these drive real
+# containers with deterministic ids and must not be run concurrently with each
+# other.
+
+#: The reserved names, written out rather than imported from the provider.
+#: These two strings are a cross-process wire protocol — one process writes
+#: them and a different one reads them — so a test that imported them would
+#: agree with a rename by construction and prove nothing about the two halves
+#: still meeting. The comment is the only link, exactly as it is for the exit
+#: codes above.
+_SIGNALLED_MARKER = "/workspace/.headspace-cancelled"  # mirrors docker.CANCELLATION_SIGNALLED_...
+_INTENT_MARKER = "/workspace/.headspace-cancel-requested"  # mirrors docker.CANCELLATION_INTENT_...
+
+#: How long ``run`` holds the door open when an intent marker names the job
+#: that just settled. Asserted against a *measured* wall time below, which is
+#: what makes "the wait really ran and still invented nothing" a fact rather
+#: than a reading of the source.
+_CANCELLATION_SETTLE_SECONDS = 2.0  # mirrors docker.CANCELLATION_SETTLE_SECONDS
+
+#: The taxonomy name the wall-clock enforcer produces, and the process exit
+#: code that goes with it. Present only so the precedence assertion below can
+#: say which answer was *rejected* rather than only which was returned.
+_STATUS_TIMEOUT = "timeout"  # mirrors result.STATUS_TIMEOUT
+_EXIT_TIMEOUT = 4  # mirrors _errors.EXIT_TIMEOUT
+
+#: A wall-clock budget short enough that headspace's own enforcer reliably
+#: fires *before* a ``stop`` issued at the same moment escalates to SIGKILL —
+#: six seconds against a ten-second grace period. That gap is what makes the
+#: coincidence in the ``both_operator_stopped_and_past_its_wall_clock_budget``
+#: test below real rather than asserted: the container demonstrably died to the
+#: enforcer, and the operator's countersignal still won the classification.
+_SHORT_WALL_CLOCK_SECONDS = 6
+
+
+def _captured_output(package: dict[str, Any]) -> str:
+    """Only the bytes the *job* produced — never headspace's narration about it.
+
+    The distinction is the whole point of the leak probe and load-bearing in
+    the tamper probes too. A result package legitimately names the job it
+    describes in ``outcome_summary``, in every evidence item's ``source``, and
+    in the findings; searching the serialised package for a job id would
+    therefore always find one, and would say nothing at all about what the job
+    could see from inside its container. This returns the excerpt bodies alone.
+    """
+    return "\n".join(
+        item["excerpt"] for item in package["evidence"] if item.get("kind") == "excerpt"
+    )
+
+
+def _await_job_log(container: Any, needle: str, timeout: float = 60.0) -> None:
+    """Block until a running job has said something specific on its own stream.
+
+    ``_await_running_job_container`` answers "the engine has started this
+    container", which for an adversarial test is still too early: a job that
+    has to arm a signal handler, or plant an object at a reserved name, has not
+    necessarily done so at the instant the engine calls it running. Gating on
+    the job's *own* announcement removes that window, so the probes below test
+    what they claim to test rather than occasionally racing their own setup.
+
+    Read from the engine's retained log rather than from an attach stream:
+    ``run`` is already attached in another process, and a second attach would
+    change the capture this module asserts about elsewhere.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with contextlib.suppress(docker.errors.APIError, OSError):
+            if needle in container.logs(stdout=True, stderr=True).decode("utf-8", "replace"):
+                return
+        time.sleep(0.05)
+    raise AssertionError(f"job container never emitted {needle!r} within {timeout}s")
+
+
+def _volume_listing(engine: docker.DockerClient, workspace_id: str) -> str:
+    """What actually stands in the workspace volume, read through the anchor.
+
+    The anchor is the container headspace itself writes and reads the markers
+    through, so this sees exactly what the provider would see. Reading it from
+    the host would mean finding the volume's path under the engine's own state
+    directory, which needs root and would be a claim about this machine's
+    storage driver rather than about the workspace.
+    """
+    anchor = _workspace_container(engine, workspace_id)
+    listing = anchor.exec_run(["/bin/sh", "-c", "ls -A /workspace"])
+    return listing.output.decode("utf-8", "replace")
+
+
+#: A job that fights back the moment it is asked to stop.
+#:
+#: On SIGTERM it reports what stands at each reserved marker name, deletes it,
+#: reports again, and exits 137 — the number a SIGKILL would have left, chosen
+#: so that every fact the engine can report about this container is identical
+#: to a forceful stop's. The reports are the evidence: they are taken from
+#: inside the box at the last instant the job is alive, which is the only
+#: moment at which its tampering could possibly matter.
+#:
+#: ``sleep 60 & wait`` rather than a foreground ``sleep 60``, and the choice is
+#: not cosmetic. A POSIX shell defers a trap until the foreground command it is
+#: running finishes, and ``docker stop`` signals PID 1 alone — so a shell
+#: blocked on a foreground ``sleep`` would never run this handler at all, would
+#: die to the escalation ten seconds later with the trap unexecuted, and the
+#: test would quietly become a duplicate of the plain-``sleep`` case above.
+#: ``wait`` is interruptible by a trapped signal, which is what puts the
+#: handler on the stack while the job still exists.
+_MARKER_DELETING_TAMPER = f"""
+trap '
+for marker in {_SIGNALLED_MARKER} {_INTENT_MARKER}
+do
+  if [ -e "$marker" ] || [ -L "$marker" ]
+  then echo "TAMPER-SAW $marker"
+  else echo "TAMPER-ABSENT $marker"
+  fi
+  rm -f "$marker"
+  if [ -e "$marker" ] || [ -L "$marker" ]
+  then echo "TAMPER-KEPT $marker"
+  else echo "TAMPER-GONE $marker"
+  fi
+done
+echo TAMPER-DONE
+exit 137
+' TERM
+echo TAMPER-ARMED
+sleep 60 &
+wait
+"""
+
+
+def test_a_tampering_job_can_delete_the_intent_marker_but_never_reaches_the_countersignal(
+    home: Path, engine: docker.DockerClient, workspace: Any
+) -> None:
+    """The headline probe: a job deleting both marker names deletes the wrong one.
+
+    The job installs a SIGTERM handler that unlinks both reserved names from
+    the shared volume and then exits 137 — the exit status a SIGKILL leaves,
+    so nothing the engine can report distinguishes this container from one an
+    operator forcefully ended. It is then genuinely stopped by a genuinely
+    separate process, and the handler's own reports say what it could see.
+
+    Three of those reports are facts about the *ordering* of the two-phase
+    channel, and they are the reason this test is not a race:
+
+    * ``TAMPER-SAW`` at the intent name. ``stop`` writes intent *before* it
+      signals, so by the time a SIGTERM handler runs the intent marker is
+      necessarily already in the volume. The job therefore has the channel
+      fully within reach — this is not a test of a job that failed to find
+      what it was attacking.
+    * ``TAMPER-GONE`` at the intent name. And it really deleted it: the volume
+      is shared and writable, and headspace does nothing to prevent this.
+      Deleting the intent marker is not harmless, either — it is exactly the
+      warning ``run`` uses to know a countersignal is on its way, so the job
+      has disarmed :data:`~headspace.providers.docker.CANCELLATION_SETTLE_SECONDS`
+      before it ever runs.
+    * ``TAMPER-ABSENT`` at the *countersignal* name. This is the whole
+      guarantee, and it holds by construction rather than by timing: the
+      countersignal is written only once the signalling has run its course,
+      which is to say only once this container is dead. There is no instant at
+      which a job and its own countersignal both exist, so there is no tamper
+      a job can perform against the one marker that classifies.
+
+    What the recorded outcome then is, is the interesting part, and the honest
+    answer is that it depends on which of two processes gets to the volume
+    first — so this test asserts the pair of answers that are honest and
+    refuses everything else, rather than pretending to a determinism the
+    channel does not claim. Measured against docker 29.1.3 on the reference
+    host, eight consecutive rounds all recorded ``cancelled``: with the intent
+    marker deleted, ``run`` does not wait, but it still spends a ``/system/df``
+    call (:meth:`~headspace.providers.docker.DockerProvider._volume_bytes`,
+    ~180ms on a daemon holding 135 images) between the job's death and its read
+    of the volume, and ``stop`` lands the countersignal inside that window. On
+    a leaner daemon that call is cheaper and ``run`` may read first, in which
+    case the record is ``failure``/137 — the pre-#16 answer, which is the
+    documented degradation and not a defect.
+
+    So the assertion below is the one the design actually makes: whichever way
+    the read lands, the record is either the truth (``cancelled``, carrying no
+    exit status, because
+    :meth:`~headspace.providers.base.JobOutcome.__post_init__` refuses one) or
+    the strictly weaker pre-#16 truth (``failure``, carrying the job's own
+    137). It is never ``success``, never ``timeout``, never
+    ``resource_exhausted``, and — the direction that matters — the tamper never
+    moved the record *towards* ``cancelled``, because a stop really did happen
+    here. The manufacturing direction is probed separately by
+    :func:`test_an_intent_marker_a_job_planted_for_itself_buys_it_nothing_at_all`.
+
+    What this is NOT evidence of: that ``cancelled`` will be recorded on any
+    given host. If a future change makes ``run`` read the volume sooner, this
+    test keeps passing and the record degrades silently to ``failure`` — which
+    is the correct direction to degrade in, and is why the disjunction here is
+    a deliberate statement about the channel rather than a hedge.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id)
+
+    runner = _cli_background(
+        "run",
+        "--json",
+        "--job-id",
+        "tamper-job",
+        workspace_id,
+        "/bin/sh",
+        "-c",
+        _MARKER_DELETING_TAMPER,
+        home=home,
+    )
+    try:
+        container = _await_running_job_container(engine, workspace_id)
+        # Gate on the job's own announcement, not on the engine calling the
+        # container running: a handler that is not installed yet cannot tamper,
+        # and this probe is worthless if it stops a job before it is armed.
+        _await_job_log(container, "TAMPER-ARMED")
+
+        stopped = _cli("stop", "--json", "--apply", workspace_id, home=home)
+        assert stopped.returncode == _EXIT_CANCELLED, (
+            f"stop --apply exited {stopped.returncode}, expected {_EXIT_CANCELLED}; "
+            f"stderr: {stopped.stderr}"
+        )
+        out, err = runner.communicate(timeout=_CLI_TIMEOUT_SECONDS)
+    finally:
+        if runner.poll() is None:  # pragma: no cover - only on a wedged engine
+            runner.kill()
+            runner.communicate(timeout=30)
+
+    package = json.loads(out)
+    tamper_report = _captured_output(package)
+    assert "TAMPER-DONE" in tamper_report, (
+        "the SIGTERM handler never ran, so this round tested nothing about "
+        f"tampering; the job said: {tamper_report!r}"
+    )
+    # The channel was fully within the job's reach...
+    assert f"TAMPER-SAW {_INTENT_MARKER}" in tamper_report, (
+        "the intent marker was not in the volume when the job was signalled, "
+        "which contradicts stop writing it before it signals"
+    )
+    assert f"TAMPER-GONE {_INTENT_MARKER}" in tamper_report, (
+        "the job could not delete the intent marker; this probe assumes it can, "
+        "and the guarantee it tests does not depend on it being unable to"
+    )
+    # ...and the one marker that classifies was still not in it.
+    assert f"TAMPER-ABSENT {_SIGNALLED_MARKER}" in tamper_report, (
+        "a countersignal existed while the job that it names was still alive — "
+        "the ordering the whole two-phase channel rests on has been inverted"
+    )
+
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    tampered = recorded["tamper-job"]
+    assert package["status"] == tampered["status"]
+    if tampered["status"] == STATUS_CANCELLED:
+        assert tampered["exit_status"] is None  # a cancelled outcome carries none, by construction
+        assert runner.returncode == _EXIT_CANCELLED
+    else:
+        assert tampered["status"] == STATUS_FAILURE, (
+            "a tampered stop was recorded as something other than the truth or "
+            f"the documented degradation: {tampered['status']!r}"
+        )
+        assert tampered["exit_status"] == 137  # the job's own choice, preserved verbatim
+        assert runner.returncode == _EXIT_COMPUTATION_FAILED
+
+
+#: A job that hears the polite signal, says so, and carries on regardless.
+#:
+#: Deliberately different from the plain ``sleep`` the stop test above uses.
+#: There, PID 1 discards SIGTERM because it installed no handler, so the signal
+#: is never *delivered* and the escalation is the only thing that could have
+#: ended the job. Here the signal is delivered, caught and ignored on purpose,
+#: and the job says so on its own stream — which turns "the escalation ran"
+#: from an inference about PID 1 semantics into something the job itself
+#: witnessed.
+_SIGTERM_IGNORING_JOB = """
+trap 'echo IGNORED-SIGTERM' TERM
+echo IGNORER-ARMED
+count=0
+while [ "$count" -lt 120 ]
+do
+  sleep 1 &
+  wait
+  count=$((count + 1))
+done
+"""
+
+
+def test_a_job_that_catches_and_ignores_sigterm_is_recorded_cancelled_after_the_escalation(
+    home: Path, engine: docker.DockerClient, workspace: Any
+) -> None:
+    """The slowest stop there is still gets its countersignal read.
+
+    ``stop`` is graceful before it is forceful, so a job that refuses to end
+    itself costs it the full :data:`STOP_GRACE_SECONDS` before the SIGKILL —
+    and every one of those seconds is spent *before* the countersignal is
+    written. That is the worst case the settle wait exists for, and it is worth
+    a test of its own because the two processes are least synchronised exactly
+    here: ``run`` is polling a container that dies the instant the escalation
+    lands, while ``stop`` still owes a reload and an exec round trip.
+
+    The job catching the signal rather than ignoring it by PID 1 default is
+    what makes this distinct from
+    :func:`test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_cancelled`.
+    That test's ``sleep`` never receives SIGTERM at all — the kernel discards a
+    signal PID 1 installed no handler for — so "the escalation ended it" is an
+    inference from the elapsed time. Here the job prints ``IGNORED-SIGTERM``
+    from inside its own handler, so delivery, refusal and escalation are three
+    separate observed facts rather than one deduction.
+
+    ``exit_status`` being absent is not this test being lenient about the 137
+    the engine holds: a ``cancelled`` outcome that carried an exit status could
+    not be constructed at all
+    (:meth:`~headspace.providers.base.JobOutcome.__post_init__`), so the
+    ``None`` below is a refusal, not an omission.
+
+    What this is NOT evidence of: anything about a job that *does* end itself
+    inside its grace window. Such a job is never killed, may exit 0, and is
+    recorded ``success`` on purpose — the channel records that an operator
+    asked and that the ask landed, never that the job was cut short.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id)
+
+    runner = _cli_background(
+        "run",
+        "--json",
+        "--job-id",
+        "stubborn-job",
+        workspace_id,
+        "/bin/sh",
+        "-c",
+        _SIGTERM_IGNORING_JOB,
+        home=home,
+    )
+    try:
+        container = _await_running_job_container(engine, workspace_id)
+        _await_job_log(container, "IGNORER-ARMED")
+
+        began = time.monotonic()
+        stopped = _cli("stop", "--json", "--apply", workspace_id, home=home)
+        elapsed = time.monotonic() - began
+
+        assert stopped.returncode == _EXIT_CANCELLED, (
+            f"stop --apply exited {stopped.returncode}, expected {_EXIT_CANCELLED}; "
+            f"stderr: {stopped.stderr}"
+        )
+        assert elapsed >= _STOP_GRACE_SECONDS - 1, (
+            f"stop returned in {elapsed:.2f}s, too fast to have given the job its "
+            f"{_STOP_GRACE_SECONDS}s grace period before escalating"
+        )
+        out, err = runner.communicate(timeout=_CLI_TIMEOUT_SECONDS)
+    finally:
+        if runner.poll() is None:  # pragma: no cover - only on a wedged engine
+            runner.kill()
+            runner.communicate(timeout=30)
+
+    package = json.loads(out)
+    assert "IGNORED-SIGTERM" in _captured_output(package), (
+        "the job never reported catching SIGTERM, so nothing here shows the "
+        "polite signal was delivered and refused rather than simply discarded"
+    )
+    assert runner.returncode == _EXIT_CANCELLED, (
+        f"the interrupted run exited {runner.returncode}, expected {_EXIT_CANCELLED}; "
+        f"stderr: {err}"
+    )
+    assert package["status"] == STATUS_CANCELLED
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    assert recorded["stubborn-job"]["status"] == STATUS_CANCELLED
+    assert recorded["stubborn-job"]["exit_status"] is None
+
+
+def test_an_intent_marker_a_job_planted_for_itself_buys_it_nothing_at_all(
+    home: Path, workspace: Any, orch: Orchestrator
+) -> None:
+    """Not an ending, and since issue #20 not even a delay.
+
+    Producing a genuine intent-only state is the hard part of this probe, and
+    the two obvious routes are both dead ends. A completed ``stop`` always
+    writes both phases, so it cannot leave one. And a job that plants an intent
+    marker *for a later job* achieves nothing at all — a fact worth recording
+    because it is not obvious: ``run`` clears both reserved names on every
+    classification path including exit 0, so the planting job's own run consumes
+    the plant before any other job can meet it (verified against docker 29.1.3
+    while writing this suite, and relied on from the other direction by
+    :func:`test_a_symlink_planted_at_a_marker_path_costs_a_cancellation_its_name_and_nothing_else`,
+    which is why the job that plants there has to be the job that is stopped).
+
+    So this test does the only remaining thing, and does it in the attacker's
+    favour: it *tells the job its own job id*, by naming the job on the command
+    line and writing the same string into the intent marker from inside the
+    container. That is deliberately more than the threat model allows, so that
+    the properties above it can be tested on their own.
+
+    Two facts, and the second one moved. **The record is a failure** — intent
+    means an operator asked, never that they succeeded — which was true before
+    the workspace token existed and is unchanged by it. **And the run does not
+    pay the settle wait**, which is new. Holding the correct job id used to be
+    enough to satisfy ``_ended_by_an_operator``'s intent test and send ``run``
+    into :meth:`~headspace.providers.docker.DockerProvider._await_countersignal`
+    for two seconds; the job could not manufacture a cancellation that way, but
+    it could make every one of its own runs burn the budget. Now the intent
+    marker must carry the workspace's token too, so a job's self-planted intent
+    fails to match and is simply cleared. Closing a forgery closed a small
+    denial-of-service lever with it, which is worth pinning so a future change
+    that loosens the intent test cannot quietly reopen both.
+
+    The settle wait's *timeout* path — a real intent marker with a countersignal
+    that never arrives — is no longer reachable from inside a container at all,
+    which is the point. It is covered where it can now be staged honestly:
+    ``test_the_wait_for_a_countersignal_ends`` in
+    ``tests/test_docker_classification.py``.
+    """
+    workspace_id = workspace()
+    orch.create(workspace_id=workspace_id)
+    victim = "self-named-intent-job"
+
+    package = orch.run(
+        workspace_id,
+        (
+            "/bin/sh",
+            "-c",
+            # The job id is handed to the job in argv, which headspace itself
+            # never does — see this test's docstring for why that is the point.
+            f"printf '{victim}' > {_INTENT_MARKER}; echo planted-intent-for-myself; exit 9",
+        ),
+        job_id=victim,
+    )
+
+    assert package.status == STATUS_FAILURE, (
+        "an intent marker naming the job that just failed was enough to record "
+        "a cancellation; intent means an operator asked, never that they succeeded"
+    )
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    planted = recorded[victim]
+    assert planted["status"] == STATUS_FAILURE
+    assert planted["exit_status"] == 9, "the job's own exit status was not preserved"
+    assert planted["usage"]["wall_time_seconds"] < _CANCELLATION_SETTLE_SECONDS, (
+        "the run paid the settle wait for an intent marker the job wrote itself, "
+        "so the intent test is matching on something a job can produce — the "
+        f"workspace token is supposed to prevent that: {planted['usage']['wall_time_seconds']}s"
+    )
+
+
+def test_a_countersignal_a_job_planted_for_itself_is_refused(
+    home: Path, workspace: Any, orch: Orchestrator
+) -> None:
+    """The forgery this test used to record, now refused — live (issue #20).
+
+    Its previous incarnation was committed deliberately as a *recorded
+    weakness*, and it ended with an instruction to whoever closed it:
+
+        If a future change makes this test fail — because the channel grew a
+        provenance check, a nonce, or a write path a job cannot reach — that is
+        an improvement, and this test should be rewritten to assert the refusal
+        rather than deleted.
+
+    That change arrived. What it recorded was the guarantee's real hinge: the
+    provider called the channel unforgeable and justified it with "the one
+    string it cannot write is its own job id", which is a conditional, and
+    ``--job-id`` is the *caller's* to choose. A caller who picked predictable
+    ids and ran code it did not trust had told the job its id by another route,
+    and the job could then write its own countersignal and be believed —
+    recorded ``cancelled``, with no operator anywhere, asserting that a human
+    deliberately ended work that in truth broke by itself.
+
+    The fix is not to make the write harder to reach — a job with a shell in
+    the volume can always write these bytes. It is to make the *payload*
+    contain something no job can obtain: a per-workspace token minted at
+    ``create`` and carried as a label on the anchor container, which is engine
+    metadata no process inside any container can read, on an object that is not
+    even the job's own container. So the body below is unchanged from the
+    version that forged successfully — same job, same id, same bytes at the
+    same path — and only the verdict moved.
+
+    That is what makes this evidence rather than assertion: the attack was not
+    weakened to make the test pass.
+
+    What this is still NOT evidence of: safety against anyone who can reach the
+    Docker socket or ``~/.headspace``. They can read the label and edit the
+    record respectively. The adversary here is the untrusted code inside the
+    box, which is the one that cannot be reasoned with.
+    """
+    workspace_id = workspace()
+    orch.create(workspace_id=workspace_id)
+    forger = "self-named-countersignal-job"
+
+    package = orch.run(
+        workspace_id,
+        (
+            "/bin/sh",
+            "-c",
+            f"printf '{forger}' > {_SIGNALLED_MARKER}; echo planted-countersignal; exit 9",
+        ),
+        job_id=forger,
+    )
+
+    assert package.status == STATUS_FAILURE, (
+        "a job forged a cancellation for itself using only its own job id — the "
+        "workspace token is meant to make that impossible; check that create "
+        "still writes the anchor label and that run still requires it"
+    )
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    assert recorded[forger]["status"] == STATUS_FAILURE
+    assert recorded[forger]["exit_status"] == 9, (
+        "the job's own exit status was lost, so the refusal cost more than the "
+        "forged cancellation it refused"
+    )
+
+
+def test_a_job_both_operator_stopped_and_past_its_wall_clock_budget_is_recorded_cancelled(
+    home: Path, engine: docker.DockerClient, workspace: Any
+) -> None:
+    """Two ways to end at once, and the documented precedence decides — cancelled > timeout.
+
+    ``_status`` ranks the three ways a job can be ended by something other than
+    itself: ``cancelled`` beats ``timeout`` beats ``resource_exhausted``,
+    heaviest deliberation first. Both of the top two are made true here in one
+    window, against a real engine, rather than by passing two booleans to a
+    static method: a workspace with a six-second wall-clock budget runs a
+    ``sleep 60`` that nothing will end politely, and an operator stops it a
+    fraction of a second after it starts.
+
+    The two events then genuinely collide. ``stop`` writes its intent, sends a
+    SIGTERM that PID 1 discards, and settles in to wait out its ten-second
+    grace period — but headspace's own enforcer kills the container at six
+    seconds, well inside that grace. So the container is killed by the timeout
+    path and named by the cancellation path, and the assertions pin both halves
+    independently:
+
+    * ``stop`` returning in comfortably less than :data:`_STOP_GRACE_SECONDS`
+      is the evidence that *something else* killed the container, because a
+      stop that had to escalate could not have returned before its own grace
+      period elapsed. The only other killer in the system is the wall-clock
+      enforcer.
+    * a recorded wall time at or past the budget is the evidence that the
+      budget was genuinely exceeded rather than merely configured.
+    * and the recorded status is ``cancelled`` — exit 5, no exit status — not
+      ``timeout``/exit 4, which is what this job would have been called had the
+      operator not been involved.
+
+    That ordering is a claim about what a *caller* should do next, which is why
+    it is worth a live test: an agent told ``timeout`` widens the budget and
+    re-runs a job a human just deliberately ended.
+
+    What this is NOT evidence of: the branch order inside ``_status``. A
+    unit-level test pins each precedence pair with the conditions beneath it
+    true at the same time; this one proves the two conditions can actually
+    co-occur in a real workspace and that the live path agrees with the table.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id, "--wall-clock-seconds", str(_SHORT_WALL_CLOCK_SECONDS))
+
+    runner = _cli_background(
+        "run",
+        "--json",
+        "--job-id",
+        "raced-job",
+        workspace_id,
+        "sleep",
+        _LONG_JOB_SECONDS,
+        home=home,
+    )
+    try:
+        _await_running_job_container(engine, workspace_id)
+
+        began = time.monotonic()
+        stopped = _cli("stop", "--json", "--apply", workspace_id, home=home)
+        elapsed = time.monotonic() - began
+
+        assert stopped.returncode == _EXIT_CANCELLED, (
+            f"stop --apply exited {stopped.returncode}, expected {_EXIT_CANCELLED}; "
+            f"stderr: {stopped.stderr}"
+        )
+        assert elapsed < _STOP_GRACE_SECONDS, (
+            f"stop took {elapsed:.2f}s, at least its own {_STOP_GRACE_SECONDS}s grace "
+            "period — so the container died to the stop's escalation and the "
+            "wall-clock enforcer never got there first; the two events did not coincide"
+        )
+        out, err = runner.communicate(timeout=_CLI_TIMEOUT_SECONDS)
+    finally:
+        if runner.poll() is None:  # pragma: no cover - only on a wedged engine
+            runner.kill()
+            runner.communicate(timeout=30)
+
+    package = json.loads(out)
+    assert package["status"] == STATUS_CANCELLED, (
+        f"a job that was both stopped and out of time was recorded "
+        f"{package['status']!r}; the documented precedence is cancelled > timeout"
+    )
+    assert package["status"] != _STATUS_TIMEOUT
+    assert runner.returncode == _EXIT_CANCELLED, (
+        f"the interrupted run exited {runner.returncode} (timeout is {_EXIT_TIMEOUT}), "
+        f"expected {_EXIT_CANCELLED}; stderr: {err}"
+    )
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    raced = recorded["raced-job"]
+    assert raced["status"] == STATUS_CANCELLED
+    assert raced["exit_status"] is None
+    assert raced["usage"]["wall_time_seconds"] >= _SHORT_WALL_CLOCK_SECONDS, (
+        "the job did not actually outlive its wall-clock budget, so only one of "
+        f"the two conditions was true: {raced['usage']['wall_time_seconds']}s "
+        f"against a {_SHORT_WALL_CLOCK_SECONDS}s budget"
+    )
+
+
+#: Every surface a process can interrogate about its own identity, dumped from
+#: inside a job. The section headers are asserted individually so a surface
+#: that silently stops being readable — a ``/proc`` mount that changes shape, a
+#: missing tool — fails the test instead of quietly narrowing what it covers.
+#:
+#: ``/proc/self/cmdline`` holds this script, so the script itself must never
+#: name a job id, and it does not: the id is passed to ``headspace run`` on the
+#: *host's* command line and asserted against from there.
+_IDENTITY_SURFACE_DUMP = """
+echo '--- env ---'
+env
+echo '--- hostname ---'
+cat /proc/sys/kernel/hostname
+cat /etc/hostname
+echo '--- cgroup ---'
+cat /proc/self/cgroup
+echo '--- mountinfo ---'
+cat /proc/self/mountinfo
+echo '--- cmdline ---'
+tr '\\0' ' ' < /proc/self/cmdline
+echo
+echo '--- pid1-cmdline ---'
+tr '\\0' ' ' < /proc/1/cmdline
+echo
+echo '--- environ ---'
+tr '\\0' '\\n' < /proc/self/environ
+"""
+
+
+def _dumped_sections(dump: str) -> dict[str, str]:
+    """Split the surface dump above into ``{name: body}``."""
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in dump.splitlines():
+        if line.startswith("--- ") and line.endswith(" ---"):
+            current = line[4:-4]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return {name: "\n".join(body) for name, body in sections.items()}
+
+
+def test_no_surface_inside_a_job_container_carries_its_own_job_id(
+    home: Path, workspace: Any, orch: Orchestrator
+) -> None:
+    """The fact the whole cancellation channel rests on, made into a standing test.
+
+    A job shares the workspace volume with headspace's two reserved marker
+    names and can write anything it likes at either. The only reason that does
+    not make the channel forgeable is that a job cannot write the one string
+    that would matter — its own job id — because nothing inside the container
+    ever tells it one. That is a placement discipline, not a mechanism: the id
+    travels as a container *name* and a ``headspace.job_id`` label, both of
+    which live at the engine and neither of which a process can read from
+    inside itself. A container's hostname is its engine id, not its name.
+
+    Placement disciplines rot silently. A future change that put the job id in
+    an environment variable for convenience, or set ``hostname`` to it for
+    nicer logs, would leave every existing test passing and quietly hand every
+    job half of what a forged countersignal needs. Only half, since issue #20:
+    the payload also carries a per-workspace token a job cannot reach, and
+    :func:`test_a_countersignal_a_job_planted_for_itself_is_refused`
+    holds that line. Which is exactly why this test still earns its keep — the
+    token is the guarantee, and this is the defence that keeps the token from
+    being the *only* one. The job id is passed explicitly with ``--job-id`` so
+    the exact string being hunted for is known rather than inferred.
+
+    Every surface a process can interrogate about itself is dumped and searched:
+    the whole environment, the kernel's idea of the hostname and the image's
+    ``/etc/hostname``, ``/proc/self/cgroup``, ``/proc/self/mountinfo``, its own
+    ``/proc/self/cmdline`` and PID 1's, and ``/proc/self/environ`` — the last
+    because an environment variable unset after start still shows there. Each
+    section is asserted to be non-empty, so a surface that stops being readable
+    fails loudly instead of narrowing the search in silence.
+
+    The contrast is the point of the last assertion, and it is why this is not
+    an argument about obscurity. The *workspace* id is plainly visible: it is
+    in the volume's name, and ``/proc/self/mountinfo`` shows the volume backing
+    ``/workspace`` in full. So a job can name the box it is in without
+    difficulty — headspace hides nothing on principle here. What it withholds
+    is the one identifier that would let a job speak *as headspace about
+    itself*, and it withholds it in exactly one place because that is where it
+    matters. Recorded against docker 29.1.3: ``HOSTNAME`` was the container's
+    12-hex engine id, ``/proc/self/cgroup`` read ``0::/``, and mountinfo named
+    ``/var/lib/docker/volumes/headspace-<workspace id>/_data``.
+
+    What this is NOT evidence of: that a job cannot obtain its id by some route
+    outside the container — a caller who passes a predictable ``--job-id`` and
+    then runs untrusted code has told it, and the forge test above records what
+    follows.
+    """
+    workspace_id = workspace()
+    orch.create(workspace_id=workspace_id)
+    # Distinctive and unrelated to the workspace id, so neither string can
+    # accidentally satisfy the other's assertion by being a substring of it.
+    job_id = f"leakprobe-{uuid.uuid4().hex[:12]}"
+
+    package = orch.run(workspace_id, ("/bin/sh", "-c", _IDENTITY_SURFACE_DUMP), job_id=job_id)
+    assert package.status == STATUS_SUCCESS, f"the dump job failed: {package.outcome_summary}"
+
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    dump = recorded[job_id]["output"]
+    assert not recorded[job_id]["truncated"], "the dump was capped, so the search was partial"
+
+    sections = _dumped_sections(dump)
+    expected = {
+        "env",
+        "hostname",
+        "cgroup",
+        "mountinfo",
+        "cmdline",
+        "pid1-cmdline",
+        "environ",
+    }
+    assert set(sections) == expected, f"a surface went missing from the dump: {sorted(sections)}"
+    for name, body in sections.items():
+        assert body.strip(), f"the {name} surface came back empty, so it was never searched"
+        assert job_id not in body, (
+            f"the job id leaked into the {name} surface a job can read about itself, "
+            "which is the single fact the cancellation channel's unforgeability rests on"
+        )
+
+    # HOSTNAME is the engine's id for the container, never headspace's name for
+    # the job — the specific confusion that would hand a job its own id.
+    hostname = sections["hostname"].splitlines()[0].strip()
+    # Two facts, two assertions: "the surface said something" and "what it said
+    # was not the job id" fail for different reasons and deserve to be told
+    # apart — an empty hostname would otherwise read as a leak that isn't one.
+    assert hostname, "the container reported no hostname at all, so nothing was checked"
+    assert hostname != job_id, "the container's hostname *is* the job id — the channel is open"
+    assert re.fullmatch(r"[0-9a-f]{12}", hostname), (
+        f"the container hostname was {hostname!r}, not an engine short id; if "
+        "headspace has started setting a hostname, check it can never be the job id"
+    )
+    # ...while the workspace the job runs in is nameable from inside, plainly.
+    assert workspace_id in sections["mountinfo"], (
+        "the workspace volume was not visible in mountinfo, so this test's "
+        "contrast — the box is nameable, the job is not — was never demonstrated"
+    )
+
+
+#: A job that plants hostile objects at both reserved names and then refuses to
+#: die politely, so that the ``stop`` which follows meets them.
+#:
+#: Two links, two shapes, for two different assertions. The countersignal name
+#: points *out of the volume* at the anchor's own ``/etc/passwd``, which is the
+#: escape the refusal exists to prevent. The intent name points at a canary
+#: *inside* the volume, which is the half that can be read back and compared
+#: byte for byte afterwards — the anchor's ``/etc/passwd`` and the job's are
+#: different files in different containers, so only the in-volume link gives a
+#: target both a job and a later probe can see.
+#:
+#: A plain foreground ``sleep`` on purpose: the shell installs no handler, PID 1
+#: discards a signal it has no handler for, and the job therefore has to be
+#: killed by the escalation — which is the slow path, and the one that gives
+#: ``stop`` the most opportunity to write a marker it should be refusing to.
+_MARKER_LINK_PLANTING_JOB = f"""
+printf 'canary-content-do-not-overwrite\\n' > /workspace/canary.txt
+ln -s /etc/passwd {_SIGNALLED_MARKER}
+ln -s /workspace/canary.txt {_INTENT_MARKER}
+echo PLANTER-ARMED
+sleep 60
+"""
+
+
+def test_a_symlink_planted_at_a_marker_path_costs_a_cancellation_its_name_and_nothing_else(
+    home: Path, engine: docker.DockerClient, workspace: Any
+) -> None:
+    """A job can wedge its own cancellation. It cannot write a byte through the wedge.
+
+    This is the same probe shape as
+    :func:`test_put_archive_writes_straight_through_a_planted_ancestor_symlink`
+    — a job plants the hostile object, and the real code path is then driven
+    against it — applied to the two paths headspace writes on its own account
+    rather than to a copy-in's destination. The threat is identical and so is
+    the reason it is not theoretical: the volume is shared, a job is the
+    caller's own code, and the engine resolves link targets within the
+    container's filesystem quite happily.
+
+    The job that plants is deliberately the job that is stopped, which is not
+    the obvious arrangement and is the only one that works. A job that planted
+    for some *later* job would achieve nothing: ``run`` clears both reserved
+    names on every classification path including exit 0, so the planter's own
+    run takes the plant away before anything else can meet it. So the attack
+    has to be self-directed — a job protecting itself from being named — and
+    that is exactly what this does.
+
+    Four things are asserted, and the last two matter as much as the first two:
+
+    * ``stop`` still ends the job. A marker that cannot be written must never
+      withhold the signal; ending a runaway job is what the operator came for.
+    * the classification degrades to ``failure``/137 — the pre-#16 answer, the
+      documented direction to fail in. The job has successfully cost its own
+      cancellation its name, and that is all it has done.
+    * **nothing was written through either link.** The write stages to an
+      unguessable nonce path and renames onto the marker's name rather than
+      redirecting at it, so the planted link is replaced rather than followed —
+      except that here it is refused outright before either. The canary inside
+      the volume is unchanged and the anchor's ``/etc/passwd`` does not contain
+      the job id, so neither the in-volume nor the out-of-volume link carried a
+      byte.
+    * **the channel recovers.** ``run`` clears whatever it found with ``rm -rf``,
+      which takes a link and never its target, so the very next job in the very
+      same workspace is stopped and recorded ``cancelled`` normally. Without
+      that, one job could permanently poison a workspace's cancellation channel
+      for every job that ever followed it, which would be a far worse outcome
+      than the misreport it is defending itself against.
+
+    What this is NOT evidence of: anything about a *directory* or a device node
+    at a marker name. Those are refused on a separate branch of the same script
+    (a rename over a directory relocates rather than fails), and are pinned by
+    the provider-level suite.
+    """
+    workspace_id = workspace()
+    _create_workspace(home, workspace_id)
+    anchor = _workspace_container(engine, workspace_id)
+
+    runner = _cli_background(
+        "run",
+        "--json",
+        "--job-id",
+        "planter-job",
+        workspace_id,
+        "/bin/sh",
+        "-c",
+        _MARKER_LINK_PLANTING_JOB,
+        home=home,
+    )
+    try:
+        container = _await_running_job_container(engine, workspace_id)
+        _await_job_log(container, "PLANTER-ARMED")
+
+        stopped = _cli("stop", "--json", "--apply", workspace_id, home=home)
+        assert stopped.returncode == _EXIT_CANCELLED, (
+            "stop refused to end a job because it could not write a marker; "
+            f"naming the ending must never withhold it. stderr: {stopped.stderr}"
+        )
+        out, err = runner.communicate(timeout=_CLI_TIMEOUT_SECONDS)
+    finally:
+        if runner.poll() is None:  # pragma: no cover - only on a wedged engine
+            runner.kill()
+            runner.communicate(timeout=30)
+
+    package = json.loads(out)
+    assert package["status"] == STATUS_FAILURE, (
+        "a stop whose countersignal could not be written was still classified "
+        f"{package['status']!r}; a refused write must fail towards silence"
+    )
+    assert runner.returncode == _EXIT_COMPUTATION_FAILED
+    recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
+    assert recorded["planter-job"]["status"] == STATUS_FAILURE
+    assert recorded["planter-job"]["exit_status"] == 137  # the engine's number for the kill
+
+    # Nothing crossed either link. The canary is inside the volume, so a later
+    # probe can read the very bytes the planted link pointed at.
+    canary = anchor.exec_run(["/bin/sh", "-c", "cat /workspace/canary.txt"])
+    assert canary.output.decode("utf-8", "replace").strip() == "canary-content-do-not-overwrite", (
+        "the marker write followed the in-volume link and overwrote its target: "
+        f"{canary.output!r}"
+    )
+    escaped = anchor.exec_run(["/bin/sh", "-c", "grep -c planter-job /etc/passwd || true"])
+    assert escaped.output.decode("utf-8", "replace").strip() == "0", (
+        "a job id was written into /etc/passwd through the planted link, which "
+        "is a write outside the workspace volume"
+    )
+
+    # ...and the channel is clean again, not wedged for every job that follows.
+    listing = _volume_listing(engine, workspace_id)
+    assert ".headspace-cancelled" not in listing, f"the planted link survived the run: {listing!r}"
+    assert ".headspace-cancel-requested" not in listing, f"intent survived the run: {listing!r}"
+
+    recovery = _cli_background(
+        "run",
+        "--json",
+        "--job-id",
+        "recovery-job",
+        workspace_id,
+        "sleep",
+        _LONG_JOB_SECONDS,
+        home=home,
+    )
+    try:
+        _await_running_job_container(engine, workspace_id)
+        again = _cli("stop", "--json", "--apply", workspace_id, home=home)
+        assert again.returncode == _EXIT_CANCELLED, f"second stop failed: {again.stderr}"
+        recovered_out, recovered_err = recovery.communicate(timeout=_CLI_TIMEOUT_SECONDS)
+    finally:
+        if recovery.poll() is None:  # pragma: no cover - only on a wedged engine
+            recovery.kill()
+            recovery.communicate(timeout=30)
+
+    assert recovery.returncode == _EXIT_CANCELLED, (
+        "the next job in this workspace could not be recorded cancelled, so the "
+        f"planted links wedged the channel permanently; stderr: {recovered_err}"
+    )
+    assert json.loads(recovered_out)["status"] == STATUS_CANCELLED

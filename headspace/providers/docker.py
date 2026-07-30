@@ -317,6 +317,146 @@ workspace with nothing running is not an error: a caller racing a job that
 happened to finish on its own between its decision and this call landing is
 the ordinary case, not a mistake, so it is reported as a fact — no job id,
 nothing stopped — rather than raised.
+
+Recording that an operator ended it, and not that it failed (issue #16)
+-----------------------------------------------------------------------
+The section above ends with the two verbs agreeing on who writes state: ``run``
+narrates, ``stop`` only signals. That leaves ``run`` having to *know* something
+only ``stop`` did — and it cannot work it out. What a stop leaves at the engine
+is a container that exited 137 with ``OOMKilled=false``, which is byte for byte
+what ``python -c "raise SystemExit(137)"`` leaves (the same live probe recorded
+under "Killed for exceeding a ceiling" above). No heuristic separates those, so
+before this channel existed a job an operator deliberately ended was recorded
+``failure`` at exit 6 — telling an operator, in the job's own record, that their
+work had failed.
+
+The fix is a **positive signal**, never an inference — and, because one signal
+turned out to be able to lie, a signal in two phases:
+
+``intent`` (:data:`CANCELLATION_INTENT_MARKER_NAME`)
+    written by :meth:`stop` into the workspace volume *before* it signals,
+    carrying the job id it is about to end. It records that an operator asked.
+``countersignal`` (:data:`CANCELLATION_SIGNALLED_MARKER_NAME`)
+    written by :meth:`stop` through the anchor once the signalling has run its
+    course, carrying the same id. It records that the ask took effect, and it
+    is the only one of the two that can, because it cannot exist until it has.
+
+:meth:`run`, on any outcome at all, reads both names back and reports
+:data:`~headspace.core.result.STATUS_CANCELLED` when — and only when — the
+*countersignal* names the job that just ran. Intent alone, neither marker, or
+either one naming another job leaves the classification exactly as it was.
+
+Why one marker was not enough is the whole of the second phase. A single
+sentinel had to be written before the signal, or the still-blocked :meth:`run`
+would miss it; but a sentinel written before the signal is a claim about the
+future. A ``stop`` killed in the gap — the operator's own ``SIGINT``, a lost
+connection, a signal the engine refused — left a sentinel naming a job it never
+ended. That job would often go on to fail entirely on its own account, find the
+sentinel naming *itself*, and be recorded ``cancelled``: headspace asserting, in
+a job's permanent record, that a human deliberately stopped work that in truth
+broke by itself. An agent reading that stops looking for the defect; an operator
+reading it is told they did something they did not do. A missing cancellation
+says less than the truth, which is survivable; a fabricated one says something
+else entirely, which is not. So the two phases split "asked" from "happened",
+and only "happened" is allowed to speak.
+
+The intent marker still earns its keep, and not as corroboration — it is what
+makes a countersignal written after the signal *readable at all*. The two
+processes wake up from the same starting gun: ``stop`` blocks until the
+container it signalled has exited, and :meth:`run` is polling that same
+container, so at the moment the job dies ``stop`` still owes one exec round trip
+and :meth:`run` is already on its way to classifying. Without a warning,
+:meth:`run` would read the volume in that gap and record almost every completed
+cancellation as a failure. An intent marker naming the job that just settled is
+that warning, and :meth:`run` holds the door open for
+:data:`CANCELLATION_SETTLE_SECONDS` — a wait that can only ever turn a missed
+cancellation into a recorded one, because what it waits for is still the
+countersignal and nothing else.
+
+The volume is the only channel available, and that is not a convenience. The
+two verbs are two processes; ``run`` holds the workspace's flock for the job's
+whole duration, so headspace's own state is closed to ``stop`` by construction
+(see the section above). What is left is the engine, and inside the engine the
+one writable thing that outlives a job is the workspace volume. So both markers
+go there, through mechanisms both verbs already own: an exec against the anchor
+to write them — the same object and the same shell a copy-in stages through —
+and ``get_archive`` against that anchor to read them, the same call the ``read``
+verb makes and for the same reason, since by classification time the job's own
+container has been reaped and the anchor may itself have exited.
+
+Four properties this shape has to carry, none of them optional:
+
+* **Unforgeable from inside the box.** A job shares the volume and can write
+  anything it likes at either marker's path, so what makes a marker believable
+  cannot be the write — it has to be the *payload*, and the payload has to
+  contain something the job cannot obtain. It contains two things: the job id,
+  and a per-workspace secret (:data:`LABEL_CANCEL_TOKEN`) minted at
+  :meth:`create` and carried on the anchor container as an engine label. The
+  pair is compared verbatim, never parsed, so a ``job_id`` holding the
+  separator cannot shift the boundary between them.
+
+  Neither half is reachable from inside a container. The id travels as a
+  container *name* and a ``headspace.job_id`` label, and a process can read
+  neither from within its own container — a container's hostname is its engine
+  id, not its name; :meth:`run` puts it in no environment variable and no argv
+  entry, held to the same placement discipline as ``env`` and tested the same
+  way, across seven surfaces at once
+  (``test_no_surface_inside_a_job_container_carries_its_own_job_id``). The
+  token is a label on a *different container* again, and labels are engine
+  metadata no process inside any container can read.
+
+  The id alone was not enough, and the reason is worth keeping: ``--job-id`` is
+  the **caller's** to choose, so a caller who picks predictable ids *and* runs
+  code it does not trust would have handed that code the only string it was
+  missing. That was real — a live test forged a cancellation exactly that way
+  before the token existed, and the same test now asserts the refusal
+  (``test_a_countersignal_a_job_planted_for_itself_is_refused``). With the
+  token the job must guess 128 bits it can never observe, whatever the caller
+  named the job.
+
+  The boundary is job-versus-record and nothing more is claimed. Whoever can
+  reach the Docker socket can read the label; whoever can reach
+  ``~/.headspace`` can edit the record directly. The adversary this defends
+  against is the untrusted code inside the box, which is the one that cannot
+  be reasoned with.
+* **Hardened against what a job can plant, both directions.** The write renames
+  onto a marker's name rather than redirecting at it, because a redirection
+  follows a link a job planted and a rename replaces it; it refuses outright
+  when anything that is not a regular file already stands there, because
+  ``mv -f file dir`` does not fail but *relocates* — a planted directory would
+  otherwise make the write appear to succeed while the marker went inside it.
+  The read accepts only a regular file, because the archive endpoint resolves
+  link targets within the container's filesystem quite happily. Those are the
+  same refusals :data:`FINALIZE_WRITE_SCRIPT` and :meth:`_archived_file`
+  already make, for the same reasons, applied to the two paths headspace writes
+  on its own account.
+* **Consumed, always, and under both names.** :meth:`run` clears whatever it
+  found on *every* path, exit 0 included — a ``stop`` that raced a job
+  finishing on its own leaves markers no failing branch would ever reach, and
+  one nobody consumes waits in the volume for whichever later job happens to
+  fail. Clearing only the name a classification happened to read is the easy
+  way to reintroduce that wedge with a phase still standing in it, so the
+  obligation is stated over :data:`CANCELLATION_MARKER_NAMES` rather than over
+  whichever marker mattered. Nothing else ever collects them: reconciliation
+  reads the journal and reaches the engine, and neither knows these names
+  exist, so a ``run`` that crashed before it could clear leaves them for the
+  *next* run in that workspace to take away.
+* **Failing towards silence, never towards invention.** Every partial state
+  this channel can be caught in — a marker that cannot be written, one that
+  cannot be read, one a job tampered with, a ``stop`` that died owing its
+  countersignal — costs a true cancellation its name and classifies exactly as
+  the code before this channel existed. None of them can produce a
+  ``cancelled`` that did not happen. The one irreducible window is in
+  :meth:`stop`, between the signal landing and the countersignal being written,
+  and it fails in that same direction by construction rather than by luck.
+
+Both halves therefore degrade towards today's behaviour rather than towards a
+wrong answer. A marker that cannot be written does not withhold the signal —
+ending the runaway job is what the operator came for, and naming it is the
+improvement on top. A marker that cannot be read does not raise: the job
+already ran and its outcome is in hand, and turning that into "the engine
+broke, retry" over an auxiliary file would discard the work ``run`` exists to
+report.
 """
 
 from __future__ import annotations
@@ -326,6 +466,7 @@ import hashlib
 import math
 import posixpath
 import re
+import secrets
 import tarfile
 import tempfile
 import threading
@@ -347,6 +488,7 @@ from headspace.core import profiles
 from headspace.core.artifacts import ByteSource
 from headspace.core.policy import CapabilitySnapshot, EffectivePolicy
 from headspace.core.result import (
+    STATUS_CANCELLED,
     STATUS_FAILURE,
     STATUS_RESOURCE_EXHAUSTED,
     STATUS_SUCCESS,
@@ -400,6 +542,42 @@ LABEL_CREATED_AT = "headspace.created_at"
 #: kept so a job container can be built from the same environment without the
 #: caller having to hand it back, and so provenance survives the process.
 LABEL_ENVIRONMENT = "headspace.environment"
+#: The per-workspace secret that makes a cancellation marker *unforgeable*
+#: rather than merely hard to guess. Minted at :meth:`DockerProvider.create`,
+#: written onto the **anchor container only** — never the volume, never a job
+#: container, never headspace's own state — and required verbatim in both
+#: markers before ``run`` will read a cancellation out of them.
+#:
+#: A label is exactly the right home and the reason is structural. ``stop`` and
+#: ``run`` are separate processes that share no memory, so a secret held in
+#: either one's variables is a secret the other cannot check; both, however,
+#: already hold the anchor. And a label is engine metadata: it is readable by
+#: anyone who can talk to the daemon and by *no process inside any container* —
+#: not even the anchor's own, and the job runs in a different container again.
+#:
+#: What this closes is the gap that made ``job_id`` alone insufficient. That id
+#: is the caller's to choose (``--job-id``), so a caller who picks predictable
+#: ids and runs code it does not trust has handed that code the only string it
+#: was missing. With a token in the payload the job would have to guess 128
+#: bits it can never observe, whatever the caller named the job.
+#:
+#: The boundary is job-versus-record, and nothing more is claimed: whoever can
+#: reach the Docker socket can read this label, and whoever can reach
+#: ``~/.headspace`` can edit the record directly. The adversary this defends
+#: against is the untrusted code *inside* the box.
+#:
+#: The ``nosec`` is a false positive worth naming rather than skipping
+#: repo-wide: B105 matches on the *variable name* ending in ``token``, and what
+#: is hardcoded here is the label's **key**. The value it names is minted per
+#: workspace by :func:`secrets.token_hex` at :meth:`DockerProvider.create` and
+#: appears in no source file.
+LABEL_CANCEL_TOKEN = "headspace.cancel_token"  # nosec B105
+
+#: Bytes of entropy behind that token. 128 bits, from :mod:`secrets` rather
+#: than :mod:`random`, because this one is guessed against rather than merely
+#: collided with.
+CANCEL_TOKEN_BYTES = 16
+
 #: ``headspace.capability.<field>`` — the create-time capability probe, one
 #: label per :class:`~headspace.core.policy.CapabilitySnapshot` field.
 LABEL_CAPABILITY_PREFIX = "headspace.capability."
@@ -922,6 +1100,250 @@ for entry in "$staging_root"/*; do
 done
 """
 
+# --- naming a job an operator ended, across two processes (issue #16) -------
+#
+# The whole shape, the live probe that forced it and the fabrication window
+# that forced the *second* phase are in the module docstring under "Recording
+# that an operator ended it". What lives here is the vocabulary ``stop`` and
+# ``run`` have to agree on, in one place so the two halves of a cross-process
+# handshake cannot drift apart: the two names, the size bound, and the scripts
+# that put a marker there and take it away.
+
+#: The name ``stop`` writes *before* it signals, carrying the job id it is
+#: about to end. Dot-prefixed and namespaced like :data:`STAGING_DIR_NAME`, and
+#: for the same two reasons: a human reading the volume can tell headspace's
+#: own state from a job's, and the name is *reserved*, so anything standing
+#: there that headspace did not put there is a job reaching for a channel that
+#: is not its own.
+#:
+#: It records an *ask*, and an ask is not an ending — nothing is ever
+#: classified ``cancelled`` from this name alone. What it does is tell the
+#: still-blocked ``run`` that a countersignal is on its way, which is the only
+#: reason a countersignal written after the signal can be waited for rather
+#: than missed. See :data:`CANCELLATION_SETTLE_SECONDS`.
+CANCELLATION_INTENT_MARKER_NAME = ".headspace-cancel-requested"
+
+#: The name ``stop`` writes *after* the signal has landed, carrying the same
+#: job id. This is the one that classifies: it is the only evidence in the
+#: volume that the operator's ask actually took effect, because it cannot be
+#: written until it has. A ``stop`` that dies before this point leaves the
+#: intent name behind and nothing else, and the job is recorded exactly as it
+#: would have been before this channel existed.
+#:
+#: Deliberately unlike the intent name at a glance rather than one letter from
+#: it: these two strings are compared, written and cleared by two processes
+#: that never speak, and a pair a reader can confuse is a pair a maintainer can
+#: swap.
+CANCELLATION_SIGNALLED_MARKER_NAME = ".headspace-cancelled"
+
+#: Both reserved names, in the order ``run`` reads them — the evidence first,
+#: the warning second. Every obligation that applies to one applies to both:
+#: they are written by the same script, refused on the same grounds, and above
+#: all *cleared together*, because a channel that tidies one name and leaves
+#: the other has only moved the wedge.
+CANCELLATION_MARKER_NAMES = (
+    CANCELLATION_SIGNALLED_MARKER_NAME,
+    CANCELLATION_INTENT_MARKER_NAME,
+)
+
+#: Where those names resolve inside every container this provider makes.
+#: Derived rather than written twice, because a marker the writer and the
+#: reader disagree about is a marker that silently never works.
+CANCELLATION_INTENT_MARKER_PATH = f"{WORKSPACE_MOUNT_PATH}/{CANCELLATION_INTENT_MARKER_NAME}"
+CANCELLATION_SIGNALLED_MARKER_PATH = f"{WORKSPACE_MOUNT_PATH}/{CANCELLATION_SIGNALLED_MARKER_NAME}"
+
+#: How long :meth:`DockerProvider.run` holds the door open for a countersignal
+#: when an intent marker names the job that just settled — and *only* then.
+#:
+#: The two writes cannot both precede the signal without the second one lying,
+#: so the countersignal necessarily lands after the container has died. That is
+#: the moment ``run`` wakes up: it is polling the very container ``stop``
+#: blocked on, so the two processes are racing from the same starting gun, with
+#: ``stop`` still owing one exec round trip. Without a wait, a completed
+#: cancellation would be recorded as a failure whenever ``stop`` lost that race
+#: — which is most of the time, and worst exactly when the stop was forceful.
+#:
+#: Two seconds is an engine round trip's order of magnitude with room for a
+#: loaded daemon, and it is spent only on the path where an operator really did
+#: ask about this job. The ordinary job never reaches it. What the budget buys
+#: is that the *ending* of the wait is a decision rather than a hang: a ``stop``
+#: that died owing a countersignal is never coming back, and holding a finished
+#: job's result hostage to it would be a worse failure than the misreport.
+CANCELLATION_SETTLE_SECONDS = 2.0
+
+#: The most of a marker that is ever read. A job id is tens of bytes; this is
+#: three orders of magnitude of headroom and still small enough that a job
+#: which fills the volume at this path cannot make ``run`` read its way through
+#: it. Anything larger is not a marker by definition, and is treated as the
+#: residue it is rather than truncated into a comparison.
+MARKER_MAX_BYTES = 4096
+
+#: ``$0`` for the two scripts below, and deliberately not
+#: :data:`SCRIPT_ARGV0`: an operator reading ``ps`` inside a workspace should
+#: see which of headspace's channels is running, not a copy-in that is not
+#: happening. The same rule the copy-in scripts follow still applies — every
+#: value the scripts touch, the job id above all, arrives as an *argument* and
+#: is never interpolated into the text.
+MARKER_ARGV0 = "headspace-cancel"
+
+#: Write one marker: ``$1`` its path, ``$2`` a nonce path beside it, ``$3``
+#: the job id being signalled. Both phases use this same script, because both
+#: write the same shape of thing at an equally reserved name, and one script is
+#: one place for the refusals below to be right.
+#:
+#: Two moves, and the second is what makes the first safe. The bytes land on
+#: the nonce path and are *renamed* onto the marker's name — never redirected
+#: at it. A shell redirection follows a symlink, so ``> "$marker"`` through a
+#: link a job planted would write headspace's own bytes wherever that job
+#: pointed, outside the volume and over a file the job could not otherwise
+#: touch. ``mv`` renames over the link itself, so the same planted link buys
+#: nothing. This is the identical reasoning :data:`FINALIZE_WRITE_SCRIPT`
+#: applies to a copy-in's destination, restated for the paths headspace writes
+#: on its own account.
+#:
+#: The explicit ``-L`` refusals in front of both paths are the checkpoint that
+#: says so out loud rather than leaving the safety implicit in ``mv``'s
+#: semantics. Nothing legitimate puts a link at either name — the markers' are
+#: reserved and the nonce's is unguessable — so one standing there is refused
+#: (exit 21) rather than quietly tidied away, and the refusal reaches the
+#: provider as a write that did not happen.
+#:
+#: A directory needs a refusal of its own (exit 22), and it is the one case
+#: where ``mv``'s safety genuinely runs out. ``mv -f file dir`` does not fail:
+#: it *relocates*, moving the file to ``dir/file`` and exiting 0 — verified on
+#: a POSIX host, coreutils and busybox alike. So a job that plants a directory
+#: at a reserved name would make headspace's write appear to succeed while what
+#: actually stands at that name is a directory holding a nonce nobody will ever
+#: read, and the job would have quietly suppressed the naming of its own
+#: cancellation. The check refuses anything that exists and is not a regular
+#: file, which takes a FIFO and a device node with it for the price of the
+#: directory: nothing legitimate is ever any of those at these two names, and
+#: only a regular file can be renamed over without surprises.
+#:
+#: Narrowed, not closed, and in exactly the way :data:`FINALIZE_WRITE_SCRIPT`
+#: already admits about its own destination: a job could land a link in the gap
+#: between the check and the rename, and POSIX offers no "rename only if this
+#: is not a symlink". What stays guaranteed is the part that matters — the
+#: rename never follows a link — so a lost race costs a marker, never a byte
+#: written outside the volume.
+#:
+#: The trap is an ``EXIT`` trap rather than a trailing line so that every
+#: refusal above leaves the volume as tidy as a success does: a workspace is
+#: the caller's, and headspace littering it with a nonce nobody can name is a
+#: cost the caller never agreed to.
+WRITE_CANCELLATION_SCRIPT = """
+set -eu
+marker=$1
+staged=$2
+job=$3
+trap 'rm -f "$staged" 2>/dev/null || true' EXIT
+[ ! -L "$marker" ] || { echo "headspace-cancel: $marker"; exit 21; }
+[ ! -e "$marker" ] || [ -f "$marker" ] || { echo "headspace-cancel: $marker"; exit 22; }
+[ ! -e "$staged" ] && [ ! -L "$staged" ] || { echo "headspace-cancel: $staged"; exit 21; }
+printf '%s' "$job" > "$staged"
+mv -f "$staged" "$marker"
+"""
+
+#: Take one marker away again: ``$1`` its path.
+#:
+#: ``-r`` because what stands there is not always the file headspace wrote. A
+#: job that planted a directory or a link at a reserved name would otherwise
+#: wedge the channel permanently — every later ``stop`` would meet its own
+#: write refusal, and every later ``run`` would meet a marker it must not read.
+#: Clearing whatever is there is what lets the channel recover from an attack
+#: on it, and ``rm`` never recurses *through* a link, so removing one takes the
+#: link and never its target. This is the other half of the refusals above: the
+#: write says no to a planted object, and this says the job that planted it has
+#: cost its own cancellation a name and nothing more.
+CLEAR_CANCELLATION_SCRIPT = """
+set -eu
+rm -rf "$1"
+"""
+
+#: Every name at the workspace root that belongs to headspace rather than to a
+#: caller, and which :meth:`DockerProvider.write` therefore refuses as a
+#: copy-in destination.
+#:
+#: "Reserved" was, until this tuple existed, a word three docstrings used and
+#: nothing enforced. A ``put`` naming :data:`CANCELLATION_SIGNALLED_MARKER_NAME`
+#: as its destination landed a regular file at the countersignal's path and
+#: reported success — verified live, not reasoned about — which let a caller
+#: pre-plant the record of an ending that never happened for a job it had not
+#: started yet. That is the one thing this channel exists to make impossible,
+#: reached without running any code at all, so the reservation is a check now
+#: and not a convention.
+#:
+#: Matched on the *first segment* of a normalised destination, so a copy-in can
+#: no more write ``.headspace-staging/x`` than ``.headspace-staging`` itself:
+#: everything under a reserved name is equally headspace's, and the marker
+#: names are files, so a path descending through one is nonsense in any case.
+#: This is a refusal about *names*, deliberately — the volume is shared, and a
+#: job with a shell can still write anything it likes at these paths. What it
+#: closes is the route that needs no job.
+RESERVED_ROOT_NAMES = (STAGING_DIR_NAME,) + CANCELLATION_MARKER_NAMES
+
+#: What separates the two fields of a marker's payload. Never parsed on — the
+#: whole string is compared verbatim — so a ``job_id`` containing this
+#: character cannot shift the boundary between the secret and the name.
+MARKER_FIELD_SEPARATOR = ":"
+
+
+def cancellation_evidence(anchor: Container, job_id: str) -> str | None:
+    """The exact bytes a marker must hold to name *this* job, or ``None``.
+
+    One function so the writer and the reader cannot drift: ``stop`` puts this
+    string in the volume and ``run`` compares against it, and a handshake whose
+    two halves each build their own payload is a handshake one refactor away
+    from silently never matching.
+
+    Compared **verbatim**, never split. Parsing on
+    :data:`MARKER_FIELD_SEPARATOR` would let a ``job_id`` containing that
+    character move the boundary between the secret and the name, which is the
+    classic way a two-field credential becomes a one-field one.
+
+    ``None`` means *no cancellation can be read here at all*, and it is
+    returned for a workspace whose anchor carries no
+    :data:`LABEL_CANCEL_TOKEN` — one created before this channel required a
+    token. That is deliberately not a fallback to comparing bare job ids: the
+    fallback is the hole. Such a workspace classifies a stopped job exactly as
+    the code before any of this existed, which is the same direction every
+    other partial state of this channel fails in.
+    """
+    token = anchor.labels.get(LABEL_CANCEL_TOKEN)
+    if not token or not job_id:
+        return None
+    return f"{token}{MARKER_FIELD_SEPARATOR}{job_id}"
+
+
+@dataclass(frozen=True)
+class _Marker:
+    """What stood at a marker's path in the volume, and what it said.
+
+    Two fields, because one probe answers two different questions and
+    collapsing them would lose the second. ``present`` is "the volume holds
+    *something* under this name", and it is what drives the clearing step: a
+    directory or a link a job planted says nothing and still has to go, or it
+    wedges the channel for every ``stop`` and ``run`` that follows. ``value``
+    is "and it was a regular file, small enough to be a marker, saying
+    this" — the only shape that is allowed to name a job.
+
+    Kept as a type rather than a tuple because both phases are read by the same
+    helper and reasoned about in the same words: the intent name and the
+    countersignal differ in what they are allowed to *conclude*, never in how
+    they are read, written or taken away.
+    """
+
+    present: bool
+    value: str | None = None
+
+
+#: The answer for a name the volume holds nothing under — which is the answer
+#: for very nearly every job that ever runs, since almost none is stopped by an
+#: operator. Named so the ordinary case reads as a fact rather than as a
+#: default constructed three times.
+_NO_MARKER = _Marker(present=False)
+
+
 _HEX_DIGITS = frozenset("0123456789abcdef")
 _DIGEST_LENGTH = 64
 
@@ -1186,6 +1608,29 @@ def _destination_is_a_directory(workspace_id: str, relative: str) -> CliError:
         remediation=(
             "name the file itself; a copy-in commits with a rename, which cannot replace a "
             "directory with a file — not even with overwrite"
+        ),
+    )
+
+
+def _destination_is_reserved(workspace_id: str, relative: str, reserved: str) -> CliError:
+    # Named twice only when the destination reaches *through* a reserved name;
+    # a caller who typed the reserved name itself does not need it read back.
+    reached = (
+        f"'{relative}' would write into '{reserved}'"
+        if relative != reserved
+        else f"'{relative}' is"
+    )
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f"{reached} at the root of workspace {workspace_id}, "
+            "a name headspace reserves for its own state"
+        ),
+        remediation=(
+            "choose a destination outside the reserved names "
+            f"({', '.join(RESERVED_ROOT_NAMES)}) — they carry headspace's own staging and "
+            "the record of who ended a job, and a copy-in that could land there could "
+            "write that record"
         ),
     )
 
@@ -1707,7 +2152,12 @@ class DockerProvider:
                     image=environment,
                     command=list(IDLE_COMMAND),
                     name=self._container_name(workspace_id),
-                    labels=labels,
+                    # The cancellation token goes on the anchor and on nothing
+                    # else — not the volume above, not the job containers
+                    # `run` builds, which assemble their labels from scratch.
+                    # One object holds it, and it is the one object both `stop`
+                    # and `run` already fetch.
+                    labels={**labels, LABEL_CANCEL_TOKEN: secrets.token_hex(CANCEL_TOKEN_BYTES)},
                     **self._sealed_kwargs(policy, network_enabled, workspace_id),
                 )
             except Exception:
@@ -1773,6 +2223,31 @@ class DockerProvider:
         :attr:`~headspace.providers.base.WorkspaceDescriptor.network_enabled`
         defaults closed rather than trusting every caller to ask for isolation
         explicitly.
+
+        ``job_id`` (issue #16) is held to the *opposite* placement rule, and by
+        the same code. It reaches the engine in exactly two places, both built
+        below: the container's ``name``, and the :data:`LABEL_JOB_ID` label.
+        Both are readable from outside the container and from nowhere within
+        it — a container's own hostname is its engine id, not its name, and a
+        label is not visible to the process at all. That is load-bearing rather
+        than incidental, because the cancellation markers this method reads
+        back are trustworthy only while a job cannot name itself: a job shares
+        the workspace volume and can write whatever it likes at either marker's
+        path, and the one string it cannot put there is the id that would make
+        a marker be believed. So ``job_id`` reaches no ``environment`` entry
+        and no ``argv`` entry — the two channels a process really can read from
+        inside its own container — and neither is built from it or with any
+        knowledge that it exists.
+
+        Both markers are read once the job has settled, on every path including
+        exit 0, and both are cleared if anything was found. Only the
+        countersignal can make this outcome ``cancelled``; an intent marker
+        naming this job buys the other process a bounded moment to finish
+        writing one, and nothing else. Why the channel exists, why it is a
+        written signal rather than an inference from exit 137, why it takes two
+        phases, and why every partial state of it fails towards today's
+        classification rather than towards a fabricated cancellation, is in the
+        module docstring under "Recording that an operator ended it".
         """
         workspace_id = require_workspace_id(workspace_id)
         argv = require_command(command)
@@ -1841,6 +2316,12 @@ class DockerProvider:
                     oom_killed = False
                     output, produced, truncated = refused.bounded(output_budget)
                 storage_bytes = self._volume_bytes(client, workspace_id)
+                # Asked on every path, exit 0 included, and under both reserved
+                # names. A `stop` that raced this job finishing on its own
+                # leaves markers no failing branch would ever reach, and one
+                # nobody consumes is one that waits in the volume for whichever
+                # later job happens to fail.
+                cancelled = self._ended_by_an_operator(anchor, job_id)
             finally:
                 # A job container that outlives its job is a stray, and the
                 # removal is best-effort on purpose: a successful job must not
@@ -1849,11 +2330,18 @@ class DockerProvider:
                 with contextlib.suppress(DockerException, OSError):
                     container.remove(force=True)
 
+        status = self._status(cancelled, timed_out, oom_killed, exit_status)
         return JobOutcome(
             job_id=job_id,
             workspace_id=workspace_id,
-            status=self._status(timed_out, oom_killed, exit_status),
-            exit_status=None if timed_out else exit_status,
+            status=status,
+            # Derived from the status rather than from the conditions that
+            # produced it, so the one rule stays in one place. The seam refuses
+            # an exit status on either of these two (see ``JobOutcome``'s own
+            # ``_NO_EXIT_STATUSES``) and it is right to: a job somebody else
+            # ended never produced an answer of its own, and the 137 sitting in
+            # ``State.ExitCode`` is the signal's number, not the command's.
+            exit_status=None if status in (STATUS_CANCELLED, STATUS_TIMEOUT) else exit_status,
             output=output,
             truncated=truncated,
             # Only this branch watched the exec fail, so only it may assert the
@@ -1997,7 +2485,8 @@ class DockerProvider:
         Everything refusable without a socket is refused before one is opened —
         the workspace id, the path (bounded by
         :func:`~headspace.providers.base.require_workspace_path`, since the
-        engine would resolve ``..`` quite happily), and the digest's shape.
+        engine would resolve ``..`` quite happily), the destination's *name*
+        against :data:`RESERVED_ROOT_NAMES`, and the digest's shape.
         Then, in order: the anchor is required to be *running*, because a
         stopped one cannot run the verification even though ``put_archive``
         against it would succeed; the staging directory is created and the
@@ -2018,6 +2507,13 @@ class DockerProvider:
         """
         workspace_id = require_workspace_id(workspace_id)
         relative = require_workspace_path(path)
+        # Before the socket, and on the *name* rather than on what happens to
+        # stand there: a reservation that only held when the name was occupied
+        # would be no reservation at all for the countersignal, whose whole
+        # point is that it is usually absent.
+        reserved = relative.split("/", 1)[0]
+        if reserved in RESERVED_ROOT_NAMES:
+            raise _destination_is_reserved(workspace_id, relative, reserved)
         landing = _Landing.of(workspace_id, relative, expected_sha256, overwrite)
         action = f"writing '{relative}' into workspace {workspace_id}"
 
@@ -2264,6 +2760,210 @@ class DockerProvider:
                 [WRITE_SHELL, "-c", DISCARD_STAGING_SCRIPT, SCRIPT_ARGV0, landing.staging]
             )
 
+    # --- the markers one process leaves for the other (issue #16) -----------
+
+    @staticmethod
+    def _read_marker(anchor: Container, name: str) -> _Marker:
+        """What the volume holds under one marker name, read with the job gone.
+
+        ``get_archive`` against the *anchor*, exactly as :meth:`read` does and
+        for the same reason restated for a different case: the engine resolves
+        the path through the container's mounts rather than through a running
+        process. By the time :meth:`run` classifies, the job's own container
+        has already been reaped in its ``finally``, and the anchor may itself
+        have exited — so an answer that needed a live runtime would be no
+        answer at all, in precisely the situation the answer matters.
+
+        Only a regular file no larger than :data:`MARKER_MAX_BYTES` yields a
+        value. The symlink refusal is the read-side twin of the write's, and it
+        is the boundary :meth:`read` already draws for an artifact: the archive
+        endpoint resolves a link target within the container's filesystem quite
+        happily, so honouring one would let a job nominate any file on that
+        filesystem as the thing naming it. A directory says nothing at all, and
+        a file too large to be a job id is a job filling the volume rather than
+        a marker. All three are reported ``present`` without a value, because
+        the caller still has to take them away.
+
+        Every engine failure here reads as "nothing there", and the direction
+        of that safety is the whole of it. This probe is *auxiliary* to an
+        outcome the engine has already produced: the job ran, its exit status
+        is in hand, and its output has been captured. Letting an unreadable
+        marker raise would turn a real computation into exit 7 — telling an
+        agent to retry work that already finished — over a file that, on the
+        overwhelmingly common path, was never supposed to exist. Falling back
+        to "no marker" costs exactly the classification the caller would have
+        received before this channel existed.
+        """
+        try:
+            stream, _stat = anchor.get_archive(
+                f"{WORKSPACE_MOUNT_PATH}/{name}", chunk_size=MARKER_MAX_BYTES
+            )
+        except _ENGINE_FAILURES:
+            # A 404 is the *ordinary* answer, not an error: almost no job is
+            # ever stopped by an operator, so almost every probe finds nothing
+            # under this name. Everything else that can fail here is the engine
+            # failing, and it lands in the same place deliberately — see above
+            # for why an auxiliary probe must never cost a caller their result.
+            return _NO_MARKER
+
+        with contextlib.ExitStack() as release:
+            release.callback(_quietly, stream.close)
+            try:
+                archive = tarfile.open(mode=ARCHIVE_STREAM_MODE, fileobj=_ChunkReader(stream))
+                release.callback(_quietly, archive.close)
+                entry = archive.next()
+                if entry is None or not entry.isfile() or entry.size > MARKER_MAX_BYTES:
+                    return _Marker(present=True)
+                member = archive.extractfile(entry)
+                if member is None:
+                    return _Marker(present=True)
+                text = member.read(MARKER_MAX_BYTES).decode("utf-8", "ignore")
+            except _ENGINE_FAILURES:
+                return _Marker(present=True)
+        return _Marker(present=True, value=text.strip())
+
+    @staticmethod
+    def _write_marker(anchor: Container, name: str, value: str) -> bool:
+        """Put one marker in the volume; say whether it is actually there.
+
+        The nonce is minted here rather than in the script because the shell
+        has no unguessable source of one — and unguessable is the property that
+        matters: the staging path is the only moment the bytes exist under a
+        name a job could reach for, and a job that cannot name it cannot race
+        it. The same nonce discipline :meth:`write` uses for a copy-in's
+        staging directory, for the same reason.
+
+        Returns rather than raises, because the caller is :meth:`stop`, and
+        ending a runaway job is the operator's actual need while naming it is
+        the improvement on top. An engine that refuses the exec — a stopped
+        anchor, an image with no shell — must not be allowed to withhold the
+        signal, so the failure is a ``False`` the caller can proceed past.
+        """
+        marker = f"{WORKSPACE_MOUNT_PATH}/{name}"
+        staged = f"{marker}.{uuid.uuid4().hex}"
+        try:
+            result = anchor.exec_run(
+                [WRITE_SHELL, "-c", WRITE_CANCELLATION_SCRIPT, MARKER_ARGV0, marker, staged, value]
+            )
+        except _ENGINE_FAILURES:
+            return False
+        return int(result.exit_code or 0) == 0
+
+    @staticmethod
+    def _clear_marker(anchor: Container, name: str) -> None:
+        """Take one marker away, never letting the tidy-up become the story.
+
+        Best-effort for the same reason :meth:`run`'s job-container removal and
+        :meth:`_discard_staging` are: this runs after an outcome has already
+        been decided, and a second exception here would replace a job's real
+        result with a complaint about a cleanup. What is lost when it fails is
+        a marker the *next* run will meet, read, find naming a job that is not
+        its own, and clear again.
+        """
+        with contextlib.suppress(*_ENGINE_FAILURES):
+            anchor.exec_run(
+                [
+                    WRITE_SHELL,
+                    "-c",
+                    CLEAR_CANCELLATION_SCRIPT,
+                    MARKER_ARGV0,
+                    f"{WORKSPACE_MOUNT_PATH}/{name}",
+                ]
+            )
+
+    def _ended_by_an_operator(self, anchor: Container, job_id: str) -> bool:
+        """Did a ``stop`` in another process actually *end* this job?
+
+        Two probes, one answer and one obligation, and the obligation is not
+        conditional on the answer.
+
+        The answer is yes only when the **countersignal** names the job that
+        just ran. That is the whole of the two-phase shape: the intent marker
+        says an operator asked, and an ask is not an ending — a ``stop`` that
+        wrote its intent and then died left one behind for a job that may well
+        go on to fail entirely on its own account, and reading that as
+        ``cancelled`` would put a human's decision in the record of a failure
+        nobody caused. The countersignal cannot be written before the signal has
+        landed, so it is the only thing in the volume that says the ending
+        happened. A marker of either kind naming some *other* job is residue
+        from a ``stop`` that raced a job finishing on its own, and letting it
+        convict the next failure would be a worse bug than the one this channel
+        fixes.
+
+        The intent marker earns its place by buying the countersignal a reader.
+        Written after the signal, the countersignal necessarily lands after the
+        container died — the same instant this process wakes up — so ``run``
+        would usually read the volume just before ``stop`` finished writing to
+        it. An intent marker naming *this* job is the one warning that a
+        countersignal is coming, and :meth:`_await_countersignal` spends a
+        bounded moment on it. It can only ever turn a missed cancellation into
+        a recorded one: what the wait waits for is still the countersignal, so
+        no amount of intent invents an ending.
+
+        The obligation is that *both* names are cleared, whoever they named and
+        whatever shape they were in. Clearing only the name this classification
+        happened to read is the easiest way to reintroduce the wedge a
+        two-phase channel adds: a ``stop`` that races a job finishing naturally
+        leaves both, no failing branch would ever consume them, and whichever
+        one survives waits in the volume for a later job.
+
+        Clearing only what was found is what keeps an ordinary job cheap: the
+        overwhelmingly common answer is "nothing there", and that answer costs
+        two archive probes and no exec at all — so :meth:`run` never acquires a
+        requirement for an anchor that can execute a shell, which it has never
+        had and must not grow silently.
+        """
+        # What a marker has to say to be about this job at all. `None` when
+        # this workspace's anchor carries no token — see
+        # :func:`cancellation_evidence` for why that is a refusal to classify
+        # rather than a fallback to comparing bare job ids.
+        evidence = cancellation_evidence(anchor, job_id)
+        signalled = self._read_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME)
+        intent = self._read_marker(anchor, CANCELLATION_INTENT_MARKER_NAME)
+        if evidence is not None and intent.value == evidence and signalled.value != evidence:
+            signalled = self._await_countersignal(anchor, evidence, signalled)
+        # Walked over the names rather than over the two locals, so the
+        # clearing obligation is spelled by :data:`CANCELLATION_MARKER_NAMES`
+        # itself: a phase added to that tuple and forgotten here raises rather
+        # than quietly leaving its marker in the volume forever.
+        found = {
+            CANCELLATION_SIGNALLED_MARKER_NAME: signalled,
+            CANCELLATION_INTENT_MARKER_NAME: intent,
+        }
+        for name in CANCELLATION_MARKER_NAMES:
+            if found[name].present:
+                self._clear_marker(anchor, name)
+        return evidence is not None and signalled.value == evidence
+
+    def _await_countersignal(self, anchor: Container, evidence: str, found: _Marker) -> _Marker:
+        """Give the other process its bounded moment to finish saying so.
+
+        Entered only when an intent marker names the job that just settled, so
+        the cost is confined to workspaces where an operator really did ask
+        about this job — never to the ordinary run, which reaches this method
+        not at all. What comes back is the *last* thing read, not merely the
+        one that matched: a stale countersignal naming another job is still
+        residue the caller has to clear, and losing its ``present`` on the way
+        out would leave it in the volume.
+
+        Polled at :data:`POLL_INTERVAL_SECONDS`, the same interval
+        :meth:`_await_exit` has already been spending on this job for its whole
+        duration — so the probes here are a rounding error against the polling
+        that got us here, and the budget rather than the interval is what
+        deserves the thought (see :data:`CANCELLATION_SETTLE_SECONDS`).
+
+        The deadline is monotonic and the loop cannot outlive it, because the
+        alternative — waiting until the marker appears — would hang a finished
+        job's result on a process that may already be gone.
+        """
+        deadline = time.monotonic() + CANCELLATION_SETTLE_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(POLL_INTERVAL_SECONDS)
+            found = self._read_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME)
+            if found.value == evidence:
+                return found
+        return found
+
     # --- stopping a job -----------------------------------------------------
 
     def stop(self, workspace_id: str) -> StopOutcome:
@@ -2312,6 +3012,55 @@ class DockerProvider:
         :meth:`_await_exit` already gives a job that outran its wall-clock
         budget instead of jumping straight to a kill.
 
+        Two markers, in two phases, and the order is the evidence (issue #16).
+        Before it signals, this method writes
+        :data:`CANCELLATION_INTENT_MARKER_NAME` into the workspace volume
+        naming the job it is about to end; once the signalling above has run
+        its course it writes :data:`CANCELLATION_SIGNALLED_MARKER_NAME` with
+        the same id. :meth:`run`, in the other process, reads a cancellation
+        off the second one alone. Both go through the anchor container, because
+        the anchor outlives every job the workspace runs and the job's own
+        container is gone by the time the second write happens. Neither write
+        touches ``~/.headspace``, takes a lock or constructs a store — the
+        boundary above is exactly as it was before this method wrote anything
+        anywhere, and a test proves it against both writes rather than trusting
+        this paragraph.
+
+        Neither write may withhold the signal. An engine that refuses the exec
+        — a stopped anchor, an image with no shell, a job that planted
+        something at a reserved name — makes :meth:`_write_marker` answer
+        ``False``, and this method carries on. Ending the runaway job is what
+        the operator came for; naming it correctly afterwards is the
+        improvement on top, and an improvement that could cancel the thing it
+        improves would be a bad trade.
+
+        **The residual window, and which way it fails.** Between the signal
+        landing and the countersignal being written, this process holds
+        knowledge that exists nowhere else. A ``stop`` killed in that gap — the
+        operator's own ``SIGINT``, a lost connection, the machine going away —
+        ends the job and never records that it did. The job's ``run`` then
+        finds an intent marker naming it, waits
+        :data:`CANCELLATION_SETTLE_SECONDS` for a countersignal that is not
+        coming, and writes the outcome down as ``failure``: a genuine
+        cancellation misreported as the thing every such job was reported as
+        before this channel existed.
+
+        That direction is chosen, not merely tolerated. The window cannot be
+        closed from here — no sequence of two writes and one signal makes the
+        second write survive the process that owes it — so the only question is
+        which way it fails when it does. Recording the countersignal *first*
+        would close it in the other direction, and that failure is
+        unaffordable: a ``stop`` that died before its signal landed would leave
+        behind a completed-looking record of an ending that never happened, and
+        a job that subsequently failed on its own account would be written down
+        as one a human deliberately stopped. A missing cancellation is a record
+        that says less than the truth; a fabricated one says something else
+        entirely, and an agent or an operator reading it stops looking for the
+        real defect. So this channel is built to lose evidence rather than to
+        invent it, and every partial state it can be caught in — intent alone,
+        neither marker, a marker a job tampered with — classifies exactly as
+        the code before it did.
+
         Reports honestly rather than raising for the ordinary race: a
         workspace with no live job container — because nothing was ever
         started, because the last job already finished, or because it
@@ -2334,13 +3083,34 @@ class DockerProvider:
         """
         workspace_id = require_workspace_id(workspace_id)
         with self._engine(f"stopping the job running in workspace {workspace_id}") as client:
-            self._require(client, workspace_id)
+            anchor = self._require(client, workspace_id)
 
             job = self._find(client, workspace_id, ROLE_JOB)
             if job is None or not self._container_is_live(job):
                 return StopOutcome(workspace_id=workspace_id, job_id=None, stopped=False)
 
             job_id = job.labels.get(LABEL_JOB_ID)
+            # Phase one: the ask, and it goes in *before* the signal. The
+            # still-blocked `run` classifies the instant its container settles,
+            # so a marker written afterwards races that poll and loses exactly
+            # when the stop was forceful — this one has to be in the volume
+            # before anything can happen to the job, because it is what tells
+            # `run` to wait for phase two. It says an operator asked and nothing
+            # more; on its own it never makes a job `cancelled`.
+            #
+            # Written into the workspace *volume*, through the engine, and
+            # nowhere near `~/.headspace`: the boundary above is unchanged, and
+            # a failure to write it is a `False` this call proceeds past,
+            # because ending the job is the need and naming it is the
+            # improvement.
+            #
+            # The payload is the workspace's secret plus the job id, not the id
+            # alone: the id is the caller's to choose, so a caller who picks a
+            # predictable one and runs untrusted code would otherwise have
+            # handed that code everything it needed to write this file itself.
+            evidence = cancellation_evidence(anchor, job_id or "")
+            if evidence is not None:
+                self._write_marker(anchor, CANCELLATION_INTENT_MARKER_NAME, evidence)
             job.stop(timeout=STOP_GRACE_SECONDS)
             # The container can disappear between the signal and the follow-up:
             # `run` removes its own job container the moment the job settles, so
@@ -2354,6 +3124,16 @@ class DockerProvider:
                 job.reload()
                 if self._container_is_live(job):
                     job.kill()
+            # Phase two: the countersignal, and it can only go in here. It is
+            # the claim that the ask took effect, so it must not be written
+            # until the signalling above has run its course — writing it up
+            # front is precisely the fabrication the second phase exists to
+            # prevent. This is the only marker `run` will classify from, and
+            # the anchor is what makes it writable at all: the job's own
+            # container is dead by now, and the anchor outlives every job the
+            # workspace runs.
+            if evidence is not None:
+                self._write_marker(anchor, CANCELLATION_SIGNALLED_MARKER_NAME, evidence)
 
         return StopOutcome(workspace_id=workspace_id, job_id=job_id, stopped=True)
 
@@ -2744,20 +3524,49 @@ class DockerProvider:
         return kept.decode("utf-8", "ignore"), produced, True
 
     @staticmethod
-    def _status(timed_out: bool, oom_killed: bool, exit_status: int) -> str:
+    def _status(cancelled: bool, timed_out: bool, oom_killed: bool, exit_status: int) -> str:
         """Name what actually stopped the job — never inferred from ``exit_status``.
 
-        ``timed_out`` is checked first on purpose: headspace's own wall-clock
-        enforcer also stops a container with ``kill()``, which yields the same
-        137 a kernel OOM kill does. When headspace deliberately stopped the
-        job, that outranks the kernel's own budget, so ``timeout`` wins even on
-        a container the engine also marks ``OOMKilled``.
+        Three ways a job can be ended by something other than itself, and the
+        order between them is **cancelled > timeout > resource_exhausted**. It
+        is one idea applied three times: the more deliberate the act that ended
+        the job, the more it outranks the ones beneath it, because that is the
+        fact a caller has to act on.
+
+        * ``cancelled`` is a human deciding this work should stop. Nothing
+          outranks that — an agent told ``resource_exhausted`` raises a memory
+          ceiling and re-runs a job an operator just ended on purpose, and one
+          told ``timeout`` widens a budget to the same effect.
+        * ``timed_out`` is headspace's own wall-clock enforcer, which also
+          stops a container with ``kill()`` and yields the same 137 a kernel
+          OOM kill does. Deliberate, but by a policy rather than a person, so
+          it outranks the kernel and yields to the operator.
+        * ``oom_killed`` is the kernel's own mark, and the least deliberate of
+          the three: nobody decided this job in particular should end.
+
+        Each one is pinned by a test with the conditions below it true at the
+        same time, rather than left to branch order.
+
+        ``cancelled`` additionally requires a non-zero exit, and that is not a
+        detail of how the markers are read. ``stop`` sends ``SIGTERM`` before
+        it forces anything, so a job with a handler can finish its work and
+        exit 0 inside its grace window — and a job that reported success really
+        did succeed, whatever anyone asked of it. The channel records that an
+        operator asked and that the ask landed, never that the job was cut
+        short.
 
         ``oom_killed`` comes from ``State.OOMKilled`` alone. Exit status 137 is
         not evidence of anything by itself — a program can call
         ``sys.exit(137)`` on its own account, and reading that as a memory-ceiling
         breach would misreport an honest computational failure as a budget one.
+        The same ambiguity is exactly why ``cancelled`` is keyed off a marker
+        another process wrote *after* it had signalled, rather than off the
+        number: a stopped job and a ``python -c "raise SystemExit(137)"`` leave
+        the engine in identical states, and only a positive signal that could
+        not have been written before the fact can separate them.
         """
+        if cancelled and exit_status != 0:
+            return STATUS_CANCELLED
         if timed_out:
             return STATUS_TIMEOUT
         if oom_killed:
