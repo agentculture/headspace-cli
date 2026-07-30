@@ -386,14 +386,29 @@ container has been reaped and the anchor may itself have exited.
 
 Four properties this shape has to carry, none of them optional:
 
-* **Unforgeable.** A job shares the volume and can write anything it likes at
-  either marker's path. The one string it cannot write is its own job id,
-  because nothing inside the box ever tells it one: the id travels as a
-  container *name* and a ``headspace.job_id`` label, and a process can read
-  neither from inside its own container — a container's hostname is its engine
-  id, not its name. :meth:`run` puts it in no environment variable and no argv
-  entry, which is the same placement discipline ``env`` is held to and is
-  tested the same way.
+* **Unforgeable by a job that was not told its own id — which is a narrower
+  claim than "unforgeable", and the difference is where the whole guarantee
+  lives.** A job shares the volume and can write anything it likes at either
+  marker's path; a countersignal it plants naming itself *is* believed, and a
+  live test records exactly that
+  (``test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation``)
+  rather than leaving it as something a reader has to infer. What stops it is
+  not the write — it is that nothing inside the box ever tells a job the one
+  string that would make the write work. The id travels as a container *name*
+  and a ``headspace.job_id`` label, and a process can read neither from inside
+  its own container: a container's hostname is its engine id, not its name.
+  :meth:`run` puts it in no environment variable and no argv entry, which is
+  the same placement discipline ``env`` is held to and is tested the same way,
+  across seven surfaces at once
+  (``test_a_job_never_learns_its_own_job_id_from_any_surface_it_can_read``).
+
+  So the property is conditional, and the condition is the id's *entropy*, not
+  its secrecy in the abstract. A headspace-minted id is
+  ``job-`` + 12 hex characters of :func:`uuid.uuid4` — 48 bits, unguessable
+  from inside. A caller-supplied ``--job-id`` is whatever the caller chose, and
+  a caller who both picks predictable ids *and* runs code it does not trust has
+  handed that code the string. Tracked as issue #20; it is a property of the
+  id, not of this channel, and no amount of marker hardening reaches it.
 * **Hardened against what a job can plant, both directions.** The write renames
   onto a marker's name rather than redirecting at it, because a redirection
   follows a link a job planted and a rename replaces it; it refuses outright
@@ -1198,6 +1213,28 @@ set -eu
 rm -rf "$1"
 """
 
+#: Every name at the workspace root that belongs to headspace rather than to a
+#: caller, and which :meth:`DockerProvider.write` therefore refuses as a
+#: copy-in destination.
+#:
+#: "Reserved" was, until this tuple existed, a word three docstrings used and
+#: nothing enforced. A ``put`` naming :data:`CANCELLATION_SIGNALLED_MARKER_NAME`
+#: as its destination landed a regular file at the countersignal's path and
+#: reported success — verified live, not reasoned about — which let a caller
+#: pre-plant the record of an ending that never happened for a job it had not
+#: started yet. That is the one thing this channel exists to make impossible,
+#: reached without running any code at all, so the reservation is a check now
+#: and not a convention.
+#:
+#: Matched on the *first segment* of a normalised destination, so a copy-in can
+#: no more write ``.headspace-staging/x`` than ``.headspace-staging`` itself:
+#: everything under a reserved name is equally headspace's, and the marker
+#: names are files, so a path descending through one is nonsense in any case.
+#: This is a refusal about *names*, deliberately — the volume is shared, and a
+#: job with a shell can still write anything it likes at these paths. What it
+#: closes is the route that needs no job.
+RESERVED_ROOT_NAMES = (STAGING_DIR_NAME,) + CANCELLATION_MARKER_NAMES
+
 
 @dataclass(frozen=True)
 class _Marker:
@@ -1492,6 +1529,29 @@ def _destination_is_a_directory(workspace_id: str, relative: str) -> CliError:
         remediation=(
             "name the file itself; a copy-in commits with a rename, which cannot replace a "
             "directory with a file — not even with overwrite"
+        ),
+    )
+
+
+def _destination_is_reserved(workspace_id: str, relative: str, reserved: str) -> CliError:
+    # Named twice only when the destination reaches *through* a reserved name;
+    # a caller who typed the reserved name itself does not need it read back.
+    reached = (
+        f"'{relative}' would write into '{reserved}'"
+        if relative != reserved
+        else f"'{relative}' is"
+    )
+    return CliError(
+        code=EXIT_USER_ERROR,
+        message=(
+            f"{reached} at the root of workspace {workspace_id}, "
+            "a name headspace reserves for its own state"
+        ),
+        remediation=(
+            "choose a destination outside the reserved names "
+            f"({', '.join(RESERVED_ROOT_NAMES)}) — they carry headspace's own staging and "
+            "the record of who ended a job, and a copy-in that could land there could "
+            "write that record"
         ),
     )
 
@@ -2341,7 +2401,8 @@ class DockerProvider:
         Everything refusable without a socket is refused before one is opened —
         the workspace id, the path (bounded by
         :func:`~headspace.providers.base.require_workspace_path`, since the
-        engine would resolve ``..`` quite happily), and the digest's shape.
+        engine would resolve ``..`` quite happily), the destination's *name*
+        against :data:`RESERVED_ROOT_NAMES`, and the digest's shape.
         Then, in order: the anchor is required to be *running*, because a
         stopped one cannot run the verification even though ``put_archive``
         against it would succeed; the staging directory is created and the
@@ -2362,6 +2423,13 @@ class DockerProvider:
         """
         workspace_id = require_workspace_id(workspace_id)
         relative = require_workspace_path(path)
+        # Before the socket, and on the *name* rather than on what happens to
+        # stand there: a reservation that only held when the name was occupied
+        # would be no reservation at all for the countersignal, whose whole
+        # point is that it is usually absent.
+        reserved = relative.split("/", 1)[0]
+        if reserved in RESERVED_ROOT_NAMES:
+            raise _destination_is_reserved(workspace_id, relative, reserved)
         landing = _Landing.of(workspace_id, relative, expected_sha256, overwrite)
         action = f"writing '{relative}' into workspace {workspace_id}"
 

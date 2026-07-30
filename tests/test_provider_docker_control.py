@@ -104,6 +104,7 @@ from headspace.providers.docker import (
     LABEL_ROLE,
     LABEL_WORKSPACE_ID,
     PROVIDER_NAME,
+    RESERVED_ROOT_NAMES,
     ROLE_JOB,
     ROLE_WORKSPACE,
     WORKSPACE_MOUNT_PATH,
@@ -1051,3 +1052,83 @@ def test_the_job_id_reaches_the_engine_and_never_the_container(
     assert job.labels[LABEL_JOB_ID] == job_id
     assert all(job_id not in str(value) for value in (job.kwargs.get("environment") or {}).values())
     assert all(job_id not in str(part) for part in (job.command or ()))
+
+
+# --- criterion 3: the reserved names are a check, not a convention -----------
+
+
+@pytest.mark.parametrize("reserved", RESERVED_ROOT_NAMES)
+def test_a_copy_in_may_not_name_a_reserved_root_name_as_its_destination(
+    provider: DockerProvider, workspace: str, reserved: str
+) -> None:
+    """The route to a forged countersignal that needs no job at all.
+
+    Everything else in this file asks what a *job* can do to the channel, and
+    the answer rests on a job never learning its own id. A copy-in is not a
+    job. It is the caller's own verb, it names its destination directly, and
+    the caller is exactly who knows the job id — because ``--job-id`` is the
+    caller's to choose. So a ``put`` landing a regular file at the
+    countersignal's path would let a caller write the record of an ending that
+    never happened, for a job it had not started yet, without running a line of
+    code inside the workspace. Verified live before this refusal existed: it
+    reported success.
+
+    ``reserved`` was a word three docstrings used and nothing enforced. It is a
+    check now, and it runs on the *name* before any socket is opened — not on
+    what happens to stand at the path, because the countersignal's whole point
+    is that it is normally absent, and a reservation that only bit when the
+    name was occupied would never bite for the one that matters.
+    """
+    with pytest.raises(CliError) as caught:
+        provider.write(workspace, reserved, io.BytesIO(b"x"), expected_sha256="0" * 64)
+
+    assert caught.value.code == EXIT_USER_ERROR
+    assert reserved in caught.value.message
+
+
+@pytest.mark.parametrize("reserved", RESERVED_ROOT_NAMES)
+def test_a_copy_in_may_not_reach_a_reserved_root_name_through_a_child_path_either(
+    provider: DockerProvider, workspace: str, reserved: str
+) -> None:
+    """Reserving a name means reserving what is under it.
+
+    Refusing ``.headspace-staging`` while allowing ``.headspace-staging/x``
+    would reserve a string rather than an area, and the area is the point: a
+    copy-in that can write inside headspace's staging directory can interfere
+    with a concurrent copy-in's commit. For the two marker names the child path
+    is nonsense in any case — they are files — and a refusal is the right
+    answer to nonsense aimed at a reserved name.
+    """
+    with pytest.raises(CliError) as caught:
+        provider.write(
+            workspace, f"{reserved}/payload.bin", io.BytesIO(b"x"), expected_sha256="0" * 64
+        )
+
+    assert caught.value.code == EXIT_USER_ERROR
+    assert reserved in caught.value.message
+
+
+def test_the_reservation_does_not_swallow_an_ordinary_destination_that_merely_looks_like_one(
+    provider: DockerProvider, workspace: str
+) -> None:
+    """The control, and the reason the two refusals above mean anything.
+
+    A check that refused every dot-prefixed name, or every name with
+    ``headspace`` in it, would pass both tests above and be wrong — and wrong
+    in the direction that quietly costs a caller destinations they are entitled
+    to. The match is on the whole first segment, so a name that merely starts
+    with a reserved one, or holds it further down, is the caller's as it always
+    was.
+    """
+    for allowed in (
+        ".headspace-cancelled-notes",
+        "notes/.headspace-cancelled",
+        ".headspace-staging.bak",
+        ".headspace",
+    ):
+        # Reaches the engine rather than the name check: this stub has no
+        # running anchor, so the refusal it raises is a *different* one, and
+        # that difference is the assertion.
+        with pytest.raises(CliError) as caught:
+            provider.write(workspace, allowed, io.BytesIO(b"x"), expected_sha256="0" * 64)
+        assert "reserves for its own state" not in caught.value.message, allowed

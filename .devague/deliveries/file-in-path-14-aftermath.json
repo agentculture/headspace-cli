@@ -1,0 +1,129 @@
+{
+  "plan_slug": "file-in-path-14-aftermath",
+  "schema_version": 1,
+  "created": "2026-07-30T05:22:12Z",
+  "updated": "2026-07-30T14:51:18Z",
+  "deviations": [
+    {
+      "id": "d1",
+      "what": "serialize t6 before t2 instead of running them as one wave: execution and merge order becomes t1+t3 -> t6 -> t2 -> t4+t7 -> t5. No task content, acceptance criterion, or coverage target changes.",
+      "task_ref": "t6",
+      "reason": "The confirmed plan puts t2 (live cancelled test) and t6 (two-phase evidence upgrade) in one wave. They are file-disjoint, so the dependency graph permits it, but t2 authors its live assertions against t1's single-phase sentinel while t6 replaces that mechanism underneath. The observable contract (cancelled, exit_status null, run exits 5) is preserved by c23, so the test should survive \u2014 but 'should survive' is a bet on a security-sensitive seam, and the operator chose the order that removes the bet at the cost of one wave. Raised at gate 2 and approved by the operator before any fan-out.",
+      "affects": [
+        "t2",
+        "t7"
+      ],
+      "origin": "user",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d2",
+      "what": "every task agent develops with -m 'not integration'; the main agent runs the live-engine gate serially at each merge point",
+      "task_ref": "t2",
+      "reason": "Applying approved deviation d3 to this run's fan-out. This repo's live-engine tests use deterministic object names (headspace-<workspace_id>) and are single-writer against one daemon, so two agents running live suites concurrently produce false reds. Wave-level file-disjointness says nothing about a shared external resource.",
+      "affects": [
+        "t1",
+        "t6",
+        "t7"
+      ],
+      "origin": "user",
+      "status": "approved",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d3",
+      "what": "the 'not integration' lane is not daemon-free: tests/test_provider_docker.py applies pytest marks per class rather than as a module-level pytestmark, so ~108 of its tests reach the live Docker daemon even under -m 'not integration'. d2's isolation premise is therefore weaker than stated.",
+      "task_ref": "t1",
+      "reason": "Found by the t1 agent while following d2's instruction, and verified: only tests/test_integration_docker.py carries a module-level pytestmark. The practical mitigation already holds for the rest of this run because docker-touching tasks are serialized from here (t6 alone, then t2, then t7 with only the README task beside it), so no two daemon-touching suites run concurrently. Recorded rather than silently relied upon: the correct fix is either a module-level mark on test_provider_docker.py or documenting the suite as single-writer, which is d3's unresolved follow-up from the previous run.",
+      "affects": [
+        "t2",
+        "t6",
+        "t7"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "needs-follow-up"
+    },
+    {
+      "id": "d4",
+      "what": "run holds the door open for the countersignal: when an intent marker names the job that just settled, run polls the signalled name for up to CANCELLATION_SETTLE_SECONDS=2.0s before classifying. The plan's t6 instruction described two writes and a read; live, stop's countersignal necessarily lands after run wakes (container.stop() blocks until the container is dead, and run is polling that same container), so the brief as written would have recorded almost every completed cancellation as failure.",
+      "task_ref": "t6",
+      "reason": "The two writes cannot both precede the signal without the second one lying, so the countersignal is post-signal by construction; without a bounded wait the two processes race from the same starting gun with stop still owing one exec round trip. The wait is entered only when an intent marker names this job, and what it waits for is still the countersignal \u2014 so it can only turn a missed cancellation into a recorded one, never fabricate one. It is bounded rather than unbounded so a stop that died owing its countersignal cannot hold a finished job's result hostage.",
+      "affects": [
+        "c23",
+        "h14"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d5",
+      "what": "t6 acceptance criterion 2's clause 'a crashed run's leftovers are cleaned by reconciliation' does not hold and was not implemented as written. Orchestrator.reconcile is journal-intent driven and its only cleanup reach is _reap_staging, scoped to the copy-in staging prefix (INTENT_PUT path only, core/workspace.py:1885 + providers/docker.py:2264) \u2014 it does not know the cancellation marker names exist. What was implemented instead: the next run in that workspace clears BOTH reserved names unconditionally, on every classification path including exit 0, so a crashed run's leftovers are taken away by the next run rather than by reconciliation. The property the criterion was protecting \u2014 no marker outlives the run after it to convict a later job \u2014 holds; the named mechanism does not.",
+      "task_ref": "t6",
+      "reason": "Verified independently by the orchestrating agent: _reconcile_one dispatches on journal intent and only the INTENT_PUT branch reaches _reap_staging, whose staging_root is WORKSPACE_MOUNT_PATH/STAGING_DIR_NAME. Adding marker cleanup to reconciliation would give run's classification a second writer for the same two names and is not needed for the property.",
+      "affects": [
+        "c17",
+        "h14"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d6",
+      "what": "the plan's coverage of the #16 caveat stops at README.md (t4) and tests/ (t2), but two further surfaces still tell a reader the gap is open: headspace/explain/catalog.py \u2014 the CLI's own self-teaching surface, reachable as 'headspace explain run' and 'headspace explain stop' \u2014 states 'a known gap, tracked as issue #16' in two places; and docs/traceability.md rows 10 and 12 call cancellation 'the taxonomy's only declared-but-unreachable category' and say DockerProvider._status has no branch that can produce STATUS_CANCELLED. Both are now false. Shipping them would mean the product's own explain text contradicts its CHANGELOG about whether the delivered fix exists.",
+      "task_ref": "t4",
+      "reason": "Found by the orchestrating agent while reading the 0.10.0 CHANGELOG entry, which records that catalog.py and traceability.md were updated to document the gap when it was opened \u2014 so the same two surfaces have to be updated when it closes. No confirmed task covers either file; h7 asks only that the README's other exit-code rows stay byte-identical. Honesty condition h1 (the delivery does not claim more than it delivers) cuts the other way here: leaving them would claim LESS than delivered while actively misinforming an operator running 'headspace explain run'.",
+      "affects": [
+        "h7",
+        "h1"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "needs-follow-up"
+    },
+    {
+      "id": "d7",
+      "what": "t7 acceptance criterion 1's first clause is false and was proved so live: a job whose SIGTERM handler deletes the markers is NOT recorded failure/137 \u2014 it was recorded cancelled in 14 of 14 rounds. The criterion assumed a tamper window that does not exist. stop writes the countersignal only after the container is dead, so there is no instant at which a job and its own countersignal both exist, and the one marker that classifies is unreachable to the job by construction rather than by guarding. The committed test asserts the deterministic core the handler can prove from inside the box (intent marker seen, deleted, countersignal absent) plus a disjunction over the two honest outcomes, and records the measurement instead of asserting a timing that is not guaranteed.",
+      "task_ref": "t7",
+      "reason": "The deletion's real effect is to disarm the settle wait, after which the record is decided by a race run wins on this host by an incidental ~180ms /system/df call in _volume_bytes, not by design. Both outcomes are honest (cancelled is true; failure is the pre-fix answer), so asserting either one alone would have been a test twisted to pass.",
+      "affects": [
+        "c24",
+        "h18"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d8",
+      "what": "closed a fabrication route the plan did not know about, in headspace/providers/docker.py \u2014 outside every task's stated scope. t7 verified live that 'headspace put <ws> <src> .headspace-cancelled' landed a regular file at the countersignal's path and reported success, so a caller (who chooses --job-id and therefore knows it) could pre-plant the record of an ending that never happened for a job it had not started, without running any code in the workspace. The word 'reserved' was used by three docstrings and enforced by nothing. Added RESERVED_ROOT_NAMES = (STAGING_DIR_NAME,) + CANCELLATION_MARKER_NAMES and a pre-socket refusal in DockerProvider.write matching the destination's first segment, with seven tests including a control that the check does not swallow ordinary names like '.headspace-cancelled-notes' or 'notes/.headspace-cancelled'.",
+      "task_ref": "t7",
+      "reason": "This is the exact fabrication direction c23/c24 say must be impossible, reached by a route the adversarial wave was not looking at because it was scoped to what a job can do. Shipping the two-phase channel while knowing a documented-but-unenforced reservation left this open would have been the overclaim this delivery exists to remove. Backend-scoped by nature: the reserved names are the docker provider's own, and the fake has no volume, so the refusal is docker-only like the staging reservation already was.",
+      "affects": [
+        "c23",
+        "c24",
+        "c21"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "acceptable"
+    },
+    {
+      "id": "d9",
+      "what": "the docstring's 'Unforgeable' property was an overclaim and is now stated conditionally. t7 proved live (test_a_countersignal_a_job_planted_for_itself_does_forge_a_cancellation) that a job which is TOLD its own job id can write a countersignal naming itself and be recorded cancelled. The guarantee was never in the write \u2014 it is that nothing inside the container leaks the id, so the property is conditional on the id's entropy. A headspace-minted id is job-<12 hex of uuid4>; a caller-supplied --job-id is whatever the caller chose, and a caller who picks predictable ids AND runs untrusted code has handed that code the string. The module docstring now says this, cites both tests, and points at the tracking issue rather than leaving a reader to discover it.",
+      "task_ref": "t7",
+      "reason": "c21 ('job_id unguessable from inside the container') and h17 (no leak) are both still true and now tested across seven surfaces at once. What was too strong was the word built on top of them. The residual cannot be closed inside this delivery \u2014 it is a property of caller-supplied job ids, not of the marker channel \u2014 so it is documented at the point of use and filed.",
+      "affects": [
+        "c21",
+        "h17",
+        "c24"
+      ],
+      "origin": "llm",
+      "status": "proposed",
+      "classification": "needs-follow-up"
+    }
+  ]
+}
