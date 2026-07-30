@@ -4,7 +4,7 @@
   "schema_version": 5,
   "status": "exported",
   "created": "2026-07-30T04:11:20Z",
-  "updated": "2026-07-30T04:43:54Z",
+  "updated": "2026-07-30T05:15:17Z",
   "claims": [
     {
       "id": "c1",
@@ -296,12 +296,168 @@
       "links": [],
       "instruction": "",
       "revisions": []
+    },
+    {
+      "id": "c17",
+      "kind": "requirement",
+      "text": "the sentinel has a declared lifecycle, not just a write: it lives under a headspace-reserved name inside the volume (#16 already flags the artifact-in-caller-volume cost \u2014 export/read/inspect and the caller's own jobs can all see it), run removes it on EVERY classification path including exit 0 (stop racing a job that finished naturally leaves a sentinel no non-zero branch would consume), and a stale sentinel from a crashed run is ignored by later jobs (wrong job_id) and cleaned by the existing reconciliation path rather than accumulating",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h14",
+          "text": "a test stops a job that exits zero inside the grace window and asserts no sentinel survives; a planted stale sentinel naming a previous job never flips a later job's classification",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c18",
+      "kind": "requirement",
+      "text": "sentinel I/O is symlink-hardened like the write path it reuses: t14 found FINALIZE_WRITE_SCRIPT following symlinks in merged code (fixed d55fc29, hardened 6a0e635) \u2014 the sentinel write must refuse a pre-planted symlink at its path and the read must refuse a sentinel that is not a regular file, or a job can redirect the write or forge the read",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h15",
+          "text": "a test pre-plants a symlink at the sentinel path and asserts the write is refused and the following classification stays failure \u2014 the exact probe shape t14 used against the copy-in",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c19",
+      "kind": "decision",
+      "text": "status precedence with cancelled joins the existing deliberate-beats-coincidental rule: _status today puts timeout first because headspace's own enforcer deliberately stopped the job (docker.py 2750-2754); an operator's stop is more deliberate still, so cancelled outranks timeout, which outranks resource_exhausted \u2014 one documented order, never inferred from the exit number",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h16",
+          "text": "a job that is both operator-stopped and past its wall-clock budget in the same poll window is recorded cancelled, and the documented order (cancelled > timeout > resource_exhausted) appears in _status's docstring",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c20",
+      "kind": "assumption",
+      "text": "both engine mechanisms the sentinel needs are already proven in this codebase: writes into the volume via the anchor container's staged exec/put_archive path (docker.py 2033-2219, the put verb), and reads with the runtime dead via the anchor's get_archive (docker.py 1935-1951, the read verb's own case) \u2014 no new engine capability is required",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c21",
+      "kind": "assumption",
+      "text": "the job_id is not visible from inside the container: it travels only as the container name and the headspace.job_id label (docker.py 1788,1793), neither of which a containerized process can read, and run passes only the caller's own env \u2014 so forging a sentinel that names the running job requires guessing an unguessable id",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h17",
+          "text": "a test runs a job that dumps env, hostname and /proc/self surfaces and asserts the job_id appears in none of them; job_id generation is a cryptographically random id, not a counter",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c22",
+      "kind": "assumption",
+      "text": "the facade's entry points are real, not aspirational: Orchestrator already exposes create (758), run (866), export (1097), put (1219), stop (1488) and destroy (1595) in core/workspace.py, each returning a result package \u2014 t3 wraps construction wiring (store, provider, policy), it does not refactor orchestration",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c23",
+      "kind": "requirement",
+      "text": "the sentinel is two-phase evidence, fail-toward-failure: stop execs an intent marker (naming the job_id) into the reserved namespace before signalling, and writes a signalled marker via the anchor \u2014 which outlives the job \u2014 after the signal lands; run classifies cancelled only on a signalled marker naming the job it just ran; intent-only, tampered, or missing evidence classifies exactly as today \u2014 so v2's false-cancel window is eliminated, and the irreducible ms residual (stop dying between signal and marker) misreports a genuinely stopped job as failure, the status-quo direction, never the fabricated one",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h18",
+          "text": "a live test plants an intent-only marker (no signal ever sent) under a naturally failing job and asserts the record stays failure; stop's docstring documents the residual ms window and its direction (false failure of a stopped job, never false cancellation)",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
+    },
+    {
+      "id": "c24",
+      "kind": "requirement",
+      "text": "the adversarial-tamper posture is tested, not just documented: a job whose SIGTERM handler deletes the markers can only revert its own record to failure/137 (live test); the SIGKILL escalation path leaves no tamper window (live test); forging either marker requires the unguessable job_id (c21) \u2014 tampering can push toward failure, never toward cancelled",
+      "origin": "llm",
+      "status": "confirmed",
+      "honesty_conditions": [
+        {
+          "id": "h19",
+          "text": "the live TERM-handler tamper test records failure and never cancelled; the SIGKILL-escalation test records cancelled; both run inside the single-writer integration lane (r2)",
+          "status": "confirmed",
+          "instruction": ""
+        }
+      ],
+      "hard_questions": [],
+      "links": [],
+      "instruction": "",
+      "revisions": []
     }
   ],
   "open_vagueness": [
     {
       "id": "v1",
       "text": "d3's follow-up is real unclaimed work no open issue covers: two concurrent suites collide on one Docker daemon because integration tests use deterministic object names (headspace-<workspace_id>) \u2014 either namespace engine objects per run or document the integration suite as single-writer",
+      "kind": "unknown_nonblocking",
+      "claim_id": null,
+      "resolved": false,
+      "resolution": "",
+      "resolution_claim_id": null
+    },
+    {
+      "id": "v2",
+      "text": "a stop that writes the sentinel but dies before its signal lands leaves a narrow window where a naturally-failing job is recorded cancelled: operator intent existed (stop was invoked) but no signal ended the job \u2014 accepted residual, documented in t1 rather than engineered away",
+      "kind": "unknown_nonblocking",
+      "claim_id": null,
+      "resolved": false,
+      "resolution": "",
+      "resolution_claim_id": null
+    },
+    {
+      "id": "v3",
+      "text": "an adversarial job can delete or overwrite the sentinel during its own SIGTERM grace window, reverting exactly that job's record to today's failure/137 misclassification \u2014 it cannot fabricate a cancellation (needs the unguessable job_id, c21); harms only its own operator's view of it",
       "kind": "unknown_nonblocking",
       "claim_id": null,
       "resolved": false,
@@ -409,6 +565,77 @@
       "seeds": [
         "c9",
         "c10"
+      ]
+    },
+    {
+      "id": "s13",
+      "surface": "challenge pass / adjacent-systems lens: workspace volume visibility (export, read, inspect, put; #16's artifact-in-caller-volume note)",
+      "finding": "the sentinel is caller-visible state: jobs, exports and storage accounting all see it, and put's overwrite guard could collide with it \u2014 seeded the lifecycle requirement",
+      "seeds": [
+        "c17"
+      ]
+    },
+    {
+      "id": "s14",
+      "surface": "challenge pass / security lens: FINALIZE_WRITE_SCRIPT symlink precedent (d55fc29, 6a0e635) + job_id exposure (docker.py 1788,1793)",
+      "finding": "t14's symlink hole class applies verbatim to the sentinel path; job_id travels only as container name and label, invisible inside \u2014 seeded the hardening requirement and the unguessability assumption",
+      "seeds": [
+        "c18",
+        "c21"
+      ]
+    },
+    {
+      "id": "s15",
+      "surface": "challenge pass / failure-mode lens: stop/run lifecycle edges (exit-0 race, crashed run, unsignalled sentinel)",
+      "finding": "three edges found: sentinel left by a zero-exit race must still be removed (c17); a crashed run's stale sentinel must not flip a later job (c17); a written-but-unsignalled sentinel can misclassify a naturally-failing job in a narrow window (parked v2, accepted residual)",
+      "seeds": [
+        "c17"
+      ]
+    },
+    {
+      "id": "s16",
+      "surface": "challenge pass / concurrency lens: stop vs run vs reap (docker.py 2336-2358), grace-window sentinel tampering",
+      "finding": "existing races already handled (stop suppresses NotFound from run's reap); the one new hazard is a job deleting its own sentinel during the SIGTERM grace window \u2014 reverts that job to today's misclassification, cannot fabricate cancellations (parked v3)",
+      "seeds": [
+        "c21"
+      ]
+    },
+    {
+      "id": "s17",
+      "surface": "challenge pass / precedence: _status ordering (docker.py 2746-2765)",
+      "finding": "the spec never said where cancelled slots against timeout and OOM; extended the existing deliberate-beats-coincidental rationale into a proposed documented order",
+      "seeds": [
+        "c19"
+      ]
+    },
+    {
+      "id": "s18",
+      "surface": "challenge pass / adjacent-systems lens: Orchestrator entry points for the facade (core/workspace.py 733-1595)",
+      "finding": "all six verbs exist as real methods returning result packages \u2014 t3's 'delegate, do not refactor' premise verified rather than assumed",
+      "seeds": [
+        "c22",
+        "c20"
+      ]
+    },
+    {
+      "id": "s19",
+      "surface": "challenge pass / observability+reversibility lens: both deliveries",
+      "finding": "clean pass: the features are additive (revert = revert commit); stale-sentinel diagnosability is folded into c17's lifecycle policy rather than a new surface; residual uncertainty is the two parked windows (v2, v3), not an absence of unknowns",
+      "seeds": []
+    },
+    {
+      "id": "s20",
+      "surface": "challenge pass / process note: ordering",
+      "finding": "this pass ran after devague plan new (tasks t1-t5 seeded, all still proposed/unexported) instead of before it, against c17's recorded timing in the challenge spec; recoverable because the plan gate re-checks the live frame \u2014 recorded rather than hidden",
+      "seeds": []
+    },
+    {
+      "id": "s21",
+      "surface": "challenge pass / mitigation follow-up: parks v2+v3 vs requirements c23+c24",
+      "finding": "the operator brought both residuals into this delivery's scope: c23 eliminates v2's false-cancel direction (two-phase, fail-toward-failure) leaving only a ms false-failure window; c24 reduces v3 to self-harm tampering proven by live test \u2014 the parks record the pre-mitigation analysis and stand as provenance, not as open scope",
+      "seeds": [
+        "c23",
+        "c24"
       ]
     }
   ],

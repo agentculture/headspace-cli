@@ -29,6 +29,14 @@
 - \#16's discriminator is the sentinel shape: stop writes a sentinel inside the workspace volume via an exec before it signals, and run, on observing a non-zero exit, reads the sentinel through the engine and records the job cancelled with `exit_status` None — a positive signal set by stop, never a heuristic (q2)
   - instruction: stop, after finding a live job and before signalling, execs a namespaced sentinel carrying the `job_id` it signalled into the workspace volume; run, when its wait returns non-zero and the sentinel names the job it just ran, classifies cancelled with `exit_status` None and removes the sentinel; the forgery risk recorded on this claim is resolved in the plan (sentinel content / engine-side corroboration)
   - honesty: the sentinel is namespaced to headspace, is cleaned up by run after classification, and stop remains lock-free and store-free — the preview inertness proofs in `test_stop_verb` keep passing unchanged
+- the sentinel has a declared lifecycle, not just a write: it lives under a headspace-reserved name inside the volume (#16 already flags the artifact-in-caller-volume cost — export/read/inspect and the caller's own jobs can all see it), run removes it on EVERY classification path including exit 0 (stop racing a job that finished naturally leaves a sentinel no non-zero branch would consume), and a stale sentinel from a crashed run is ignored by later jobs (wrong `job_id`) and cleaned by the existing reconciliation path rather than accumulating
+  - honesty: a test stops a job that exits zero inside the grace window and asserts no sentinel survives; a planted stale sentinel naming a previous job never flips a later job's classification
+- sentinel I/O is symlink-hardened like the write path it reuses: t14 found `FINALIZE_WRITE_SCRIPT` following symlinks in merged code (fixed d55fc29, hardened 6a0e635) — the sentinel write must refuse a pre-planted symlink at its path and the read must refuse a sentinel that is not a regular file, or a job can redirect the write or forge the read
+  - honesty: a test pre-plants a symlink at the sentinel path and asserts the write is refused and the following classification stays failure — the exact probe shape t14 used against the copy-in
+- the sentinel is two-phase evidence, fail-toward-failure: stop execs an intent marker (naming the `job_id`) into the reserved namespace before signalling, and writes a signalled marker via the anchor — which outlives the job — after the signal lands; run classifies cancelled only on a signalled marker naming the job it just ran; intent-only, tampered, or missing evidence classifies exactly as today — so v2's false-cancel window is eliminated, and the irreducible ms residual (stop dying between signal and marker) misreports a genuinely stopped job as failure, the status-quo direction, never the fabricated one
+  - honesty: a live test plants an intent-only marker (no signal ever sent) under a naturally failing job and asserts the record stays failure; stop's docstring documents the residual ms window and its direction (false failure of a stopped job, never false cancellation)
+- the adversarial-tamper posture is tested, not just documented: a job whose SIGTERM handler deletes the markers can only revert its own record to failure/137 (live test); the SIGKILL escalation path leaves no tamper window (live test); forging either marker requires the unguessable `job_id` (c21) — tampering can push toward failure, never toward cancelled
+  - honesty: the live TERM-handler tamper test records failure and never cancelled; the SIGKILL-escalation test records cancelled; both run inside the single-writer integration lane (r2)
 
 ## Honesty conditions
 
@@ -40,6 +48,8 @@
 - each cited pain is sourced, not asserted: failure/exit 6 on a stopped job was verified live (#16), the undeclared surface was measured by embodiment's `__all__` probe (#18), and the five proposed deviations sat in the committed ledger until adjudication
 - every clause of the after-state is independently checkable at delivery: the live cancelled test, the import probe, deviate --list, and a grep for the retired caveats — none accepted from memory
 - each success signal is executable as written — a pytest node, a python -c import probe, a devague deviate --list read, and a grep — and all run green at delivery
+- a job that is both operator-stopped and past its wall-clock budget in the same poll window is recorded cancelled, and the documented order (cancelled > timeout > `resource_exhausted`) appears in `_status`'s docstring
+- a test runs a job that dumps env, hostname and /proc/self surfaces and asserts the `job_id` appears in none of them; `job_id` generation is a cryptographically random id, not a counter
 
 ## Success signals
 
@@ -59,6 +69,9 @@
 
 - the orchestration half of c43 already exists and needs no change: workspace.py:417 maps `STATUS_CANCELLED` to `EXIT_CANCELLED` (5), workspace.py:1552 gives the stop verb's own package status cancelled, and JobOutcome (providers/base.py) already admits `STATUS_CANCELLED` while refusing it an `exit_status` (`_NO_EXIT_STATUSES`) — only the provider-side classification is missing
 - the confirm move still targets the file-in-path-14 plan after this frame exists: deviate --plan defaults to the current plan, .devague/`current_plan` reads file-in-path-14, and creating this frame changed only .devague/current (the frame), not the plan pointer
+- both engine mechanisms the sentinel needs are already proven in this codebase: writes into the volume via the anchor container's staged exec/`put_archive` path (docker.py 2033-2219, the put verb), and reads with the runtime dead via the anchor's `get_archive` (docker.py 1935-1951, the read verb's own case) — no new engine capability is required
+- the `job_id` is not visible from inside the container: it travels only as the container name and the headspace.`job_id` label (docker.py 1788,1793), neither of which a containerized process can read, and run passes only the caller's own env — so forging a sentinel that names the running job requires guessing an unguessable id
+- the facade's entry points are real, not aspirational: Orchestrator already exposes create (758), run (866), export (1097), put (1219), stop (1488) and destroy (1595) in core/workspace.py, each returning a result package — t3 wraps construction wiring (store, provider, policy), it does not refactor orchestration
 
 ## Scope exploration
 
@@ -86,6 +99,26 @@
   - seeds: `c9`
 - `s12` — `devague CLI (deviate --help) + .devague/current_plan`: deviate --confirm/--reject are marked user-only and --plan defaults to the current plan; .devague/`current_plan` still reads file-in-path-14 after this frame was created (verified post-new), so the operator's confirm needs no --plan flag
   - seeds: `c9`, `c10`
+- `s13` — `challenge pass / adjacent-systems lens: workspace volume visibility (export, read, inspect, put; #16's artifact-in-caller-volume note)`: the sentinel is caller-visible state: jobs, exports and storage accounting all see it, and put's overwrite guard could collide with it — seeded the lifecycle requirement
+  - seeds: `c17`
+- `s14` — `challenge pass / security lens: FINALIZE_WRITE_SCRIPT symlink precedent (d55fc29, 6a0e635) + job_id exposure (docker.py 1788,1793)`: t14's symlink hole class applies verbatim to the sentinel path; `job_id` travels only as container name and label, invisible inside — seeded the hardening requirement and the unguessability assumption
+  - seeds: `c18`, `c21`
+- `s15` — `challenge pass / failure-mode lens: stop/run lifecycle edges (exit-0 race, crashed run, unsignalled sentinel)`: three edges found: sentinel left by a zero-exit race must still be removed (c17); a crashed run's stale sentinel must not flip a later job (c17); a written-but-unsignalled sentinel can misclassify a naturally-failing job in a narrow window (parked v2, accepted residual)
+  - seeds: `c17`
+- `s16` — `challenge pass / concurrency lens: stop vs run vs reap (docker.py 2336-2358), grace-window sentinel tampering`: existing races already handled (stop suppresses NotFound from run's reap); the one new hazard is a job deleting its own sentinel during the SIGTERM grace window — reverts that job to today's misclassification, cannot fabricate cancellations (parked v3)
+  - seeds: `c21`
+- `s17` — `challenge pass / precedence: _status ordering (docker.py 2746-2765)`: the spec never said where cancelled slots against timeout and OOM; extended the existing deliberate-beats-coincidental rationale into a proposed documented order
+  - seeds: `c19`
+- `s18` — `challenge pass / adjacent-systems lens: Orchestrator entry points for the facade (core/workspace.py 733-1595)`: all six verbs exist as real methods returning result packages — t3's 'delegate, do not refactor' premise verified rather than assumed
+  - seeds: `c22`, `c20`
+- `s19` — `challenge pass / observability+reversibility lens: both deliveries`: clean pass: the features are additive (revert = revert commit); stale-sentinel diagnosability is folded into c17's lifecycle policy rather than a new surface; residual uncertainty is the two parked windows (v2, v3), not an absence of unknowns
+- `s20` — `challenge pass / process note: ordering`: this pass ran after devague plan new (tasks t1-t5 seeded, all still proposed/unexported) instead of before it, against c17's recorded timing in the challenge spec; recoverable because the plan gate re-checks the live frame — recorded rather than hidden
+- `s21` — `challenge pass / mitigation follow-up: parks v2+v3 vs requirements c23+c24`: the operator brought both residuals into this delivery's scope: c23 eliminates v2's false-cancel direction (two-phase, fail-toward-failure) leaving only a ms false-failure window; c24 reduces v3 to self-harm tampering proven by live test — the parks record the pre-mitigation analysis and stand as provenance, not as open scope
+  - seeds: `c23`, `c24`
+
+## Decisions
+
+- status precedence with cancelled joins the existing deliberate-beats-coincidental rule: `_status` today puts timeout first because headspace's own enforcer deliberately stopped the job (docker.py 2750-2754); an operator's stop is more deliberate still, so cancelled outranks timeout, which outranks `resource_exhausted` — one documented order, never inferred from the exit number
 
 ## Hard questions
 
@@ -94,3 +127,5 @@
 ## Open parks
 
 - [unknown_nonblocking] d3's follow-up is real unclaimed work no open issue covers: two concurrent suites collide on one Docker daemon because integration tests use deterministic object names (headspace-<`workspace_id`>) — either namespace engine objects per run or document the integration suite as single-writer
+- [unknown_nonblocking] a stop that writes the sentinel but dies before its signal lands leaves a narrow window where a naturally-failing job is recorded cancelled: operator intent existed (stop was invoked) but no signal ended the job — accepted residual, documented in t1 rather than engineered away
+- [unknown_nonblocking] an adversarial job can delete or overwrite the sentinel during its own SIGTERM grace window, reverting exactly that job's record to today's failure/137 misclassification — it cannot fabricate a cancellation (needs the unguessable `job_id`, c21); harms only its own operator's view of it

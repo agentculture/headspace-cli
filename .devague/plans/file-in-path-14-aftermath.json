@@ -1,0 +1,425 @@
+{
+  "slug": "file-in-path-14-aftermath",
+  "title": "file-in-path-14 aftermath",
+  "frame_slug": "file-in-path-14-aftermath",
+  "schema_version": 4,
+  "status": "exported",
+  "created": "2026-07-30T04:45:57Z",
+  "updated": "2026-07-30T05:17:39Z",
+  "targets": [
+    {
+      "id": "c1",
+      "kind": "announcement",
+      "text": "The aftermath of the file-in-path-14 workforce run is settled: the five recorded deviations are adjudicated by the operator, a Docker job ended by stop --apply is recorded cancelled end-to-end so c43 is fully met, and headspace's supported import surface is declared where an external consumer can read it.",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h1",
+      "kind": "honesty",
+      "text": "the announcement is backed by its own record: deviate --list shows d1-d5 approved, the live Docker stop test passes, headspace.api imports cleanly, and issues #15/#16/#18 are closed with a comment citing the delivering change",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c2",
+      "kind": "requirement",
+      "text": "the supported consumption surface is written down where an external consumer can find it: today headspace/__init__.py advertises only __version__ in __all__, headspace/core/__init__.py defines no __all__, and README.md documents only the CLI contract \u2014 a would-be library consumer (embodiment, #18) cannot tell CLI-first from library-supported from the outside",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h2",
+      "kind": "honesty",
+      "text": "an external consumer can determine the supported surface from README plus headspace.api.__all__ alone, without reading source or asking \u2014 the exact test embodiment failed in #18",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c3",
+      "kind": "boundary",
+      "text": "the CLI contract remains the supported surface regardless of the import-surface decision: the documented flags, the nine-section result package, and the 0-8 exit taxonomy (README 'Exit codes' table) must not regress \u2014 #18 explicitly does not claim the current layout is wrong",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h7",
+      "kind": "honesty",
+      "text": "the existing CLI-contract test suite (verbs, result package sections, exit-code taxonomy) passes unchanged through both the #16 and #18 deliveries \u2014 no documented flag, package section, or exit-code slot changes meaning",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c4",
+      "kind": "requirement",
+      "text": "a Docker job ended by stop --apply is recorded status=cancelled with exit_status None, and its concurrent run invocation exits 5 \u2014 closing c43's second half: today DockerProvider._status (docker.py:2747) has no branch that can produce STATUS_CANCELLED, so the record reads failure/137 and run exits 6 (verified live per #16)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h3",
+      "kind": "honesty",
+      "text": "verified live against a real Docker engine, not inferred: stop --apply during a genuinely running job yields recorded status cancelled with exit_status null and the concurrent run invocation exits 5",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c5",
+      "kind": "boundary",
+      "text": "stop stays engine-side only: it takes no workspace lock and writes nothing under ~/.headspace (docker.py stop docstring; test_stop_verb.py proves inertness against three surfaces at once) \u2014 so the cancellation discriminator cannot be a state file; it must be visible to both processes through the engine",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h8",
+      "kind": "honesty",
+      "text": "test_stop_verb's three-surface inertness proofs (UntouchableProvider, LockRefusingStore, byte-identical state.json/journal.jsonl) pass unchanged after the sentinel lands \u2014 the discriminator added no lock, no store write",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c8",
+      "kind": "requirement",
+      "text": "the fix lands with a live Docker test asserting the stopped job's recorded outcome, and retires the two recorded-gap notices that currently point at #16: the gap paragraph in tests/test_stop_verb.py's module docstring and the exit-code-5 row caveat in README.md",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h4",
+      "kind": "honesty",
+      "text": "the new live test red-bars on today's code (it would have caught the gap) and greens with the fix; afterwards grep finds no #16 reference left in README.md or tests/test_stop_verb.py",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c9",
+      "kind": "boundary",
+      "text": "deviation adjudication is user-only: devague deviate --confirm/--reject refuse an agent caller by contract (CLI help marks them user-only; the delivery doc records 'An agent cannot confirm its own deviation') \u2014 this handling prepares the decision, the operator executes it",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h9",
+      "kind": "honesty",
+      "text": "the ledger shows d1-d5 approved only after the operator's explicit in-channel instruction (q3, 2026-07-30); no deviate --confirm ran before that instruction",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c11",
+      "kind": "requirement",
+      "text": "#18 settles as a narrow declared API: ship an importable headspace.api facade over the supported operations (create/run/put/export/destroy) with a declared __all__, versioned under semver \u2014 headspace.core stays private behind it, and the facade is documented in README so a consumer can see the supported surface from the outside (q1)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h5",
+      "kind": "honesty",
+      "text": "importing headspace.api succeeds without a reachable engine and exposes exactly the names its __all__ declares \u2014 no consumer needs to reach into headspace.core for the five supported operations",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c12",
+      "kind": "requirement",
+      "text": "#16's discriminator is the sentinel shape: stop writes a sentinel inside the workspace volume via an exec before it signals, and run, on observing a non-zero exit, reads the sentinel through the engine and records the job cancelled with exit_status None \u2014 a positive signal set by stop, never a heuristic (q2)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h6",
+      "kind": "honesty",
+      "text": "the sentinel is namespaced to headspace, is cleaned up by run after classification, and stop remains lock-free and store-free \u2014 the preview inertness proofs in test_stop_verb keep passing unchanged",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c13",
+      "kind": "audience",
+      "text": "audience: agents that offload execution into headspace and the humans operating them \u2014 the workforce-run operator adjudicating drift (#15), an operator stopping a runaway job (#16), and external integrators like embodiment's muse role choosing a surface to depend on (#18)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h10",
+      "kind": "honesty",
+      "text": "each named audience maps to a delivered artifact: the run operator to the approved ledger, the stopping operator to the live Docker cancelled test, embodiment to the README Python API section that answers #18",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c14",
+      "kind": "why_it_matters",
+      "text": "why it matters: an operator who stops a job is currently told the job failed (exit 6) \u2014 the exact misclassification the honest-failure taxonomy (#9) exists to prevent; an external consumer cannot tell which Python surface is supported and may silently depend on private internals; and until the five recorded deviations were adjudicated the run's accountability loop stayed open",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h11",
+      "kind": "honesty",
+      "text": "each cited pain is sourced, not asserted: failure/exit 6 on a stopped job was verified live (#16), the undeclared surface was measured by embodiment's __all__ probe (#18), and the five proposed deviations sat in the committed ledger until adjudication",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c15",
+      "kind": "after_state",
+      "text": "after: a Docker job ended by stop --apply is recorded cancelled with no exit status and its run invocation exits 5; headspace.api is importable with a declared __all__ and documented in README; d1-d5 are approved in the ledger; issues #15, #16 and #18 are closed and the two recorded #16 caveats (README exit-5 row, test_stop_verb docstring) are retired",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h12",
+      "kind": "honesty",
+      "text": "every clause of the after-state is independently checkable at delivery: the live cancelled test, the import probe, deviate --list, and a grep for the retired caveats \u2014 none accepted from memory",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c16",
+      "kind": "success_signal",
+      "text": "success signals: a live Docker test stops a running job and asserts the run invocation exits 5 with package status cancelled and exit_status null; python -c 'import headspace.api' exposes exactly the declared facade without reaching headspace.core; devague deviate --list shows d1-d5 approved; grep finds no #16 caveat left in README or test_stop_verb.py",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h13",
+      "kind": "honesty",
+      "text": "each success signal is executable as written \u2014 a pytest node, a python -c import probe, a devague deviate --list read, and a grep \u2014 and all run green at delivery",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c17",
+      "kind": "requirement",
+      "text": "the sentinel has a declared lifecycle, not just a write: it lives under a headspace-reserved name inside the volume (#16 already flags the artifact-in-caller-volume cost \u2014 export/read/inspect and the caller's own jobs can all see it), run removes it on EVERY classification path including exit 0 (stop racing a job that finished naturally leaves a sentinel no non-zero branch would consume), and a stale sentinel from a crashed run is ignored by later jobs (wrong job_id) and cleaned by the existing reconciliation path rather than accumulating",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h14",
+      "kind": "honesty",
+      "text": "a test stops a job that exits zero inside the grace window and asserts no sentinel survives; a planted stale sentinel naming a previous job never flips a later job's classification",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c18",
+      "kind": "requirement",
+      "text": "sentinel I/O is symlink-hardened like the write path it reuses: t14 found FINALIZE_WRITE_SCRIPT following symlinks in merged code (fixed d55fc29, hardened 6a0e635) \u2014 the sentinel write must refuse a pre-planted symlink at its path and the read must refuse a sentinel that is not a regular file, or a job can redirect the write or forge the read",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h15",
+      "kind": "honesty",
+      "text": "a test pre-plants a symlink at the sentinel path and asserts the write is refused and the following classification stays failure \u2014 the exact probe shape t14 used against the copy-in",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c23",
+      "kind": "requirement",
+      "text": "the sentinel is two-phase evidence, fail-toward-failure: stop execs an intent marker (naming the job_id) into the reserved namespace before signalling, and writes a signalled marker via the anchor \u2014 which outlives the job \u2014 after the signal lands; run classifies cancelled only on a signalled marker naming the job it just ran; intent-only, tampered, or missing evidence classifies exactly as today \u2014 so v2's false-cancel window is eliminated, and the irreducible ms residual (stop dying between signal and marker) misreports a genuinely stopped job as failure, the status-quo direction, never the fabricated one",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h18",
+      "kind": "honesty",
+      "text": "a live test plants an intent-only marker (no signal ever sent) under a naturally failing job and asserts the record stays failure; stop's docstring documents the residual ms window and its direction (false failure of a stopped job, never false cancellation)",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "c24",
+      "kind": "requirement",
+      "text": "the adversarial-tamper posture is tested, not just documented: a job whose SIGTERM handler deletes the markers can only revert its own record to failure/137 (live test); the SIGKILL escalation path leaves no tamper window (live test); forging either marker requires the unguessable job_id (c21) \u2014 tampering can push toward failure, never toward cancelled",
+      "deferred": false,
+      "deferred_reason": ""
+    },
+    {
+      "id": "h19",
+      "kind": "honesty",
+      "text": "the live TERM-handler tamper test records failure and never cancelled; the SIGKILL-escalation test records cancelled; both run inside the single-writer integration lane (r2)",
+      "deferred": false,
+      "deferred_reason": ""
+    }
+  ],
+  "tasks": [
+    {
+      "id": "t1",
+      "summary": "Docker sentinel discriminator: stop writes a namespaced sentinel bearing the signalled job_id into the workspace volume before SIGTERM; run classifies the ended job cancelled (single file: headspace/providers/docker.py)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "stop, after finding a live job and before signalling, execs a namespaced sentinel carrying the job_id it signalled into the workspace volume; it still takes no lock and writes nothing under ~/.headspace \u2014 test_stop_verb's three-surface inertness proofs pass unchanged",
+        "run records status cancelled with exit_status None exactly when its wait returns non-zero and the sentinel names the job it just ran; a missing, stale, or wrong-job sentinel leaves classification as today \u2014 SystemExit(137) stays failure/137, timeout and OOM precedence unchanged",
+        "run removes the sentinel after classification, and the job_id is not exposed inside the container (no env/argv leak), so a job cannot name itself in a forged sentinel"
+      ],
+      "deps": [],
+      "covers": [
+        "c4",
+        "c5",
+        "c12",
+        "h6",
+        "h8",
+        "c18"
+      ],
+      "instruction": "Single file plus its unit tests: headspace/providers/docker.py. Add a cancelled branch to _status per the documented precedence (cancelled > timeout > resource_exhausted, c19/h16) and the sentinel write inside stop's existing engine boundary. Reuse the proven mechanisms rather than inventing: the anchor container's exec/put_archive staging path (docker.py 2033-2219, the put verb) writes, and get_archive (1935-1951, the read verb) reads with the runtime dead. Harden the path against symlinks exactly as t14 did (d55fc29 guard-before-hash, 6a0e635 re-check-before-rename) \u2014 c18. Do NOT weaken the seam: JobOutcome refuses a cancelled outcome carrying an exit status, so drop the 137. t6 upgrades this to two-phase evidence immediately after; keep the marker read/write helpers separable so t6 extends rather than rewrites."
+    },
+    {
+      "id": "t2",
+      "summary": "Live Docker cancelled test + retire the test-side #16 caveat (files: tests/test_integration_docker.py, tests/test_stop_verb.py docstring)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a live integration test runs stop --apply against a genuinely running Docker job and asserts the recorded outcome: package status cancelled, exit_status null, and the concurrent run invocation exiting 5; it skips cleanly when no Docker socket is reachable",
+        "the test demonstrably red-bars against pre-t1 code (evidence recorded in the PR) and greens after t1 merges",
+        "the gap paragraph in tests/test_stop_verb.py's module docstring is retired; grep finds no #16 reference left under tests/"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c8",
+        "h3",
+        "h4"
+      ],
+      "instruction": "Live-engine test only \u2014 tests/test_integration_docker.py plus retiring the gap paragraph in tests/test_stop_verb.py's module docstring. Prove the red bar first: run the new test against pre-t1 code, record the failure output in the PR body as evidence (h4), then confirm green post-t1. Drive the in-flight case honestly the way test_stop_verb already does rather than fabricating a running job. Skip cleanly when no Docker socket is reachable, and mark it 'integration'. Approved deviation d3 binds here: this suite is single-writer against one daemon (uses deterministic object names), so it must not run concurrently with another live suite."
+    },
+    {
+      "id": "t3",
+      "summary": "headspace.api facade: the declared import surface (new files: headspace/api.py, tests/test_api.py)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "headspace/api.py exposes create, run, put, export, destroy as typed functions delegating to the same orchestration entry points the CLI uses, with __all__ declaring exactly those names; signatures are decided against core/workspace.py's real entry points, not invented",
+        "importing headspace.api succeeds with no reachable engine \u2014 module import performs no engine probe and does not import the docker SDK",
+        "tests assert __all__ matches the documented set and that every supported operation is reachable without touching headspace.core"
+      ],
+      "deps": [],
+      "covers": [
+        "c2",
+        "c11",
+        "h5"
+      ],
+      "instruction": "Two new files only: headspace/api.py and tests/test_api.py \u2014 no edits to existing modules, which is what keeps this wave-0 task file-disjoint from t1. Delegate to the six Orchestrator methods already verified present in core/workspace.py (create 758, run 866, export 1097, put 1219, stop 1488, destroy 1595) \u2014 wrap construction wiring (store, provider, policy resolution) as the CLI's own command modules do; do NOT refactor orchestration (c22). Import must stay side-effect free: no engine probe, no docker SDK import at module import time (h5), so keep provider construction lazy inside the functions. Declare __all__ over exactly the five supported operations."
+    },
+    {
+      "id": "t4",
+      "summary": "README closure: Python API section + retire the exit-5 caveat (single file: README.md)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a Python API section documents headspace.api as the sole supported import surface under semver, states headspace.core is private, and shows a minimal example \u2014 an external consumer can determine the surface from README plus __all__ alone, the exact test embodiment failed in #18",
+        "the exit-code-5 row caveat referencing #16 is removed; every other row of the 0-8 table and the documented CLI contract are byte-identical",
+        "issue #18 is answered citing the new section"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3"
+      ],
+      "covers": [
+        "c3",
+        "h2"
+      ],
+      "instruction": "Single file: README.md. Add a 'Python API' section declaring headspace.api the sole supported import surface under semver and headspace.core private, with a minimal example \u2014 the bar is that an external consumer settles the question from README plus __all__ alone, which is the exact test embodiment failed in #18. Remove the #16 caveat sentence from the exit-code-5 row and leave every other row of the 0-8 table byte-identical (c3/h7). Answering issue #18 with a comment citing the section is part of this task."
+    },
+    {
+      "id": "t5",
+      "summary": "Delivery verification + release: success-signal checklist, version bump, changelog, PR closure of #16/#18 (files: pyproject.toml, CHANGELOG.md)",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "all four success signals run green with evidence quoted in the delivery summary: the live cancelled pytest node, a python -c import probe of headspace.api, devague deviate --list showing d1-d5 approved, and a grep proving no #16 caveat remains in README.md or tests/",
+        "the full suite passes and the pre-existing CLI-contract tests (verbs, result package, exit taxonomy) pass unchanged",
+        "version bumped with a CHANGELOG entry (CI version-check green); issues #16 and #18 closed citing the delivering PR; the ledger still shows d1-d5 approved (#15 closed by adjudication on 2026-07-30)"
+      ],
+      "deps": [
+        "t1",
+        "t2",
+        "t3",
+        "t4"
+      ],
+      "covers": [
+        "c1",
+        "h1",
+        "c9",
+        "h9",
+        "c13",
+        "h10",
+        "c14",
+        "h11",
+        "c15",
+        "h12",
+        "c16",
+        "h13",
+        "h7"
+      ],
+      "instruction": "Release and verification only: pyproject.toml + CHANGELOG.md via the version-bump skill, then the four success signals from c16/h13 run with their output quoted in the delivery summary \u2014 the live cancelled pytest node, a python -c import probe of headspace.api, devague deviate --list showing d1-d5 approved, and a grep proving no #16 caveat survives in README.md or tests/. Full suite green with the pre-existing CLI-contract tests unchanged (c3). Close #16 and #18 citing the delivering PR; #15 is already closed by adjudication (2026-07-30)."
+    },
+    {
+      "id": "t6",
+      "summary": "Two-phase evidence upgrade (dep t1, single file: headspace/providers/docker.py + its unit tests): intent marker exec'd pre-signal, signalled marker via the anchor post-signal, run honors only a signalled marker naming its job; full marker lifecycle",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "stop writes the intent marker into the reserved namespace before signalling and the signalled marker via the anchor after the signal lands; run classifies cancelled only on a signalled marker naming the job it just ran \u2014 intent-only, missing, or tampered evidence classifies exactly as pre-fix code",
+        "markers are removed on every classification path including exit 0; a stale marker naming a previous job never flips a later job's classification; a crashed run's leftovers are cleaned by reconciliation",
+        "stop stays lock-free and store-free with both marker writes (inertness proofs pass unchanged), and its docstring documents the residual ms window and its fail-toward-failure direction"
+      ],
+      "deps": [
+        "t1"
+      ],
+      "covers": [
+        "c23",
+        "c17",
+        "h14"
+      ],
+      "instruction": "Depends on t1, same file (docker.py) \u2014 this is why it is a separate wave, not a parallel task. Upgrade the single sentinel to two-phase evidence (c23): an intent marker exec'd before the signal, a signalled marker written via the anchor (which outlives the job) after the signal lands, and run honoring ONLY a signalled marker naming the job it just ran. The direction of the residual matters more than closing it: partial, missing or tampered evidence must classify exactly as pre-fix code, so the irreducible window misreports a stopped job as failure and never fabricates a cancellation. Implement the full marker lifecycle including removal on the exit-0 path (a stop racing a job that finished naturally leaves a marker no non-zero branch would consume) and staleness rejection by job_id. Document the residual window and its direction in stop's docstring."
+    },
+    {
+      "id": "t7",
+      "summary": "Adversarial and edge live-test wave (dep t2, t6; files: tests/ live suite): tamper, SIGKILL, intent-only, coincident stop+timeout, job_id leak probe, symlink probe",
+      "origin": "llm",
+      "status": "confirmed",
+      "acceptance_criteria": [
+        "a job whose SIGTERM handler deletes the markers is recorded failure/137, never cancelled; a job ended by the SIGKILL escalation is recorded cancelled \u2014 both live against a real engine",
+        "an intent-only marker under a naturally failing job stays failure; a job both operator-stopped and past its wall-clock budget in the same window is recorded cancelled per the documented precedence (c19, h16)",
+        "a job dumping env, hostname and /proc surfaces never sees its job_id (h17); a pre-planted symlink at the marker path refuses the write and classification stays failure \u2014 t14's probe shape",
+        "all new live tests skip cleanly without a Docker socket and run inside the single-writer integration lane"
+      ],
+      "deps": [
+        "t2",
+        "t6"
+      ],
+      "covers": [
+        "c24",
+        "h15",
+        "h18",
+        "h19"
+      ],
+      "instruction": "Live-engine tests only, depends on t2 and t6. Six probes: a SIGTERM handler that deletes the markers (must record failure/137, never cancelled); a job ended via the SIGKILL escalation (must record cancelled); an intent-only marker under a naturally failing job (stays failure); a job both operator-stopped and past its wall-clock budget in one window (cancelled, per c19); a job dumping env/hostname//proc surfaces (job_id appears in none \u2014 h17); a pre-planted symlink at the marker path (write refused, classification stays failure \u2014 t14's probe shape, h15). The posture being proven is asymmetric: tampering can push a record toward failure, never toward cancelled. Same d3 constraint as t2 \u2014 single-writer lane, skip cleanly without a socket."
+    }
+  ],
+  "risks": [
+    {
+      "id": "r1",
+      "text": "fake provider parity: the fake pins the cancelled contract only via authored JobPlan; making fake.stop structurally flip an in-flight job's outcome to cancelled would prove the semantics on both backends \u2014 deliberate follow-up, not in this delivery",
+      "kind": "follow_up",
+      "task_id": null,
+      "resolved": false,
+      "resolution": ""
+    },
+    {
+      "id": "r2",
+      "text": "the new live test inherits the d3 constraint: this repo's live-engine tests use deterministic object names and are single-writer against one daemon; the namespacing-vs-documenting decision is still parked on the frame",
+      "kind": "unknown_nonblocking",
+      "task_id": "t2",
+      "resolved": false,
+      "resolution": ""
+    }
+  ]
+}
