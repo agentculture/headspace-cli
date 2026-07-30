@@ -92,8 +92,12 @@ from headspace.core.policy import EffectivePolicy, Policy
 from headspace.core.policy import resolve as resolve_policy
 from headspace.core.result import STATUS_CANCELLED, STATUS_FAILURE
 from headspace.core.store import HOME_ENV_VAR, Store
+from headspace.providers import docker as docker_backend
 from headspace.providers.docker import (
-    CANCELLATION_MARKER_NAME,
+    CANCELLATION_INTENT_MARKER_NAME,
+    CANCELLATION_MARKER_NAMES,
+    CANCELLATION_SIGNALLED_MARKER_NAME,
+    CLEAR_CANCELLATION_SCRIPT,
     LABEL_CREATED_AT,
     LABEL_JOB_ID,
     LABEL_PROVIDER,
@@ -141,6 +145,25 @@ def _label_filter(filters: Mapping[str, Any] | None) -> dict[str, str]:
 
 def _matches(container: "_StubContainer", wanted: Mapping[str, str]) -> bool:
     return all(container.labels.get(key) == value for key, value in wanted.items())
+
+
+def _exec_label(cmd: Sequence[str]) -> str:
+    """Name one exec by what it does and which marker it does it to.
+
+    The engine timeline is how ordering claims are proved here, and with two
+    marker names a bare ``"exec"`` would no longer distinguish the two claims
+    that matter: intent goes in *before* the signal, the countersignal only
+    *after* it. So the label carries both halves, read off the argv the
+    provider actually built rather than off a counter the stub keeps.
+    """
+    _shell, _dash_c, script, _argv0, path, *_rest = cmd
+    verb = "clear" if script == CLEAR_CANCELLATION_SCRIPT else "write"
+    marker = str(path).rpartition("/")[2]
+    phase = {
+        CANCELLATION_INTENT_MARKER_NAME: "intent",
+        CANCELLATION_SIGNALLED_MARKER_NAME: "countersignal",
+    }.get(marker, marker)
+    return f"{verb}-{phase}"
 
 
 class _StubContainer:
@@ -245,7 +268,7 @@ class _StubContainer:
 
     def exec_run(self, cmd: Sequence[str], **_: Any) -> SimpleNamespace:
         """Run the provider's own script text, for real, against a real directory."""
-        self._engine.timeline.append("exec")
+        self._engine.timeline.append(_exec_label(cmd))
         self.exec_calls.append(list(cmd))
         _shell, _dash_c, script, argv0, *rest = cmd
         completed = subprocess.run(  # nosec B603 - the fixture's own shell, by design
@@ -615,19 +638,34 @@ def test_stop_leaves_the_store_root_untouched_on_the_nothing_running_path(
     assert not store_home.exists()
 
 
-# --- criterion 3: the sentinel stop leaves for run to find (issue #16) -------
+# --- criterion 3: the two markers stop leaves for run to find (issue #16) ----
 #
 # ``stop`` cannot tell ``run`` anything through headspace's own state: ``run``
 # holds the workspace's flock for the job's whole duration and is the single
 # writer of that workspace's records, so a ``stop`` that wrote there would
 # deadlock against the very call it exists to interrupt. The engine is the
 # only channel the two processes share, and inside it the workspace volume is
-# the only writable thing that outlives a job — so the sentinel goes there,
-# and everything below holds ``stop`` to the boundary while it does.
+# the only writable thing that outlives a job — so the markers go there, and
+# everything below holds ``stop`` to the boundary while it does.
+#
+# Two of them, in two phases, because one was not honest enough. A marker
+# written before the signal records that an operator *asked*; only a marker
+# written after the signal has landed records that the ask took effect. The
+# first alone would let a ``stop`` that died mid-way convict a job that then
+# failed for its own reasons — so ``stop`` writes both, in that order, and the
+# tests below pin the order rather than the mere presence.
 
 
-def _marker(engine: _StubEngine) -> Path:
-    return engine.volume_root / CANCELLATION_MARKER_NAME
+def _marker(engine: _StubEngine, name: str) -> Path:
+    return engine.volume_root / name
+
+
+def _intent(engine: _StubEngine) -> Path:
+    return _marker(engine, CANCELLATION_INTENT_MARKER_NAME)
+
+
+def _countersignal(engine: _StubEngine) -> Path:
+    return _marker(engine, CANCELLATION_SIGNALLED_MARKER_NAME)
 
 
 def _volume_entries(engine: _StubEngine) -> list[str]:
@@ -635,52 +673,78 @@ def _volume_entries(engine: _StubEngine) -> list[str]:
     return sorted(entry.name for entry in engine.volume_root.iterdir())
 
 
+@pytest.fixture
+def brief_settle(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Shrink ``run``'s wait for a countersignal to something a test can spend.
+
+    ``run`` holds the door open for a bounded moment when an intent marker
+    names the job that just settled, because in production the countersignal is
+    being written by another process at that very instant. Nothing here is a
+    second process, so the tests that leave intent unanswered would sit out the
+    whole real budget for a countersignal that was never coming. The mechanism
+    is the provider's throughout; only the number is this test's.
+    """
+    budget = 4 * docker_backend.POLL_INTERVAL_SECONDS
+    monkeypatch.setattr(docker_backend, "CANCELLATION_SETTLE_SECONDS", budget)
+    return budget
+
+
 @requires_a_host_shell
-def test_stop_writes_a_sentinel_naming_the_job_it_signalled(
+def test_stop_writes_two_markers_naming_the_job_it_signalled(
     engine: _StubEngine, provider: DockerProvider, workspace: str
 ) -> None:
     """The payload is the whole point: which job, not merely that one was ended.
 
-    ``run`` classifies from this file, and the job it classifies may not be
-    the job that was stopped — a sentinel that only said "somebody stopped
+    ``run`` classifies from these files, and the job it classifies may not be
+    the job that was stopped — a marker that only said "somebody stopped
     something here" would convict whichever later job happened to fail.
     """
     _in_flight_job(engine, workspace, "job-marked")
 
     provider.stop(workspace)
 
-    assert _marker(engine).read_text() == "job-marked"
+    assert _intent(engine).read_text() == "job-marked"
+    assert _countersignal(engine).read_text() == "job-marked"
 
 
 @requires_a_host_shell
-def test_the_sentinel_is_written_before_the_job_is_signalled(
+def test_intent_is_recorded_before_the_signal_and_countersigned_only_after_it(
     engine: _StubEngine, provider: DockerProvider, workspace: str
 ) -> None:
-    """Ordering, not merely presence — the other process is already watching.
+    """Ordering is the evidence; presence alone would prove nothing.
 
+    Both halves matter, in opposite directions.
+
+    Intent goes in *first* because the other process is already watching:
     ``run`` is blocked in ``_await_exit``, re-reading the very container this
     call is about to signal, and it classifies the instant that container
-    settles. A sentinel written after the signal races that poll and loses
-    whenever the job dies quickly, which is exactly when a forceful stop is
-    involved.
+    settles. Intent written after the signal would race that poll and lose
+    whenever the job dies quickly — which is exactly when a forceful stop is
+    involved, and exactly when ``run`` most needs to know to wait.
+
+    The countersignal goes in *last* because of what it claims. It says the
+    signal landed, so it cannot be written before that is true; writing it up
+    front is precisely the fabrication this second phase exists to prevent —
+    a ``stop`` that died in the gap would have left behind a completed-looking
+    record of an ending that never happened.
     """
     job = _in_flight_job(engine, workspace, "job-ordered")
     job.survives_stop = True  # so the timeline carries the escalation too
 
     provider.stop(workspace)
 
-    assert engine.timeline == ["exec", "signal", "kill"]
+    assert engine.timeline == ["write-intent", "signal", "kill", "write-countersignal"]
 
 
 @requires_a_host_shell
-def test_stop_writes_no_sentinel_when_there_was_no_job_to_name(
+def test_stop_writes_nothing_when_there_was_no_job_to_name(
     engine: _StubEngine, provider: DockerProvider, workspace: str
 ) -> None:
     """The ordinary race leaves the volume exactly as it found it.
 
     A caller racing a job that finished on its own signalled nothing, so there
-    is no job id to write — and a sentinel naming nothing is residue the next
-    job would have to be protected from for no gain at all.
+    is no job id to write — and a marker naming nothing is residue the next job
+    would have to be protected from for no gain at all.
     """
     result = provider.stop(workspace)
 
@@ -689,38 +753,40 @@ def test_stop_writes_no_sentinel_when_there_was_no_job_to_name(
 
 
 @requires_a_host_shell
-def test_the_sentinel_write_leaves_no_staging_residue_in_the_volume(
+def test_the_marker_writes_leave_no_staging_residue_in_the_volume(
     engine: _StubEngine, provider: DockerProvider, workspace: str
 ) -> None:
-    """The volume a caller reads back holds the sentinel and nothing beside it.
+    """The volume a caller reads back holds the two markers and nothing beside them.
 
-    The write lands on a nonce path first and is renamed onto the sentinel's
+    Each write lands on a nonce path first and is renamed onto its marker's
     name, because a rename replaces a link rather than writing through one.
-    The nonce must not survive that: a workspace is the caller's, and headspace
-    littering it with scratch files is a cost the caller never agreed to.
+    The nonces must not survive that: a workspace is the caller's, and
+    headspace littering it with scratch files is a cost the caller never
+    agreed to.
     """
     _in_flight_job(engine, workspace, "job-tidy")
 
     provider.stop(workspace)
 
-    assert _volume_entries(engine) == [CANCELLATION_MARKER_NAME]
+    assert _volume_entries(engine) == sorted(CANCELLATION_MARKER_NAMES)
 
 
 @requires_a_host_shell
-def test_a_pre_planted_symlink_at_the_sentinel_path_is_never_written_through(
-    engine: _StubEngine, provider: DockerProvider, workspace: str, tmp_path: Path
+@pytest.mark.parametrize("name", CANCELLATION_MARKER_NAMES)
+def test_a_pre_planted_symlink_at_a_marker_path_is_never_written_through(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, tmp_path: Path, name: str
 ) -> None:
     """The write-side half of the discipline the copy-in path already keeps.
 
     A job shares the workspace volume and can plant a link at any name it
-    likes, including this one. A shell redirection follows a link and would
+    likes, including these two. A shell redirection follows a link and would
     write headspace's own bytes wherever the job pointed it — outside the
     volume, over a file the job could not otherwise touch. Nothing legitimate
     puts a link here, so one standing there is refused outright.
     """
     outside = tmp_path / "outside-the-volume"
     outside.write_text("untouched")
-    _marker(engine).symlink_to(outside)
+    _marker(engine, name).symlink_to(outside)
     _in_flight_job(engine, workspace, "job-planted")
 
     provider.stop(workspace)
@@ -731,23 +797,93 @@ def test_a_pre_planted_symlink_at_the_sentinel_path_is_never_written_through(
     # so the assertion that separates "refused" from "quietly tidied away" is
     # that the job's own link is still exactly what stands there, and that the
     # refusal left no nonce behind on its way out.
-    assert _marker(engine).is_symlink()
-    assert _volume_entries(engine) == [CANCELLATION_MARKER_NAME]
+    assert _marker(engine, name).is_symlink()
+    # The other phase still wrote, so the volume holds both names: the job's
+    # own link where it planted it, and headspace's marker where it did not.
+    assert _volume_entries(engine) == sorted(CANCELLATION_MARKER_NAMES)
 
 
 @requires_a_host_shell
-def test_a_refused_sentinel_write_never_stops_the_job_from_being_stopped(
-    engine: _StubEngine, provider: DockerProvider, workspace: str, tmp_path: Path
+@pytest.mark.parametrize("name", CANCELLATION_MARKER_NAMES)
+def test_a_pre_planted_directory_at_a_marker_path_is_refused_not_moved_into(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, name: str
+) -> None:
+    """``mv -f file dir`` succeeds — and puts the file *inside* the directory.
+
+    The symlink refusal above does not cover this one, and the difference is
+    the nastiest kind: a rename onto a directory does not fail, it relocates.
+    Without an explicit refusal the write would exit 0, the provider would
+    believe the marker was there, and what actually stands at the reserved name
+    is a directory holding a nonce nobody will ever read. A job that plants one
+    could therefore suppress the naming of its own cancellation and re-open the
+    #16 symptom against itself — pushing towards ``failure``, never towards a
+    fabricated cancellation, but pushing all the same for free.
+
+    So anything at a reserved name that is not a regular file is refused in one
+    check, which covers a directory, a FIFO and a device node alike: nothing
+    legitimate is ever any of those, and only a regular file can be renamed
+    over safely.
+    """
+    _marker(engine, name).mkdir()
+    _in_flight_job(engine, workspace, "job-planted-dir")
+
+    provider.stop(workspace)
+
+    assert _marker(engine, name).is_dir()
+    assert list(_marker(engine, name).iterdir()) == []  # nothing was moved inside
+
+
+@requires_a_host_shell
+@pytest.mark.parametrize("name", CANCELLATION_MARKER_NAMES)
+def test_a_planted_directory_still_leaves_the_channel_recoverable(
+    engine: _StubEngine,
+    provider: DockerProvider,
+    policy: EffectivePolicy,
+    workspace: str,
+    name: str,
+    brief_settle: float,
+) -> None:
+    """Refusing the write must not be how a job wedges the channel for good.
+
+    The clearing step removes whatever stands at a reserved name — a directory
+    included, which is why it recurses — so the job that planted one costs its
+    own cancellation its name and nothing more. The next ``stop`` in that
+    workspace meets an empty name again and both phases land.
+    """
+    del brief_settle  # the refused write can leave intent unanswered; see above
+    _marker(engine, name).mkdir()
+    wedged = _in_flight_job(engine, workspace, "job-wedger")
+    provider.stop(workspace)
+
+    engine.job_exit_code = 137
+    provider.run(workspace, ("false",), policy, job_id="job-wedger")
+    assert _volume_entries(engine) == []
+
+    # In production the blocked ``run`` reaps its own job container the moment
+    # the job settles; this stand-in was never ``run``'s to reap, so it is
+    # retired by hand before the next one takes its place.
+    wedged.removed = True
+    _in_flight_job(engine, workspace, "job-after-the-wedge")
+    provider.stop(workspace)
+
+    assert _intent(engine).read_text() == "job-after-the-wedge"
+    assert _countersignal(engine).read_text() == "job-after-the-wedge"
+
+
+@requires_a_host_shell
+@pytest.mark.parametrize("name", CANCELLATION_MARKER_NAMES)
+def test_a_refused_marker_write_never_stops_the_job_from_being_stopped(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, tmp_path: Path, name: str
 ) -> None:
     """Ending the runaway job is the operator's need; naming it is the nicety.
 
-    The sentinel only improves how the *other* process narrates the outcome.
-    A refusal to write it — a planted link, an image with no ``mv``, an anchor
-    that has exited — must therefore degrade the narration to exactly today's
-    answer and never withhold the signal, which is the whole reason the
+    The markers only improve how the *other* process narrates the outcome. A
+    refusal to write either one — a planted link, an image with no ``mv``, an
+    anchor that has exited — must therefore degrade the narration to exactly
+    today's answer and never withhold the signal, which is the whole reason the
     operator reached for this verb.
     """
-    (engine.volume_root / CANCELLATION_MARKER_NAME).symlink_to(tmp_path / "elsewhere")
+    _marker(engine, name).symlink_to(tmp_path / "elsewhere")
     job = _in_flight_job(engine, workspace, "job-still-stopped")
 
     result = provider.stop(workspace)
@@ -761,14 +897,16 @@ def test_a_refused_sentinel_write_never_stops_the_job_from_being_stopped(
 
 
 @requires_a_host_shell
-def test_writing_the_sentinel_still_constructs_no_state_store(
+def test_writing_the_markers_still_constructs_no_state_store(
     engine: _StubEngine, provider: DockerProvider, workspace: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The new write is engine-side, like every other thing ``stop`` does.
+    """The new writes are engine-side, like every other thing ``stop`` does.
 
-    Restated against the sentinel specifically, because "``stop`` writes
+    Restated against the markers specifically, because "``stop`` writes
     something now" is exactly the change that could have reached for the
-    store: the marker goes into the *volume*, through the engine, and the
+    store — and the second phase is a second chance to make that mistake, on
+    the far side of the signal where a caller might feel entitled to record an
+    outcome. Both markers go into the *volume*, through the engine, and the
     store's constructor is still never called.
     """
 
@@ -780,18 +918,20 @@ def test_writing_the_sentinel_still_constructs_no_state_store(
     _in_flight_job(engine, workspace, "job-store-3")
     provider.stop(workspace)
 
-    assert _marker(engine).read_text() == "job-store-3"
+    assert _intent(engine).read_text() == "job-store-3"
+    assert _countersignal(engine).read_text() == "job-store-3"
 
 
 @requires_a_host_shell
-def test_the_sentinel_lands_in_the_volume_and_not_under_the_store_root(
+def test_the_markers_land_in_the_volume_and_not_under_the_store_root(
     engine: _StubEngine, provider: DockerProvider, workspace: str, store_home: Path
 ) -> None:
     _in_flight_job(engine, workspace, "job-store-4")
 
     provider.stop(workspace)
 
-    assert _marker(engine).is_file()
+    assert _intent(engine).is_file()
+    assert _countersignal(engine).is_file()
     assert not store_home.exists()
 
 
@@ -821,13 +961,45 @@ def test_a_stop_and_a_later_run_agree_that_the_job_was_cancelled(
 
 
 @requires_a_host_shell
-def test_the_run_that_consumed_the_sentinel_removes_it_from_the_volume(
+def test_a_stop_that_never_countersigned_reports_the_job_as_it_failed(
+    engine: _StubEngine,
+    provider: DockerProvider,
+    policy: EffectivePolicy,
+    workspace: str,
+    brief_settle: float,
+) -> None:
+    """The fabrication case, through the volume the two processes really share.
+
+    A ``stop`` that got its intent down and then died — killed, disconnected,
+    its signal refused — leaves exactly what is planted here. The job it named
+    then fails on its own account, which is the trap: with one marker, that job
+    found a sentinel naming *itself* and was written down as cancelled, so
+    headspace would have claimed a human ended work that failed by itself.
+
+    The countersignal is the difference. It is absent, so nothing here says the
+    ending ever happened, and the job is recorded exactly as the code before
+    any of this existed recorded it — a failure, with its own exit status
+    intact. Both leftovers still go, because residue is residue.
+    """
+    del brief_settle  # intent naming this job is precisely what makes it wait
+    _intent(engine).write_text("job-half-stopped")
+
+    engine.job_exit_code = 137
+    outcome = provider.run(workspace, ("./train.py",), policy, job_id="job-half-stopped")
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == 137
+    assert _volume_entries(engine) == []
+
+
+@requires_a_host_shell
+def test_the_run_that_consumed_the_markers_removes_both_from_the_volume(
     engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
 ) -> None:
-    """A consumed sentinel is residue, and residue in a caller's volume is a leak."""
+    """A consumed marker is residue, and residue in a caller's volume is a leak."""
     _in_flight_job(engine, workspace, "job-consumed")
     provider.stop(workspace)
-    assert _marker(engine).is_file()
+    assert _volume_entries(engine) == sorted(CANCELLATION_MARKER_NAMES)
 
     engine.job_exit_code = 137
     provider.run(workspace, ("sleep", "600"), policy, job_id="job-consumed")
@@ -836,7 +1008,7 @@ def test_the_run_that_consumed_the_sentinel_removes_it_from_the_volume(
 
 
 @requires_a_host_shell
-def test_a_sentinel_from_an_earlier_job_does_not_reach_the_next_one(
+def test_markers_from_an_earlier_job_do_not_reach_the_next_one(
     engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
 ) -> None:
     """Through real files this time, not an armed stub attribute."""
