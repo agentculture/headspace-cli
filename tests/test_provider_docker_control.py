@@ -1079,8 +1079,13 @@ def test_a_copy_in_may_not_name_a_reserved_root_name_as_its_destination(
     is that it is normally absent, and a reservation that only bit when the
     name was occupied would never bite for the one that matters.
     """
+    # Built before the block so the only thing inside it that can raise is the
+    # call under test: a `raises` that would also be satisfied by the source
+    # constructor failing is a test that can pass for the wrong reason.
+    source = io.BytesIO(b"x")
+
     with pytest.raises(CliError) as caught:
-        provider.write(workspace, reserved, io.BytesIO(b"x"), expected_sha256="0" * 64)
+        provider.write(workspace, reserved, source, expected_sha256="0" * 64)
 
     assert caught.value.code == EXIT_USER_ERROR
     assert reserved in caught.value.message
@@ -1099,10 +1104,10 @@ def test_a_copy_in_may_not_reach_a_reserved_root_name_through_a_child_path_eithe
     is nonsense in any case — they are files — and a refusal is the right
     answer to nonsense aimed at a reserved name.
     """
+    source = io.BytesIO(b"x")
+
     with pytest.raises(CliError) as caught:
-        provider.write(
-            workspace, f"{reserved}/payload.bin", io.BytesIO(b"x"), expected_sha256="0" * 64
-        )
+        provider.write(workspace, f"{reserved}/payload.bin", source, expected_sha256="0" * 64)
 
     assert caught.value.code == EXIT_USER_ERROR
     assert reserved in caught.value.message
@@ -1126,9 +1131,11 @@ def test_the_reservation_does_not_swallow_an_ordinary_destination_that_merely_lo
         ".headspace-staging.bak",
         ".headspace",
     ):
+        source = io.BytesIO(b"x")
+
         # Reaches the engine rather than the name check: this stub has no
         # running anchor, so the refusal it raises is a *different* one, and
         # that difference is the assertion.
         with pytest.raises(CliError) as caught:
-            provider.write(workspace, allowed, io.BytesIO(b"x"), expected_sha256="0" * 64)
+            provider.write(workspace, allowed, source, expected_sha256="0" * 64)
         assert "reserves for its own state" not in caught.value.message, allowed

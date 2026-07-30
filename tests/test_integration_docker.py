@@ -2576,7 +2576,11 @@ def test_no_surface_inside_a_job_container_carries_its_own_job_id(
     # HOSTNAME is the engine's id for the container, never headspace's name for
     # the job — the specific confusion that would hand a job its own id.
     hostname = sections["hostname"].splitlines()[0].strip()
-    assert hostname and hostname != job_id
+    # Two facts, two assertions: "the surface said something" and "what it said
+    # was not the job id" fail for different reasons and deserve to be told
+    # apart — an empty hostname would otherwise read as a leak that isn't one.
+    assert hostname, "the container reported no hostname at all, so nothing was checked"
+    assert hostname != job_id, "the container's hostname *is* the job id — the channel is open"
     assert re.fullmatch(r"[0-9a-f]{12}", hostname), (
         f"the container hostname was {hostname!r}, not an engine short id; if "
         "headspace has started setting a hostname, check it can never be the job id"
