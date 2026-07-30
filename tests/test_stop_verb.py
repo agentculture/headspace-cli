@@ -39,19 +39,30 @@ is ``running``, the run intent in the journal really is open, and the run
 invocation really is blocked in the provider holding the workspace lock — which
 is the whole situation this verb was built for.
 
-One gap these tests deliberately do not paper over
----------------------------------------------------
-Criterion 2 has two halves, and only one of them is settled below this seam.
-The ``stop`` verb's own package reports ``cancelled`` and exits 5 on every
-backend — that is orchestration, and it is asserted here and verified live
-against Docker. The *job's* recorded outcome is written by the ``run``
-invocation from whatever its backend reports, and only the fake can currently
-report ``cancelled``: :meth:`headspace.providers.docker.DockerProvider._status`
-has no branch that produces it, so a live job ended by ``stop --apply`` is
-recorded as ``failure`` with exit status 137 and its ``run`` exits 6. That is a
-backend gap, not an orchestration one, and it is left visible here rather than
-asserted away — the fake tests below pin the contract the Docker backend must
-grow into, and none of them pretends it already has.
+Both halves of criterion 2, now settled on both backends
+----------------------------------------------------------
+Criterion 2 has two halves. The ``stop`` verb's own package reports
+``cancelled`` and exits 5 on every backend — that is orchestration, and it is
+asserted here and verified live against Docker. The *job's* recorded outcome
+is written by the ``run`` invocation from whatever its backend reports, and
+that half used to be settled only for the fake: ``DockerProvider._status`` had
+no branch that could produce ``cancelled``, because a container the engine
+killed for ``stop`` and one that called ``sys.exit(137)`` on its own account
+are byte-for-byte indistinguishable at the engine's own numbers. That gap was
+issue #16.
+
+It closes not by teaching ``_status`` to guess harder — the numbers still
+cannot tell those two jobs apart, and never will — but by giving ``run`` a
+positive, out-of-band signal the numbers were never going to supply: the
+two-phase cancellation channel in ``headspace/providers/docker.py`` (see that
+module's docstring, "Recording that an operator ended it"), where ``stop``
+writes an intent marker before it signals and a countersignal after the
+signalling has run its course, both read back by ``run`` and matched against
+the job id that just ran. The fake tests below still pin the orchestration
+contract every backend must honor; the live Docker half of criterion 2 is
+verified against a genuinely running container by
+:func:`tests.test_integration_docker.test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_cancelled`,
+not by anything in this module.
 """
 
 from __future__ import annotations
