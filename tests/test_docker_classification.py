@@ -1,5 +1,13 @@
 """A command the image cannot execute is the caller's error, not a broken engine.
 
+And, since issue #16, the other half of the same idea: a job an *operator*
+ended is not a failed computation either. Both are cases where the honest
+answer cannot be read off the engine's numbers — an exec-step 400 looks like
+any other 400, and a stopped container looks exactly like one that chose 137
+for itself — so both are settled by a signal the provider can actually trust:
+the engine's own marker for the first, and a sentinel another process wrote
+for the second. The classification tests for both live here.
+
 WHY this module exists
 ----------------------
 ``container.start()`` sits inside :meth:`DockerProvider._engine`, and
@@ -43,19 +51,22 @@ counterpart of these assertions belongs to the integration lane.
 
 from __future__ import annotations
 
+import io
 import json
+import tarfile
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from docker.errors import APIError
+from docker.errors import APIError, NotFound
 
 import headspace.cli._commands.create as provider_registry
 from headspace.cli import main
 from headspace.cli._commands.inspect import collect_logs
 from headspace.cli._errors import (
+    EXIT_CANCELLED,
     EXIT_COMPUTATION_FAILED,
     EXIT_INFRASTRUCTURE_FAILURE,
     EXIT_RESOURCE_EXHAUSTED,
@@ -65,6 +76,7 @@ from headspace.core import profiles
 from headspace.core.policy import EffectivePolicy, Policy, ResourceBudget
 from headspace.core.policy import resolve as resolve_policy
 from headspace.core.result import (
+    STATUS_CANCELLED,
     STATUS_FAILURE,
     STATUS_RESOURCE_EXHAUSTED,
     STATUS_SUCCESS,
@@ -76,6 +88,9 @@ from headspace.core.store import HOME_ENV_VAR, Store
 from headspace.core.workspace import Orchestrator, exit_code_for_status
 from headspace.providers.base import ProviderError
 from headspace.providers.docker import (
+    CANCELLATION_MARKER_NAME,
+    CANCELLATION_MARKER_PATH,
+    CLEAR_CANCELLATION_SCRIPT,
     EXEC_INIT_MARKER,
     EXIT_COMMAND_NOT_EXECUTABLE,
     EXIT_COMMAND_NOT_FOUND,
@@ -220,6 +235,68 @@ class StubContainer:
         #: container keeps running is an engine failure, not a job that
         #: happened to exit first — the two must not read alike.
         self._kill_error = kill_error
+        #: What the workspace volume holds at the cancellation sentinel's path,
+        #: as the *other* process would have left it: the text of the marker
+        #: file, or ``None`` for the ordinary case where no operator stopped
+        #: anything. Armed on the anchor container, because that is the object
+        #: ``run`` reads the volume through — see the sentinel tests below.
+        self.marker: str | None = None
+        #: What kind of filesystem object stands at that path: ``"file"``,
+        #: ``"symlink"`` or ``"directory"``. Only a regular file is a sentinel;
+        #: the other two are what a job sharing the volume can plant there, and
+        #: the archive endpoint reports each one honestly in the tar member's
+        #: own type — which is the whole reason the provider can refuse them.
+        self.marker_kind = "file"
+        #: Every command the provider ran as an exec, in call order.
+        self.exec_calls: list[list[str]] = []
+
+    # -- the workspace volume, as the archive endpoint and an exec see it -----
+
+    def get_archive(self, path: str, chunk_size: int | None = None) -> tuple[Any, dict[str, Any]]:
+        """The engine's transfer archive for one path in the volume.
+
+        Answers a 404 for a path that holds nothing, exactly as the daemon
+        does — which is the ordinary answer for the sentinel, since almost no
+        job is ever stopped by an operator. When something *is* there, the
+        member carries that object's real tar type, so a planted symlink or
+        directory reaches the provider as a symlink or directory rather than
+        as bytes a stub decided to hand over.
+        """
+        del chunk_size  # the marker is far smaller than any chunk worth cutting
+        if path != CANCELLATION_MARKER_PATH or self.marker is None:
+            raise NotFound(f'404 Client Error for {ENDPOINT}: Not Found ("{path}")')
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            entry = tarfile.TarInfo(CANCELLATION_MARKER_NAME)
+            if self.marker_kind == "symlink":
+                entry.type = tarfile.SYMTYPE
+                entry.linkname = self.marker
+                archive.addfile(entry)
+            elif self.marker_kind == "directory":
+                entry.type = tarfile.DIRTYPE
+                archive.addfile(entry)
+            else:
+                payload = self.marker.encode("utf-8")
+                entry.size = len(payload)
+                archive.addfile(entry, io.BytesIO(payload))
+        # A generator, not a plain iterator: the SDK hands back one, and the
+        # provider registers its ``close`` with the stream's release — a stub
+        # answering with something that has no ``close`` would quietly excuse
+        # the provider from releasing what it opened.
+        return (chunk for chunk in [buffer.getvalue()]), {"name": CANCELLATION_MARKER_NAME}
+
+    def exec_run(self, cmd: Sequence[str], **_: Any) -> SimpleNamespace:
+        """Run one of the provider's scripts — recorded, and honoured for effect.
+
+        Only the clearing script has an effect worth modelling here: it is the
+        one whose *absence* would leave a stale sentinel behind for the next
+        job, so the stub really removes the marker rather than merely counting
+        the call.
+        """
+        self.exec_calls.append(list(cmd))
+        if len(cmd) > 2 and cmd[2] == CLEAR_CANCELLATION_SCRIPT:
+            self.marker = None
+        return SimpleNamespace(exit_code=0, output=b"")
 
     @property
     def status(self) -> str:
@@ -677,6 +754,296 @@ def test_a_kill_the_daemon_refuses_is_an_engine_failure_not_a_success(
     assert exc.value.code == EXIT_INFRASTRUCTURE_FAILURE
 
 
+# --- an operator ended it: the one thing the exit status cannot say (issue #16)
+#
+# ``stop`` and ``run`` are different processes. ``run`` holds the workspace's
+# flock for the job's whole duration, so the operator's ``stop`` cannot go
+# through it — and what ``stop`` leaves behind at the engine is a container
+# that exited 137 with ``OOMKilled=false``, which is byte-for-byte what
+# ``python -c "raise SystemExit(137)"`` leaves behind. No heuristic can tell
+# those apart, and the module docstring records the live probe that proves it.
+#
+# So the discriminator is a *positive signal*: ``stop`` writes a sentinel into
+# the workspace volume naming the job it signalled, and ``run`` reads it back
+# through the same archive endpoint the ``read`` verb uses. Every test below
+# arms that sentinel on the anchor container, because the anchor is the object
+# ``run`` reads the volume through — the job's own container is gone by then.
+
+
+def _anchor(engine: StubEngine) -> StubContainer:
+    """The workspace container: the object the volume is reached through."""
+    anchors = [c for c in engine.registry if c.labels.get(LABEL_ROLE) == ROLE_WORKSPACE]
+    assert len(anchors) == 1, f"expected exactly one anchor, found {len(anchors)}"
+    return anchors[0]
+
+
+def _cleared(anchor: StubContainer) -> bool:
+    """Whether the provider ran its sentinel-clearing script at all."""
+    return any(len(cmd) > 2 and cmd[2] == CLEAR_CANCELLATION_SCRIPT for cmd in anchor.exec_calls)
+
+
+def test_a_job_an_operator_stopped_is_recorded_cancelled_not_failed(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """The defect from live testing: the operator's own stop read as a failure.
+
+    ``stop`` already reported ``cancelled`` and exited 5 for its *own*
+    invocation. The job's recorded outcome came from here, and here had no
+    branch that could produce it — so an operator who stopped a runaway job
+    was told, in the job's own record, that their work had failed.
+    """
+    engine.job_exit_code = 137
+    _anchor(engine).marker = "job-stopped"
+
+    outcome = provider.run(workspace, ("sleep", "infinity"), policy, job_id="job-stopped")
+
+    assert outcome.status == STATUS_CANCELLED
+    assert exit_code_for_status(outcome.status) == EXIT_CANCELLED
+
+
+def test_a_cancelled_job_reports_no_exit_status_of_its_own(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """The seam refuses a cancelled outcome carrying one, and it is right to.
+
+    ``JobOutcome.__post_init__`` rejects an exit status on a ``cancelled``
+    outcome, because a job somebody else ended never produced one of its own —
+    the 137 is the signal's number, not the command's answer. Dropping it is
+    the contract, not a workaround for the check.
+    """
+    engine.job_exit_code = 137
+    _anchor(engine).marker = "job-no-status"
+
+    outcome = provider.run(workspace, ("sleep", "infinity"), policy, job_id="job-no-status")
+
+    assert outcome.status == STATUS_CANCELLED
+    assert outcome.exit_status is None
+
+
+def test_a_sentinel_naming_another_job_changes_nothing(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """A stale sentinel must never flip a later job's classification.
+
+    This is the case that makes the sentinel's payload load-bearing rather
+    than decorative: a bare "somebody stopped something here" flag would
+    convict the next job that happened to fail.
+    """
+    engine.job_exit_code = 137
+    _anchor(engine).marker = "job-from-yesterday"
+
+    outcome = provider.run(workspace, ("false",), policy, job_id="job-today")
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == 137
+
+
+def test_a_self_chosen_137_stays_a_failure_when_no_sentinel_is_there(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """The indistinguishable case, pinned from the other side.
+
+    ``python -c "raise SystemExit(137)"`` produces exactly what a stopped job
+    produces. With no sentinel naming it, it must keep reading as the honest
+    computational failure it is — the classification only ever moves on the
+    positive signal, never on the number.
+    """
+    engine.job_exit_code = 137
+    assert _anchor(engine).marker is None
+
+    outcome = provider.run(
+        workspace, ("python3", "-c", "raise SystemExit(137)"), policy, job_id="job-honest-137"
+    )
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == 137
+    assert exit_code_for_status(outcome.status) == EXIT_COMPUTATION_FAILED
+
+
+def test_a_sentinel_beside_a_job_that_succeeded_is_not_a_cancellation(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """A job that caught the signal and finished cleanly really did succeed.
+
+    ``stop`` sends ``SIGTERM`` before it forces anything, so a job with a
+    handler can complete its work and exit 0 inside its grace window. Its own
+    answer is the truthful one; the sentinel says the operator asked, not that
+    the job was cut short.
+    """
+    engine.job_exit_code = 0
+    _anchor(engine).marker = "job-graceful"
+
+    outcome = provider.run(workspace, ("tidy-up",), policy, job_id="job-graceful")
+
+    assert outcome.status == STATUS_SUCCESS
+    assert outcome.exit_status == 0
+
+
+def test_cancelled_outranks_a_wall_clock_timeout(
+    engine: StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """The documented precedence, top of the order: cancelled > timeout.
+
+    ``_status`` already put ``timeout`` above ``resource_exhausted`` because
+    headspace's own enforcer *deliberately* stopped the job, outranking the
+    kernel's mark. An operator's stop is more deliberate still, so it takes the
+    top slot — pinned with both conditions true at once rather than trusting
+    branch order.
+    """
+    engine.job_settles_to = "running"  # stays alive until the enforcer kills it
+    tight_policy = resolve_policy(
+        Policy(budget=ResourceBudget(wall_clock_seconds=0)), provider.capabilities()
+    )
+    _anchor(engine).marker = "job-both"
+
+    outcome = provider.run(workspace, ("sleep", "infinity"), tight_policy, job_id="job-both")
+
+    assert outcome.status == STATUS_CANCELLED
+    assert outcome.exit_status is None
+
+
+def test_cancelled_outranks_an_oom_kill(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """Bottom of the same order: a stopped job is not a budget breach.
+
+    A host under real memory pressure can mark a container ``OOMKilled`` in
+    the same instant an operator ends it. Reporting ``resource_exhausted``
+    would send an autonomous caller off to raise a memory ceiling over a
+    decision a human already made.
+    """
+    engine.job_exit_code = 137
+    engine.job_oom_killed = True
+    _anchor(engine).marker = "job-oom-and-stopped"
+
+    outcome = provider.run(workspace, ("stress-me",), policy, job_id="job-oom-and-stopped")
+
+    assert outcome.status == STATUS_CANCELLED
+    assert outcome.exit_status is None
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_a_sentinel_that_is_not_a_regular_file_is_refused(
+    engine: StubEngine,
+    provider: DockerProvider,
+    policy: EffectivePolicy,
+    workspace: str,
+    kind: str,
+) -> None:
+    """A job sharing the volume can plant one; neither may name a job.
+
+    The read-side half of the symlink discipline the copy-in path already
+    keeps. The archive endpoint resolves a link target within the container's
+    filesystem quite happily, so a link at the sentinel's path would let a job
+    nominate any file on that filesystem as the thing naming it. Only a
+    regular file is read, and anything else leaves the classification exactly
+    where it was.
+    """
+    engine.job_exit_code = 137
+    anchor = _anchor(engine)
+    anchor.marker = "job-planted"
+    anchor.marker_kind = kind
+
+    outcome = provider.run(workspace, ("false",), policy, job_id="job-planted")
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == 137
+
+
+@pytest.mark.parametrize("exit_code", [0, 137])
+def test_the_sentinel_is_consumed_whatever_the_job_did(
+    engine: StubEngine,
+    provider: DockerProvider,
+    policy: EffectivePolicy,
+    workspace: str,
+    exit_code: int,
+) -> None:
+    """Including exit 0 — the path no non-zero branch would ever reach.
+
+    A ``stop`` that races a job finishing naturally leaves a sentinel nobody
+    consumed. Clearing it only on the failing path would leave that one to be
+    found by whichever later job happened to fail, which is precisely the
+    stale-sentinel hazard the payload check already guards — and a guard that
+    is never exercised is one nobody notices breaking.
+    """
+    engine.job_exit_code = exit_code
+    anchor = _anchor(engine)
+    anchor.marker = "job-raced"
+
+    provider.run(workspace, ("whatever",), policy, job_id="job-raced")
+
+    assert anchor.marker is None
+    assert _cleared(anchor)
+
+
+def test_a_sentinel_naming_another_job_is_cleared_too(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """Residue is residue, whoever it names — and clearing it ends the hazard."""
+    engine.job_exit_code = 137
+    anchor = _anchor(engine)
+    anchor.marker = "job-from-yesterday"
+
+    provider.run(workspace, ("false",), policy, job_id="job-today")
+
+    assert anchor.marker is None
+
+
+@pytest.mark.parametrize("kind", ["symlink", "directory"])
+def test_a_planted_object_at_the_sentinel_path_is_cleared_as_well(
+    engine: StubEngine,
+    provider: DockerProvider,
+    policy: EffectivePolicy,
+    workspace: str,
+    kind: str,
+) -> None:
+    """Refusing to *read* it is not enough; leaving it there wedges the channel.
+
+    A link a job planted at the sentinel's path would sit in the volume
+    forever, and every later ``stop`` would meet it as the pre-planted link
+    its own write refuses. Clearing whatever stands there — the link itself,
+    never its target — is what keeps the channel usable after an attack on it.
+    """
+    engine.job_exit_code = 137
+    anchor = _anchor(engine)
+    anchor.marker = "job-planted"
+    anchor.marker_kind = kind
+
+    provider.run(workspace, ("false",), policy, job_id="job-planted")
+
+    assert anchor.marker is None
+
+
+def test_no_sentinel_means_no_exec_against_the_workspace_container(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """The ordinary job pays one archive probe and nothing else.
+
+    Almost no job is ever stopped by an operator, so the clearing exec must be
+    the exception rather than a tax every ``run`` pays — and ``run`` must not
+    quietly acquire a requirement for an anchor that can execute a shell,
+    which it has never had.
+    """
+    provider.run(workspace, ("true",), policy, job_id="job-ordinary")
+
+    assert _anchor(engine).exec_calls == []
+
+
+def test_a_stale_sentinel_cannot_reach_the_job_after_next(
+    engine: StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """The lifecycle end to end: consumed once, and never seen again."""
+    engine.job_exit_code = 137
+    _anchor(engine).marker = "job-one"
+
+    first = provider.run(workspace, ("false",), policy, job_id="job-one")
+    second = provider.run(workspace, ("false",), policy, job_id="job-one")
+
+    assert first.status == STATUS_CANCELLED
+    assert second.status == STATUS_FAILURE
+    assert second.exit_status == 137
+
+
 # --- through the orchestrator, to the rendered package -----------------------
 
 
@@ -795,3 +1162,30 @@ def test_the_cli_exits_eight_on_a_job_the_engine_marks_oomkilled(
     assert code == EXIT_RESOURCE_EXHAUSTED
     payload = json.loads(captured.out)
     assert payload["status"] == STATUS_RESOURCE_EXHAUSTED
+
+
+def test_the_cli_exits_five_on_a_job_an_operator_stopped(
+    cli_provider: DockerProvider,
+    engine: StubEngine,
+    store_home: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The whole point of issue #16, at the surface the operator's ``run`` prints.
+
+    The ``stop`` invocation already exited 5. This is the *other* process — the
+    one that was blocked on the job and writes its record — and until now it
+    exited 6 and wrote ``failure``, telling an operator their job had failed
+    when they were the one who ended it.
+    """
+    del store_home, cli_provider
+    assert main(["create", "--workspace-id", WORKSPACE]) == 0
+    capsys.readouterr()
+
+    engine.job_exit_code = 137
+    _anchor(engine).marker = "job-stopped-cli"
+    code = main(["run", "--json", "--job-id", "job-stopped-cli", WORKSPACE, "sleep", "infinity"])
+    captured = capsys.readouterr()
+
+    assert code == EXIT_CANCELLED
+    payload = json.loads(captured.out)
+    assert payload["status"] == STATUS_CANCELLED

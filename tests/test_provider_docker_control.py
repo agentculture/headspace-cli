@@ -1,9 +1,9 @@
-"""The Docker half of the secret channel and the ``stop`` verb (issue #13, #14).
+"""The Docker half of the secret channel and the ``stop`` verb (issue #13, #14, #16).
 
 WHY this module exists
 ----------------------
-Two features, one boundary each, and both boundaries are about a value going
-somewhere it must never reach.
+Three features, one boundary each, and every one of them is about a value going
+somewhere it must — or must not — reach.
 
 ``run(..., env=...)`` (issue #13) opens a channel for a caller to hand a job
 process secrets — an API token, a credential — without paying the two costs
@@ -30,6 +30,19 @@ lookup, the stop-then-kill escalation, the honest "nothing was running"
 report) and structurally (``stop`` never constructs the state store at all,
 proven by making the constructor raise and calling ``stop`` anyway).
 
+The cancellation sentinel (issue #16) is the third, and it is the first thing
+``stop`` writes anywhere. It exists because ``run`` — the *other* process, the
+one that will record the job's outcome — cannot tell an operator's stop from a
+job that chose 137 for itself, so ``stop`` has to leave it a positive signal
+naming the job it signalled. The boundary is that the sentinel goes into the
+workspace *volume*, through the engine, and still nowhere near ``~/.headspace``:
+the two structural proofs above are restated against the write specifically,
+because "``stop`` writes something now" is exactly the change that could have
+reached for the store. Two further properties are proved rather than asserted —
+the write is refused outright when a job has planted a symlink at the reserved
+name, and a job never learns the id it would have to forge to plant a sentinel
+of its own.
+
 No engine required
 -------------------
 Every test here runs against :class:`_StubEngine`, a hand-written stand-in for
@@ -39,6 +52,15 @@ Every test here runs against :class:`_StubEngine`, a hand-written stand-in for
 ``connect=``, so nothing about the code under test is stubbed — only the
 daemon underneath it, following the same shape
 ``tests/test_docker_classification.py`` already established for this module.
+
+What is *not* stubbed is the workspace volume. :class:`_StubContainer` mounts a
+real directory, runs the provider's own script text through the host's
+``/bin/sh``, and tars real paths out of it with their real types — so the
+sentinel round trip below is a genuine round trip through two processes' only
+shared surface, and "a planted symlink is refused" is a statement about ``mv``
+and ``[ -L ]`` rather than about a stub's ``if``. The tests that need that
+shell say so with :data:`requires_a_host_shell`; the placement assertions above
+need none and are not skipped with them.
 
 ``stop``'s tests build their job container directly against the stub's
 registry rather than by calling ``provider.run()`` first. That is deliberate,
@@ -52,18 +74,26 @@ only case ``stop`` exists to reach.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+import io
+import shutil
+import subprocess  # nosec B404 - the fixture's own shell, never a caller's input
+import tarfile
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from docker.errors import NotFound
 
 from headspace.cli._errors import EXIT_USER_ERROR, CliError
 from headspace.core import profiles
 from headspace.core.policy import EffectivePolicy, Policy
 from headspace.core.policy import resolve as resolve_policy
+from headspace.core.result import STATUS_CANCELLED, STATUS_FAILURE
 from headspace.core.store import HOME_ENV_VAR, Store
 from headspace.providers.docker import (
+    CANCELLATION_MARKER_NAME,
     LABEL_CREATED_AT,
     LABEL_JOB_ID,
     LABEL_PROVIDER,
@@ -72,10 +102,29 @@ from headspace.providers.docker import (
     PROVIDER_NAME,
     ROLE_JOB,
     ROLE_WORKSPACE,
+    WORKSPACE_MOUNT_PATH,
     DockerProvider,
 )
 
 WORKSPACE = "ctrl-ws"
+
+#: What the volume-backed anchor below needs of the host to stand in for a
+#: container's own filesystem. ``sh`` runs the provider's script text, ``mv``
+#: is the script's one external tool, and ``rm`` is the clearing script's.
+_HOST_TOOLS = ("sh", "mv", "rm")
+
+
+def _absent_host_tools() -> list[str]:
+    return [tool for tool in _HOST_TOOLS if shutil.which(tool) is None]
+
+
+#: Applied per test rather than as a module ``pytestmark``: the env-placement
+#: assertions above need no shell at all, and a module-wide skip would take
+#: them with it.
+requires_a_host_shell = pytest.mark.skipif(
+    bool(_absent_host_tools()),
+    reason=f"the host shell lacks {', '.join(_absent_host_tools())}",
+)
 
 #: The environment the fixture workspace is created from — the default
 #: profile's own digest-pinned reference.
@@ -103,9 +152,21 @@ class _StubContainer:
     ``environment`` and the closed-posture kwargs — kept verbatim rather than
     picked apart, so a test asserts what the provider actually sent the engine
     instead of a paraphrase of it.
+
+    Two surfaces are honoured for real rather than stubbed, and both are the
+    workspace volume seen from a different side. ``exec_run`` runs the
+    provider's own script text through the host's ``/bin/sh`` against a real
+    directory, and ``get_archive`` tars a real path out of it with that path's
+    real type — so "a planted symlink is refused" becomes a statement about
+    ``mv``, ``[ -L ]`` and :func:`tarfile.TarFile.gettarinfo`, not about a
+    stub's ``if``. That is what makes the cross-process sentinel round trip
+    below a genuine round trip: the bytes ``stop`` writes are the bytes ``run``
+    reads, through the two engine mechanisms the provider actually uses.
     """
 
-    def __init__(self, image: str, kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self, image: str, kwargs: dict[str, Any], engine: "_StubEngine", *, is_job: bool
+    ) -> None:
         self.image = image
         self.kwargs = kwargs
         self.labels: dict[str, str] = dict(kwargs.get("labels") or {})
@@ -125,12 +186,26 @@ class _StubContainer:
         #: that caught ``SIGTERM`` and exited inside its grace window.
         #: ``True`` models a job that ignores it, so ``stop`` must escalate.
         self.survives_stop = False
+        self._engine = engine
+        self._is_job = is_job
+        #: Every command this container was asked to exec, in call order.
+        self.exec_calls: list[list[str]] = []
+
+    # -- lifecycle ------------------------------------------------------------
 
     def start(self) -> None:
-        # Settles immediately: nothing in this module drives a real wall
-        # clock, and the env/label/command placement this module proves does
-        # not depend on how long the job ran.
-        self.attrs["State"] = {"Status": "exited", "ExitCode": 0, "OOMKilled": False}
+        # The anchor holds a posture for the workspace's whole life, so it
+        # stays up; a job settles immediately, because nothing in this module
+        # drives a real wall clock and none of what it proves depends on how
+        # long the job ran.
+        if not self._is_job:
+            self.attrs["State"] = {"Status": "running", "ExitCode": None, "OOMKilled": False}
+            return
+        self.attrs["State"] = {
+            "Status": "exited",
+            "ExitCode": self._engine.job_exit_code,
+            "OOMKilled": False,
+        }
 
     def reload(self) -> None:
         """The stub's state is already current; nothing to re-fetch."""
@@ -148,13 +223,72 @@ class _StubContainer:
         return {}
 
     def stop(self, timeout: Any = None) -> None:
+        self._engine.timeline.append("signal")
         self.stop_calls.append(timeout)
         if not self.survives_stop:
             self.attrs["State"] = {"Status": "exited", "ExitCode": 143, "OOMKilled": False}
 
     def kill(self) -> None:
+        self._engine.timeline.append("kill")
         self.kill_calls += 1
         self.attrs["State"] = {"Status": "exited", "ExitCode": 137, "OOMKilled": False}
+
+    # -- the workspace volume, from the two sides the provider reaches it -----
+
+    def _to_host(self, value: str) -> str:
+        root = self._engine.volume_root
+        if value == WORKSPACE_MOUNT_PATH:
+            return str(root)
+        if value.startswith(f"{WORKSPACE_MOUNT_PATH}/"):
+            return f"{root}{value[len(WORKSPACE_MOUNT_PATH):]}"
+        return value
+
+    def exec_run(self, cmd: Sequence[str], **_: Any) -> SimpleNamespace:
+        """Run the provider's own script text, for real, against a real directory."""
+        self._engine.timeline.append("exec")
+        self.exec_calls.append(list(cmd))
+        _shell, _dash_c, script, argv0, *rest = cmd
+        completed = subprocess.run(  # nosec B603 - the fixture's own shell, by design
+            [
+                shutil.which("sh") or "/bin/sh",
+                "-c",
+                script,
+                argv0,
+                *(self._to_host(argument) for argument in rest),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        return SimpleNamespace(
+            exit_code=completed.returncode, output=completed.stdout + completed.stderr
+        )
+
+    def get_archive(self, path: str, chunk_size: int | None = None) -> tuple[Any, dict[str, Any]]:
+        """One path out of the volume, carrying the type it really has.
+
+        ``gettarinfo`` stats without dereferencing, so a symlink leaves here as
+        a symlink member and a directory as a directory member — which is the
+        only reason the provider's read-side refusal can be tested at all.
+        A path holding nothing is the engine's 404, the ordinary answer for a
+        sentinel nobody wrote.
+        """
+        del chunk_size  # the marker is far smaller than any chunk worth cutting
+        host = Path(self._to_host(path))
+        if not host.exists() and not host.is_symlink():
+            raise NotFound(f'404 Client Error: Not Found ("{path}")')
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            entry = archive.gettarinfo(str(host), arcname=host.name)
+            if entry.isfile():
+                with host.open("rb") as handle:
+                    archive.addfile(entry, handle)
+            else:
+                archive.addfile(entry)
+        # A generator, not a plain iterator: the SDK hands back one, and the
+        # provider registers its ``close`` with the stream's release — a stub
+        # answering with something that has no ``close`` would quietly excuse
+        # the provider from releasing what it opened.
+        return (chunk for chunk in [buffer.getvalue()]), {"name": host.name}
 
 
 class _StubImages:
@@ -185,7 +319,10 @@ class _StubContainers:
         self._engine = engine
 
     def create(self, image: str, **kwargs: Any) -> _StubContainer:
-        container = _StubContainer(image, kwargs)
+        labels = dict(kwargs.get("labels") or {})
+        container = _StubContainer(
+            image, kwargs, self._engine, is_job=labels.get(LABEL_ROLE) != ROLE_WORKSPACE
+        )
         self._engine.registry.append(container)
         return container
 
@@ -196,14 +333,29 @@ class _StubContainers:
 
 
 class _StubEngine:
-    """A stand-in for ``docker.DockerClient``: state, no daemon, no network."""
+    """A stand-in for ``docker.DockerClient``: state, no daemon, no network.
 
-    def __init__(self) -> None:
+    ``volume_root`` is a real directory standing in for the one workspace
+    volume every container here mounts — the shared, writable state that
+    outlives a job, and therefore the only place a sentinel written by one
+    process can be found by another.
+    """
+
+    def __init__(self, volume_root: Path) -> None:
         self.containers = _StubContainers(self)
         self.volumes = _StubVolumes(self)
         self.images = _StubImages()
         self.registry: list[_StubContainer] = []
         self.volume_registry: list[_StubVolume] = []
+        self.volume_root = volume_root
+        volume_root.mkdir(parents=True, exist_ok=True)
+        #: What the next job container exits with. Independent of everything
+        #: else, exactly as the engine's own fields are.
+        self.job_exit_code = 0
+        #: Every engine action that can be ordered against another, in the
+        #: order it happened — which is how "the sentinel was written *before*
+        #: the signal" is proved rather than asserted.
+        self.timeline: list[str] = []
         self.closed = 0
 
     def version(self) -> dict[str, Any]:
@@ -255,8 +407,8 @@ def _in_flight_job(engine: _StubEngine, workspace_id: str, job_id: str) -> _Stub
 
 
 @pytest.fixture
-def engine() -> _StubEngine:
-    return _StubEngine()
+def engine(tmp_path: Path) -> _StubEngine:
+    return _StubEngine(tmp_path / "workspace-volume")
 
 
 @pytest.fixture
@@ -461,3 +613,269 @@ def test_stop_leaves_the_store_root_untouched_on_the_nothing_running_path(
     provider.stop(workspace)
 
     assert not store_home.exists()
+
+
+# --- criterion 3: the sentinel stop leaves for run to find (issue #16) -------
+#
+# ``stop`` cannot tell ``run`` anything through headspace's own state: ``run``
+# holds the workspace's flock for the job's whole duration and is the single
+# writer of that workspace's records, so a ``stop`` that wrote there would
+# deadlock against the very call it exists to interrupt. The engine is the
+# only channel the two processes share, and inside it the workspace volume is
+# the only writable thing that outlives a job — so the sentinel goes there,
+# and everything below holds ``stop`` to the boundary while it does.
+
+
+def _marker(engine: _StubEngine) -> Path:
+    return engine.volume_root / CANCELLATION_MARKER_NAME
+
+
+def _volume_entries(engine: _StubEngine) -> list[str]:
+    """Everything in the volume, links never followed and never resolved."""
+    return sorted(entry.name for entry in engine.volume_root.iterdir())
+
+
+@requires_a_host_shell
+def test_stop_writes_a_sentinel_naming_the_job_it_signalled(
+    engine: _StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """The payload is the whole point: which job, not merely that one was ended.
+
+    ``run`` classifies from this file, and the job it classifies may not be
+    the job that was stopped — a sentinel that only said "somebody stopped
+    something here" would convict whichever later job happened to fail.
+    """
+    _in_flight_job(engine, workspace, "job-marked")
+
+    provider.stop(workspace)
+
+    assert _marker(engine).read_text() == "job-marked"
+
+
+@requires_a_host_shell
+def test_the_sentinel_is_written_before_the_job_is_signalled(
+    engine: _StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """Ordering, not merely presence — the other process is already watching.
+
+    ``run`` is blocked in ``_await_exit``, re-reading the very container this
+    call is about to signal, and it classifies the instant that container
+    settles. A sentinel written after the signal races that poll and loses
+    whenever the job dies quickly, which is exactly when a forceful stop is
+    involved.
+    """
+    job = _in_flight_job(engine, workspace, "job-ordered")
+    job.survives_stop = True  # so the timeline carries the escalation too
+
+    provider.stop(workspace)
+
+    assert engine.timeline == ["exec", "signal", "kill"]
+
+
+@requires_a_host_shell
+def test_stop_writes_no_sentinel_when_there_was_no_job_to_name(
+    engine: _StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """The ordinary race leaves the volume exactly as it found it.
+
+    A caller racing a job that finished on its own signalled nothing, so there
+    is no job id to write — and a sentinel naming nothing is residue the next
+    job would have to be protected from for no gain at all.
+    """
+    result = provider.stop(workspace)
+
+    assert result.stopped is False
+    assert _volume_entries(engine) == []
+
+
+@requires_a_host_shell
+def test_the_sentinel_write_leaves_no_staging_residue_in_the_volume(
+    engine: _StubEngine, provider: DockerProvider, workspace: str
+) -> None:
+    """The volume a caller reads back holds the sentinel and nothing beside it.
+
+    The write lands on a nonce path first and is renamed onto the sentinel's
+    name, because a rename replaces a link rather than writing through one.
+    The nonce must not survive that: a workspace is the caller's, and headspace
+    littering it with scratch files is a cost the caller never agreed to.
+    """
+    _in_flight_job(engine, workspace, "job-tidy")
+
+    provider.stop(workspace)
+
+    assert _volume_entries(engine) == [CANCELLATION_MARKER_NAME]
+
+
+@requires_a_host_shell
+def test_a_pre_planted_symlink_at_the_sentinel_path_is_never_written_through(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, tmp_path: Path
+) -> None:
+    """The write-side half of the discipline the copy-in path already keeps.
+
+    A job shares the workspace volume and can plant a link at any name it
+    likes, including this one. A shell redirection follows a link and would
+    write headspace's own bytes wherever the job pointed it — outside the
+    volume, over a file the job could not otherwise touch. Nothing legitimate
+    puts a link here, so one standing there is refused outright.
+    """
+    outside = tmp_path / "outside-the-volume"
+    outside.write_text("untouched")
+    _marker(engine).symlink_to(outside)
+    _in_flight_job(engine, workspace, "job-planted")
+
+    provider.stop(workspace)
+
+    assert outside.read_text() == "untouched"
+    # Refused, not merely survived. A ``mv`` onto the link would also have left
+    # the target untouched — it replaces the link rather than following it —
+    # so the assertion that separates "refused" from "quietly tidied away" is
+    # that the job's own link is still exactly what stands there, and that the
+    # refusal left no nonce behind on its way out.
+    assert _marker(engine).is_symlink()
+    assert _volume_entries(engine) == [CANCELLATION_MARKER_NAME]
+
+
+@requires_a_host_shell
+def test_a_refused_sentinel_write_never_stops_the_job_from_being_stopped(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, tmp_path: Path
+) -> None:
+    """Ending the runaway job is the operator's need; naming it is the nicety.
+
+    The sentinel only improves how the *other* process narrates the outcome.
+    A refusal to write it — a planted link, an image with no ``mv``, an anchor
+    that has exited — must therefore degrade the narration to exactly today's
+    answer and never withhold the signal, which is the whole reason the
+    operator reached for this verb.
+    """
+    (engine.volume_root / CANCELLATION_MARKER_NAME).symlink_to(tmp_path / "elsewhere")
+    job = _in_flight_job(engine, workspace, "job-still-stopped")
+
+    result = provider.stop(workspace)
+
+    assert result.to_dict() == {
+        "workspace_id": workspace,
+        "job_id": "job-still-stopped",
+        "stopped": True,
+    }
+    assert job.stop_calls
+
+
+@requires_a_host_shell
+def test_writing_the_sentinel_still_constructs_no_state_store(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new write is engine-side, like every other thing ``stop`` does.
+
+    Restated against the sentinel specifically, because "``stop`` writes
+    something now" is exactly the change that could have reached for the
+    store: the marker goes into the *volume*, through the engine, and the
+    store's constructor is still never called.
+    """
+
+    def _forbidden(self: Store, *_a: Any, **_kw: Any) -> None:
+        raise AssertionError("DockerProvider.stop() must never construct the state store")
+
+    monkeypatch.setattr(Store, "__init__", _forbidden)
+
+    _in_flight_job(engine, workspace, "job-store-3")
+    provider.stop(workspace)
+
+    assert _marker(engine).read_text() == "job-store-3"
+
+
+@requires_a_host_shell
+def test_the_sentinel_lands_in_the_volume_and_not_under_the_store_root(
+    engine: _StubEngine, provider: DockerProvider, workspace: str, store_home: Path
+) -> None:
+    _in_flight_job(engine, workspace, "job-store-4")
+
+    provider.stop(workspace)
+
+    assert _marker(engine).is_file()
+    assert not store_home.exists()
+
+
+# --- and the round trip the two processes actually make ----------------------
+
+
+@requires_a_host_shell
+def test_a_stop_and_a_later_run_agree_that_the_job_was_cancelled(
+    engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """End to end through the volume: one process writes, the other reads.
+
+    Two verbs, one shared workspace volume, and no channel between them but
+    that. ``stop`` names the job it signalled; ``run`` — which in production is
+    a different process, already blocked on that job — reads the name back out
+    through the archive endpoint and records the outcome an operator would
+    recognise.
+    """
+    _in_flight_job(engine, workspace, "job-round-trip")
+    provider.stop(workspace)
+
+    engine.job_exit_code = 137
+    outcome = provider.run(workspace, ("sleep", "600"), policy, job_id="job-round-trip")
+
+    assert outcome.status == STATUS_CANCELLED
+    assert outcome.exit_status is None
+
+
+@requires_a_host_shell
+def test_the_run_that_consumed_the_sentinel_removes_it_from_the_volume(
+    engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """A consumed sentinel is residue, and residue in a caller's volume is a leak."""
+    _in_flight_job(engine, workspace, "job-consumed")
+    provider.stop(workspace)
+    assert _marker(engine).is_file()
+
+    engine.job_exit_code = 137
+    provider.run(workspace, ("sleep", "600"), policy, job_id="job-consumed")
+
+    assert _volume_entries(engine) == []
+
+
+@requires_a_host_shell
+def test_a_sentinel_from_an_earlier_job_does_not_reach_the_next_one(
+    engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """Through real files this time, not an armed stub attribute."""
+    _in_flight_job(engine, workspace, "job-earlier")
+    provider.stop(workspace)
+
+    engine.job_exit_code = 137
+    outcome = provider.run(workspace, ("false",), policy, job_id="job-later")
+
+    assert outcome.status == STATUS_FAILURE
+    assert outcome.exit_status == 137
+    assert _volume_entries(engine) == []
+
+
+# --- criterion 3: a job can never learn the name it would have to forge ------
+
+
+def test_the_job_id_reaches_the_engine_and_never_the_container(
+    engine: _StubEngine, provider: DockerProvider, policy: EffectivePolicy, workspace: str
+) -> None:
+    """The sentinel is unforgeable only because a job cannot name itself.
+
+    A job shares the workspace volume, so it can write whatever it likes at
+    the sentinel's path; the one string it cannot write there is its own job
+    id, because nothing inside the box ever tells it what that is. The id
+    travels as a container *name* and a ``headspace.job_id`` label, and both
+    are readable from outside the container and from nowhere within it — a
+    container's own hostname is its engine id, not its name, and a label is
+    not visible to the process at all.
+
+    So this pins the two channels a process really can read from inside its
+    own container: its environment and its argv. Both are the caller's to
+    fill, and neither is built from the job id or with any knowledge that one
+    exists.
+    """
+    job_id = "job-unforgeable"
+    provider.run(workspace, ("echo", "hi"), policy, job_id=job_id, env={"TOKEN": "t"})
+
+    job = _jobs(engine)[0]
+    assert job.labels[LABEL_JOB_ID] == job_id
+    assert all(job_id not in str(value) for value in (job.kwargs.get("environment") or {}).values())
+    assert all(job_id not in str(part) for part in (job.command or ()))
