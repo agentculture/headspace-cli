@@ -109,10 +109,11 @@ else, because a stub engine can only confirm what its author already believed:
 * whether a job container is genuinely gone on the normal path, and whether the
   label-reaping backstop genuinely works when the removal genuinely fails.
 * whether ``stop --apply`` genuinely ends a live job in another process — and
-  what the still-blocked ``run`` genuinely records about it, which today is
-  ``failure``/137/exit 6 rather than ``cancelled``/exit 5. That gap is issue
-  #16 and it is asserted *as it is*, deliberately: see
-  :func:`test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_as_issue_16_describes`.
+  whether the still-blocked ``run`` now genuinely records that honestly:
+  ``cancelled``/exit 5 with no ``exit_status`` at all, rather than the
+  ``failure``/137/exit 6 the identical scenario produced before issue #16's
+  two-phase cancellation channel existed. See
+  :func:`test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_cancelled`.
 
 Running without an engine, and leaving nothing behind
 -------------------------------------------------------
@@ -1632,28 +1633,42 @@ def test_a_job_container_is_removed_on_the_normal_path_and_a_failed_removal_is_r
     ), "the label-reaping backstop did not reap a stray it was the backstop for"
 
 
-def test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_as_issue_16_describes(
+def test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_cancelled(
     home: Path, engine: docker.DockerClient, workspace: Any
 ) -> None:
-    """Two processes, one job: the stop reports honestly, and the run does not yet.
+    """Two processes, one job: the stop reports honestly, and now so does the run.
 
     ``run`` blocks and holds the workspace lock for a job's whole duration, so
     the only way to prove ``stop`` works is to have a genuinely separate process
-    arrive with nothing but the workspace id. That half works, and is asserted
-    as it should be: ``cancelled``, exit 5.
+    arrive with nothing but the workspace id. That half has always worked, and
+    is asserted as it should be: ``cancelled``, exit 5.
 
-    The other half is a **known gap, tracked as issue #16**, and it is asserted
-    here exactly as it behaves today rather than marked ``xfail`` or quietly
-    omitted. The still-blocked ``run`` sees a container the engine killed with
-    SIGKILL: exit status 137, ``OOMKilled: false``. ``DockerProvider._status``
-    has no branch that can produce ``cancelled`` — and it could not invent one
-    from these facts anyway, because a job that deliberately calls
-    ``sys.exit(137)`` presents identically (that indistinguishability is itself
-    pinned by
-    ``test_regression_one_workspace_tells_four_outcomes_apart``). So the run
-    reports ``failure`` and exits 6. **If a future change fixes #16, this test
-    will fail** — that is deliberate: read this docstring, then update the
-    assertions under the ``issue #16`` banner below to ``cancelled`` / 5.
+    The other half used to be a known gap, tracked as issue #16: the
+    still-blocked ``run`` sees a container the engine killed with SIGKILL —
+    exit status 137, ``OOMKilled: false`` — and that is byte for byte what
+    ``python -c "raise SystemExit(137)"`` leaves behind too, a fact pinned
+    independently by ``test_regression_one_workspace_tells_four_outcomes_apart``.
+    No amount of staring at the engine's own numbers can tell those two jobs
+    apart, which is exactly what makes the assertions below meaningful rather
+    than circular: if ``cancelled`` shows up here, it did not come from the
+    exit code, the ``OOMKilled`` flag, or any other fact the engine can report
+    about this container, because none of those facts differ between a job an
+    operator stopped and a job that chose 137 for itself. It can only have come
+    from the positive, out-of-band signal described in
+    ``headspace/providers/docker.py``'s module docstring under "Recording that
+    an operator ended it": the intent marker ``stop`` writes into the
+    workspace volume before it signals, and the countersignal it writes
+    through the anchor once the signalling has run its course — both read back
+    by ``run`` and matched against the job id that just ran.
+
+    ``exit_status`` being absent below is not this provider merely asserting
+    that a stopped job carries none — it is
+    :meth:`~headspace.providers.base.JobOutcome.__post_init__` refusing, at
+    construction, to build a ``cancelled`` outcome that carries an exit status
+    at all. So even a provider that classified the job correctly but also
+    tried to report the 137 it observed at the engine would fail loudly right
+    there, rather than quietly leaking a number the taxonomy says a cancelled
+    job never produces.
     """
     workspace_id = workspace()
     _create_workspace(home, workspace_id)
@@ -1695,16 +1710,16 @@ def test_stop_apply_ends_a_live_job_and_the_blocked_run_records_it_as_issue_16_d
             runner.kill()
             runner.communicate(timeout=30)
 
-    # --- issue #16: the honest, current behaviour of the job's own record ---
-    assert runner.returncode == _EXIT_COMPUTATION_FAILED, (
-        f"the interrupted run exited {runner.returncode}; issue #16 says 6 today, "
-        f"and 5 once cancellation is distinguishable. stderr: {err}"
+    # --- the job's own record, honest about who ended it (since issue #16) ---
+    assert runner.returncode == _EXIT_CANCELLED, (
+        f"the interrupted run exited {runner.returncode}, expected {_EXIT_CANCELLED}; "
+        f"stderr: {err}"
     )
     run_package = json.loads(out)
-    assert run_package["status"] == STATUS_FAILURE  # issue #16: 'cancelled' one day
+    assert run_package["status"] == STATUS_CANCELLED  # the countersignal, not the exit code
     recorded = {job["job_id"]: job for job in Store().read_state(workspace_id).state["jobs"]}
-    assert recorded["stoppable-job"]["exit_status"] == 137  # issue #16: SIGKILL, not a verdict
-    assert recorded["stoppable-job"]["status"] == STATUS_FAILURE  # issue #16
+    assert recorded["stoppable-job"]["exit_status"] is None  # a cancelled outcome carries none
+    assert recorded["stoppable-job"]["status"] == STATUS_CANCELLED  # since issue #16
 
 
 def test_put_archive_writes_straight_through_a_planted_ancestor_symlink(
