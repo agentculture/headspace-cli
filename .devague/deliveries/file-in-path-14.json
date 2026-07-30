@@ -2,7 +2,7 @@
   "plan_slug": "file-in-path-14",
   "schema_version": 1,
   "created": "2026-07-29T08:55:13Z",
-  "updated": "2026-07-29T10:50:27Z",
+  "updated": "2026-07-30T04:30:28Z",
   "deviations": [
     {
       "id": "d1",
@@ -17,7 +17,7 @@
         "h2"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     },
     {
@@ -30,7 +30,7 @@
         "c42"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     },
     {
@@ -45,7 +45,7 @@
         "t14"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "needs-follow-up"
     },
     {
@@ -59,7 +59,7 @@
         "t7"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "acceptable"
     },
     {
@@ -73,7 +73,7 @@
         "t12"
       ],
       "origin": "llm",
-      "status": "proposed",
+      "status": "approved",
       "classification": "needs-follow-up"
     }
   ]
